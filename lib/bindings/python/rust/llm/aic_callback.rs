@@ -25,6 +25,14 @@ use aiconfigurator_core::{AicEngine, build_aic_engine};
 use dynamo_kv_router::PrefillLoadEstimator;
 use dynamo_mocker::common::perf_model::AicCallback;
 
+#[cfg(feature = "aic-forward-pass")]
+fn include_workload_distribution_in_cache_identity(
+    base_identity: String,
+    workload_distribution: Option<&str>,
+) -> String {
+    format!("{base_identity}|{workload_distribution:?}")
+}
+
 /// Pure-Rust AIC callback: wraps an `aiconfigurator_core::AicEngine`
 /// compiled once at startup and answers predict calls with NO PyO3 / GIL on the
 /// hot path — `AicEngine::{prefill,decode}_latency_ms` are pure Rust.
@@ -101,6 +109,7 @@ fn build_rust_engine(
     moe_tp_size: Option<usize>,
     moe_ep_size: Option<usize>,
     attention_dp_size: Option<usize>,
+    workload_distribution: Option<&str>,
     gemm_dtype: Option<&str>,
     moe_dtype: Option<&str>,
     fmha_dtype: Option<&str>,
@@ -152,9 +161,10 @@ fn build_rust_engine(
     // prefill+decode). Mirror the Python `_cached_engine_handle` so the build is
     // paid once per unique config (speculative config included).
     static CACHE: OnceLock<Mutex<HashMap<String, Arc<AicEngine>>>> = OnceLock::new();
-    let key = format!(
+    let base_identity = format!(
         "{backend_name}|{system}|{backend_version:?}|{model_path}|{tp_size}|{moe_tp_size:?}|{moe_ep_size:?}|{attention_dp_size:?}|{gemm_dtype:?}|{moe_dtype:?}|{fmha_dtype:?}|{kv_cache_dtype:?}|{comm_dtype:?}|{nextn}|{nextn_accept_rates:?}"
     );
+    let key = include_workload_distribution_in_cache_identity(base_identity, workload_distribution);
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(existing) = cache.lock().unwrap().get(&key) {
         return Ok(Arc::clone(existing));
@@ -183,6 +193,7 @@ fn build_rust_engine(
         kv_cache_dtype.as_deref(), // kvcache_quant_mode
         fmha_dtype.as_deref(),     // fmha_quant_mode
         comm_dtype.as_deref(),     // comm_quant_mode
+        workload_distribution,     // MoE workload distribution
         nextn,                     // speculative (MTP) tokens; 0 for dense
         nextn_accept_rates,        // per-position accept rates
         None,                      // kv_block_size
@@ -213,6 +224,7 @@ pub(super) fn create_aic_callback(
     moe_tp_size: Option<usize>,
     moe_ep_size: Option<usize>,
     attention_dp_size: Option<usize>,
+    workload_distribution: Option<&str>,
     gemm_dtype: Option<&str>,
     moe_dtype: Option<&str>,
     fmha_dtype: Option<&str>,
@@ -233,6 +245,7 @@ pub(super) fn create_aic_callback(
             moe_tp_size,
             moe_ep_size,
             attention_dp_size,
+            workload_distribution,
             gemm_dtype,
             moe_dtype,
             fmha_dtype,
@@ -263,6 +276,7 @@ pub(super) fn create_aic_prefill_load_estimator(
     moe_tp_size: Option<usize>,
     moe_ep_size: Option<usize>,
     attention_dp_size: Option<usize>,
+    workload_distribution: Option<&str>,
     gemm_dtype: Option<&str>,
     moe_dtype: Option<&str>,
     fmha_dtype: Option<&str>,
@@ -283,6 +297,7 @@ pub(super) fn create_aic_prefill_load_estimator(
             moe_tp_size,
             moe_ep_size,
             attention_dp_size,
+            workload_distribution,
             gemm_dtype,
             moe_dtype,
             fmha_dtype,
@@ -344,4 +359,23 @@ pub(super) fn estimate_aic_num_gpu_blocks(
     kwargs.set_item("comm_dtype", comm_dtype)?;
     let blocks = module.call_method("estimate_num_gpu_blocks", (), Some(&kwargs))?;
     blocks.extract()
+}
+
+#[cfg(all(test, feature = "aic-forward-pass"))]
+mod tests {
+    use super::include_workload_distribution_in_cache_identity;
+
+    #[test]
+    fn workload_distribution_changes_compiled_engine_cache_identity() {
+        let base = "sglang|h100_pcie|deepseek|tp4ep4".to_string();
+        let balanced =
+            include_workload_distribution_in_cache_identity(base.clone(), Some("balanced"));
+        let power_law =
+            include_workload_distribution_in_cache_identity(base.clone(), Some("power_law"));
+        let default = include_workload_distribution_in_cache_identity(base, None);
+
+        assert_ne!(balanced, power_law);
+        assert_ne!(balanced, default);
+        assert_ne!(power_law, default);
+    }
 }

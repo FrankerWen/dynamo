@@ -255,6 +255,7 @@ def _load_aic_perf_config(args: argparse.Namespace):
         "aic_moe_tp_size": args.aic_moe_tp_size,
         "aic_moe_ep_size": args.aic_moe_ep_size,
         "aic_attention_dp_size": args.aic_attention_dp_size,
+        "aic_workload_distribution": args.aic_workload_distribution,
         # Normalize here so `--aic-*-dtype auto` (== model default) doesn't make
         # the "any AIC value set?" check below think an AIC config was requested
         # and then demand --aic-backend/--aic-system/--aic-model-path.
@@ -287,6 +288,7 @@ def _load_aic_perf_config(args: argparse.Namespace):
         aic_moe_tp_size=values["aic_moe_tp_size"],
         aic_moe_ep_size=values["aic_moe_ep_size"],
         aic_attention_dp_size=values["aic_attention_dp_size"],
+        aic_workload_distribution=values["aic_workload_distribution"],
         aic_gemm_dtype=values["aic_gemm_dtype"],
         aic_moe_dtype=values["aic_moe_dtype"],
         aic_fmha_dtype=values["aic_fmha_dtype"],
@@ -740,6 +742,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--aic-moe-tp-size", type=int)
     parser.add_argument("--aic-moe-ep-size", type=int)
     parser.add_argument("--aic-attention-dp-size", type=int)
+    parser.add_argument("--aic-workload-distribution")
     parser.add_argument(
         "--aic-gemm-dtype",
         help="dense-GEMM quant mode for the AIC KV-router prefill-load "

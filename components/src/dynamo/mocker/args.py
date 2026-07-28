@@ -391,6 +391,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "Corresponds to the 'dp' dimension in AIC CLI output.",
     )
     parser.add_argument(
+        "--aic-workload-distribution",
+        type=str,
+        default=None,
+        help="MoE workload distribution for AIC latency prediction, for example 'balanced'.",
+    )
+    parser.add_argument(
         "--aic-nextn",
         type=int,
         default=None,
@@ -484,6 +490,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=None,
         help="SGLang schedule conservativeness factor 0.0-1.0 (default: 1.0).",
+    )
+    parser.add_argument(
+        "--sglang-cuda-graph-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable CUDA-graph decode timing in the SGLang simulator.",
+    )
+    parser.add_argument(
+        "--sglang-cuda-graph-padding-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Pad SGLang decode timing batches to configured CUDA graph capture sizes.",
+    )
+    parser.add_argument(
+        "--sglang-cuda-graph-batch-sizes",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Strictly increasing SGLang CUDA graph capture batch sizes.",
     )
 
     # TensorRT-LLM-specific configuration

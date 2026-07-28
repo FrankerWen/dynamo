@@ -515,6 +515,12 @@ pub struct SglangArgs {
     /// Schedule conservativeness factor (0.0–1.0). Default: 1.0.
     #[validate(range(min = 0.0, max = 1.0))]
     pub schedule_conservativeness: Option<f64>,
+    /// Whether decode timing should use captured CUDA graph batches.
+    pub cuda_graph_enabled: Option<bool>,
+    /// Whether logical decode batches are padded to the next capture size.
+    pub cuda_graph_padding_enabled: Option<bool>,
+    /// CUDA graph capture batch sizes used by the target SGLang runtime.
+    pub cuda_graph_batch_sizes: Option<Vec<usize>>,
 }
 
 /// TensorRT-LLM-specific configuration parameters.
@@ -593,6 +599,7 @@ struct MockEngineArgsSerde {
     aic_moe_tp_size: OptionalConfigValue<usize>,
     aic_moe_ep_size: OptionalConfigValue<usize>,
     aic_attention_dp_size: OptionalConfigValue<usize>,
+    aic_workload_distribution: OptionalConfigValue<String>,
     aic_gemm_dtype: OptionalConfigValue<String>,
     aic_moe_dtype: OptionalConfigValue<String>,
     aic_fmha_dtype: OptionalConfigValue<String>,
@@ -769,6 +776,12 @@ pub struct MockEngineArgs {
     #[serde(skip)]
     #[builder(default = "None")]
     pub aic_attention_dp_size: Option<usize>,
+
+    /// MoE workload distribution used by AIC (for example, "balanced").
+    /// Kept in the compiled-engine cache identity because it changes MoE op timing.
+    #[serde(skip)]
+    #[builder(default = "None")]
+    pub aic_workload_distribution: Option<String>,
 
     /// Weight dtype override for AIC latency prediction.
     #[serde(skip)]
@@ -1067,6 +1080,22 @@ fn validate_mock_engine_args(args: &MockEngineArgs) -> Result<(), ValidationErro
         ));
     }
 
+    if let Some(capture_sizes) = args
+        .sglang
+        .as_ref()
+        .and_then(|sglang| sglang.cuda_graph_batch_sizes.as_ref())
+        && (capture_sizes.is_empty()
+            || capture_sizes.iter().any(|&size| size == 0)
+            || capture_sizes.windows(2).any(|pair| pair[0] >= pair[1]))
+    {
+        return Err(mock_engine_args_validation_error(
+            "sglang_invalid_cuda_graph_batch_sizes",
+            format!(
+                "engine_type=sglang requires cuda_graph_batch_sizes to be non-empty, positive, strictly increasing, got {capture_sizes:?}"
+            ),
+        ));
+    }
+
     Ok(())
 }
 
@@ -1180,6 +1209,9 @@ impl TryFrom<MockEngineArgsSerde> for MockEngineArgs {
         }
         if let Some(aic_attention_dp_size) = compat.aic_attention_dp_size.into_nullable() {
             builder = builder.aic_attention_dp_size(aic_attention_dp_size);
+        }
+        if let Some(aic_workload_distribution) = compat.aic_workload_distribution.into_nullable() {
+            builder = builder.aic_workload_distribution(aic_workload_distribution);
         }
         if let Some(aic_gemm_dtype) = compat.aic_gemm_dtype.into_nullable() {
             builder = builder.aic_gemm_dtype(aic_gemm_dtype);

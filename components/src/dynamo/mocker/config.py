@@ -51,6 +51,13 @@ def _build_sglang_args(args: argparse.Namespace) -> SglangArgs | None:
         "schedule_conservativeness": getattr(
             args, "sglang_schedule_conservativeness", None
         ),
+        "cuda_graph_enabled": getattr(args, "sglang_cuda_graph_enabled", None),
+        "cuda_graph_padding_enabled": getattr(
+            args, "sglang_cuda_graph_padding_enabled", None
+        ),
+        "cuda_graph_batch_sizes": getattr(
+            args, "sglang_cuda_graph_batch_sizes", None
+        ),
     }
     if not any(value is not None for value in sglang_args.values()):
         return None
@@ -273,6 +280,9 @@ def build_mocker_engine_args(args: argparse.Namespace) -> MockEngineArgs:
         aic_moe_tp_size=aic_moe_tp_size,
         aic_moe_ep_size=aic_moe_ep_size,
         aic_attention_dp_size=aic_attention_dp_size,
+        aic_workload_distribution=getattr(
+            args, "aic_workload_distribution", None
+        ),
         gpu_memory_utilization=getattr(args, "gpu_memory_utilization", None),
         mem_fraction_static=getattr(args, "mem_fraction_static", None),
         free_gpu_memory_fraction=getattr(args, "free_gpu_memory_fraction", None),

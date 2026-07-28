@@ -1873,6 +1873,7 @@ impl KvRouter {
                         config.moe_tp_size(),
                         config.moe_ep_size(),
                         config.attention_dp_size(),
+                        config.workload_distribution(),
                         config.gemm_dtype(),
                         config.moe_dtype(),
                         config.fmha_dtype(),

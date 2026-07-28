@@ -92,6 +92,7 @@ pub struct AicPerfConfig {
     aic_moe_tp_size: Option<usize>,
     aic_moe_ep_size: Option<usize>,
     aic_attention_dp_size: Option<usize>,
+    aic_workload_distribution: Option<String>,
     aic_gemm_dtype: Option<String>,
     aic_moe_dtype: Option<String>,
     aic_fmha_dtype: Option<String>,
@@ -134,6 +135,10 @@ impl AicPerfConfig {
         self.aic_attention_dp_size
     }
 
+    pub(crate) fn workload_distribution(&self) -> Option<&str> {
+        self.aic_workload_distribution.as_deref()
+    }
+
     pub(crate) fn gemm_dtype(&self) -> Option<&str> {
         self.aic_gemm_dtype.as_deref()
     }
@@ -166,7 +171,7 @@ impl AicPerfConfig {
 #[pymethods]
 impl AicPerfConfig {
     #[new]
-    #[pyo3(signature = (aic_backend, aic_system, aic_model_path, aic_tp_size=1, aic_backend_version=None, aic_moe_tp_size=None, aic_moe_ep_size=None, aic_attention_dp_size=None, aic_nextn=None, aic_nextn_accept_rates=None, aic_gemm_dtype=None, aic_moe_dtype=None, aic_fmha_dtype=None, aic_kv_cache_dtype=None, aic_comm_dtype=None))]
+    #[pyo3(signature = (aic_backend, aic_system, aic_model_path, aic_tp_size=1, aic_backend_version=None, aic_moe_tp_size=None, aic_moe_ep_size=None, aic_attention_dp_size=None, aic_workload_distribution=None, aic_nextn=None, aic_nextn_accept_rates=None, aic_gemm_dtype=None, aic_moe_dtype=None, aic_fmha_dtype=None, aic_kv_cache_dtype=None, aic_comm_dtype=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         aic_backend: String,
@@ -177,6 +182,7 @@ impl AicPerfConfig {
         aic_moe_tp_size: Option<usize>,
         aic_moe_ep_size: Option<usize>,
         aic_attention_dp_size: Option<usize>,
+        aic_workload_distribution: Option<String>,
         aic_nextn: Option<usize>,
         aic_nextn_accept_rates: Option<String>,
         aic_gemm_dtype: Option<String>,
@@ -224,6 +230,7 @@ impl AicPerfConfig {
             aic_moe_tp_size,
             aic_moe_ep_size,
             aic_attention_dp_size,
+            aic_workload_distribution,
             aic_gemm_dtype,
             aic_moe_dtype,
             aic_fmha_dtype,
@@ -820,6 +827,7 @@ async fn select_engine(
                             config.moe_tp_size(),
                             config.moe_ep_size(),
                             config.attention_dp_size(),
+                            config.workload_distribution(),
                             config.gemm_dtype(),
                             config.moe_dtype(),
                             config.fmha_dtype(),
@@ -868,6 +876,7 @@ async fn select_engine(
                 let moe_tp_size = mocker_args.aic_moe_tp_size;
                 let moe_ep_size = mocker_args.aic_moe_ep_size;
                 let attention_dp_size = mocker_args.aic_attention_dp_size;
+                let workload_distribution = mocker_args.aic_workload_distribution.as_deref();
                 let gemm_dtype = mocker_args.aic_gemm_dtype.as_deref();
                 let moe_dtype = mocker_args.aic_moe_dtype.as_deref();
                 let fmha_dtype = mocker_args.aic_fmha_dtype.as_deref();
@@ -886,6 +895,7 @@ async fn select_engine(
                         moe_tp_size,
                         moe_ep_size,
                         attention_dp_size,
+                        workload_distribution,
                         gemm_dtype,
                         moe_dtype,
                         fmha_dtype,

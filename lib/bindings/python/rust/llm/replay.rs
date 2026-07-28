@@ -106,7 +106,7 @@ impl SglangArgs {
 #[pymethods]
 impl SglangArgs {
     #[new]
-    #[pyo3(signature = (schedule_policy=None, page_size=None, max_prefill_tokens=None, chunked_prefill_size=None, clip_max_new_tokens=None, schedule_conservativeness=None))]
+    #[pyo3(signature = (schedule_policy=None, page_size=None, max_prefill_tokens=None, chunked_prefill_size=None, clip_max_new_tokens=None, schedule_conservativeness=None, cuda_graph_enabled=None, cuda_graph_padding_enabled=None, cuda_graph_batch_sizes=None))]
     fn new(
         schedule_policy: Option<String>,
         page_size: Option<usize>,
@@ -114,6 +114,9 @@ impl SglangArgs {
         chunked_prefill_size: Option<usize>,
         clip_max_new_tokens: Option<usize>,
         schedule_conservativeness: Option<f64>,
+        cuda_graph_enabled: Option<bool>,
+        cuda_graph_padding_enabled: Option<bool>,
+        cuda_graph_batch_sizes: Option<Vec<usize>>,
     ) -> PyResult<Self> {
         let inner = RsSglangArgs {
             schedule_policy,
@@ -122,6 +125,9 @@ impl SglangArgs {
             chunked_prefill_size,
             clip_max_new_tokens,
             schedule_conservativeness,
+            cuda_graph_enabled,
+            cuda_graph_padding_enabled,
+            cuda_graph_batch_sizes,
         };
         Ok(Self { inner })
     }
@@ -171,7 +177,7 @@ impl MockEngineArgs {
 #[pymethods]
 impl MockEngineArgs {
     #[new]
-    #[pyo3(signature = (engine_type="vllm", num_gpu_blocks=None, block_size=0, max_num_seqs=Some(256), max_num_batched_tokens=Some(8192), enable_prefix_caching=true, enable_chunked_prefill=true, speedup_ratio=1.0, decode_speedup_ratio=1.0, dp_size=1, startup_time=None, worker_type="aggregated", planner_profile_data=None, aic_backend=None, aic_system=None, aic_backend_version=None, aic_tp_size=None, aic_model_path=None, aic_moe_tp_size=None, aic_moe_ep_size=None, aic_attention_dp_size=None, aic_nextn=None, aic_nextn_accept_rates=None, aic_mtp_seed=42, aic_gemm_dtype=None, aic_moe_dtype=None, aic_fmha_dtype=None, aic_kv_cache_dtype=None, aic_comm_dtype=None, gpu_memory_utilization=None, mem_fraction_static=None, free_gpu_memory_fraction=None, enable_local_indexer=false, bootstrap_port=None, handoff_session_timeout_ms=300000, kv_bytes_per_token=None, kv_transfer_bandwidth=None, kv_transfer_timing_mode="full_prompt", reasoning=None, response_replay_trace_path=None, zmq_kv_events_port=None, zmq_replay_port=None, preemption_mode="lifo", router_queue_policy=None, sglang=None, trtllm=None, num_g2_blocks=None, num_g3_blocks=None, offload_batch_size=None, bandwidth_g1_to_g2_gbps=None, bandwidth_g2_to_g1_gbps=None, bandwidth_g2_to_g3_gbps=None, bandwidth_g3_to_g2_gbps=None, enable_g4_storage=false, bandwidth_g2_to_g4_gbps=None, bandwidth_g4_to_g2_gbps=None, max_model_len=None))]
+    #[pyo3(signature = (engine_type="vllm", num_gpu_blocks=None, block_size=0, max_num_seqs=Some(256), max_num_batched_tokens=Some(8192), enable_prefix_caching=true, enable_chunked_prefill=true, speedup_ratio=1.0, decode_speedup_ratio=1.0, dp_size=1, startup_time=None, worker_type="aggregated", planner_profile_data=None, aic_backend=None, aic_system=None, aic_backend_version=None, aic_tp_size=None, aic_model_path=None, aic_moe_tp_size=None, aic_moe_ep_size=None, aic_attention_dp_size=None, aic_workload_distribution=None, aic_nextn=None, aic_nextn_accept_rates=None, aic_mtp_seed=42, aic_gemm_dtype=None, aic_moe_dtype=None, aic_fmha_dtype=None, aic_kv_cache_dtype=None, aic_comm_dtype=None, gpu_memory_utilization=None, mem_fraction_static=None, free_gpu_memory_fraction=None, enable_local_indexer=false, bootstrap_port=None, handoff_session_timeout_ms=300000, kv_bytes_per_token=None, kv_transfer_bandwidth=None, kv_transfer_timing_mode="full_prompt", reasoning=None, response_replay_trace_path=None, zmq_kv_events_port=None, zmq_replay_port=None, preemption_mode="lifo", router_queue_policy=None, sglang=None, trtllm=None, num_g2_blocks=None, num_g3_blocks=None, offload_batch_size=None, bandwidth_g1_to_g2_gbps=None, bandwidth_g2_to_g1_gbps=None, bandwidth_g2_to_g3_gbps=None, bandwidth_g3_to_g2_gbps=None, enable_g4_storage=false, bandwidth_g2_to_g4_gbps=None, bandwidth_g4_to_g2_gbps=None, max_model_len=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         engine_type: &str,
@@ -195,6 +201,7 @@ impl MockEngineArgs {
         aic_moe_tp_size: Option<usize>,
         aic_moe_ep_size: Option<usize>,
         aic_attention_dp_size: Option<usize>,
+        aic_workload_distribution: Option<String>,
         aic_nextn: Option<usize>,
         aic_nextn_accept_rates: Option<String>,
         aic_mtp_seed: u64,
@@ -268,6 +275,7 @@ impl MockEngineArgs {
             .aic_moe_tp_size(aic_moe_tp_size)
             .aic_moe_ep_size(aic_moe_ep_size)
             .aic_attention_dp_size(aic_attention_dp_size)
+            .aic_workload_distribution(aic_workload_distribution)
             .aic_gemm_dtype(aic_gemm_dtype)
             .aic_moe_dtype(aic_moe_dtype)
             .aic_fmha_dtype(aic_fmha_dtype)
@@ -572,6 +580,16 @@ impl MockEngineArgs {
     }
 
     #[getter]
+    fn aic_workload_distribution(&self) -> Option<String> {
+        self.inner.aic_workload_distribution.clone()
+    }
+
+    #[setter]
+    fn set_aic_workload_distribution(&mut self, value: Option<String>) {
+        self.inner.aic_workload_distribution = value;
+    }
+
+    #[getter]
     fn aic_gemm_dtype(&self) -> Option<String> {
         self.inner.aic_gemm_dtype.clone()
     }
@@ -735,7 +753,7 @@ impl MockEngineArgs {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (bootstrap_port=None, zmq_kv_events_port=None, zmq_replay_port=None, kv_bytes_per_token=None, num_gpu_blocks=None, aic_backend=None, aic_system=None, aic_backend_version=None, aic_tp_size=None, aic_model_path=None, aic_moe_tp_size=None, aic_moe_ep_size=None, aic_attention_dp_size=None, aic_nextn=None, aic_nextn_accept_rates=None, aic_mtp_seed=None, aic_gemm_dtype=None, aic_moe_dtype=None, aic_fmha_dtype=None, aic_kv_cache_dtype=None, aic_comm_dtype=None, gpu_memory_utilization=None, mem_fraction_static=None, free_gpu_memory_fraction=None, enable_prefix_caching=None, worker_type=None))]
+    #[pyo3(signature = (bootstrap_port=None, zmq_kv_events_port=None, zmq_replay_port=None, kv_bytes_per_token=None, num_gpu_blocks=None, aic_backend=None, aic_system=None, aic_backend_version=None, aic_tp_size=None, aic_model_path=None, aic_moe_tp_size=None, aic_moe_ep_size=None, aic_attention_dp_size=None, aic_workload_distribution=None, aic_nextn=None, aic_nextn_accept_rates=None, aic_mtp_seed=None, aic_gemm_dtype=None, aic_moe_dtype=None, aic_fmha_dtype=None, aic_kv_cache_dtype=None, aic_comm_dtype=None, gpu_memory_utilization=None, mem_fraction_static=None, free_gpu_memory_fraction=None, enable_prefix_caching=None, worker_type=None))]
     fn with_overrides(
         &self,
         bootstrap_port: Option<u16>,
@@ -751,6 +769,7 @@ impl MockEngineArgs {
         aic_moe_tp_size: Option<usize>,
         aic_moe_ep_size: Option<usize>,
         aic_attention_dp_size: Option<usize>,
+        aic_workload_distribution: Option<String>,
         aic_nextn: Option<usize>,
         aic_nextn_accept_rates: Option<String>,
         aic_mtp_seed: Option<u64>,
@@ -806,6 +825,9 @@ impl MockEngineArgs {
         }
         if let Some(attention_dp_size) = aic_attention_dp_size {
             inner.aic_attention_dp_size = Some(attention_dp_size);
+        }
+        if let Some(workload_distribution) = aic_workload_distribution {
+            inner.aic_workload_distribution = Some(workload_distribution);
         }
         if let Some(dtype) = aic_gemm_dtype {
             inner.aic_gemm_dtype = Some(dtype);
@@ -1764,6 +1786,7 @@ fn materialize_replay_mocker_args(
         let moe_tp_size = args.aic_moe_tp_size;
         let moe_ep_size = args.aic_moe_ep_size;
         let attention_dp_size = args.aic_attention_dp_size;
+        let workload_distribution = args.aic_workload_distribution.clone();
         let gemm_dtype = args.aic_gemm_dtype.clone();
         let moe_dtype = args.aic_moe_dtype.clone();
         let fmha_dtype = args.aic_fmha_dtype.clone();
@@ -1823,6 +1846,7 @@ fn materialize_replay_mocker_args(
             moe_tp_size,
             moe_ep_size,
             attention_dp_size,
+            workload_distribution.as_deref(),
             gemm_dtype.as_deref(),
             moe_dtype.as_deref(),
             fmha_dtype.as_deref(),
@@ -1975,6 +1999,7 @@ fn load_replay_prefill_load_estimator(
         aic_perf_config.moe_tp_size(),
         aic_perf_config.moe_ep_size(),
         aic_perf_config.attention_dp_size(),
+        aic_perf_config.workload_distribution(),
         aic_perf_config.gemm_dtype(),
         aic_perf_config.moe_dtype(),
         aic_perf_config.fmha_dtype(),

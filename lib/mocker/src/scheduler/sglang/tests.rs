@@ -1180,6 +1180,137 @@ mod core_behavior {
     }
 
     #[test]
+    fn test_shared_prefix_is_matched_before_chunking() {
+        let config = SglangConfig {
+            chunked_prefill_size: 8,
+            ..SglangConfig::from_args(
+                &MockEngineArgs::builder()
+                    .block_size(1)
+                    .speedup_ratio(1.0)
+                    .build()
+                    .unwrap(),
+            )
+        };
+        let mut kv_manager = SglangKvManager::new(10000, 1, KvEventPublishers::default(), 0);
+        let shared_prefix = (0..12).collect::<Vec<_>>();
+        let cached = kv_manager.allocate_for_request(&shared_prefix).unwrap();
+        kv_manager.finish(&shared_prefix, cached.lease);
+
+        let mut prompt = shared_prefix;
+        prompt.extend(100..104);
+        let mut waiting = VecDeque::from([SglangRequest {
+            uuid: Uuid::from_u128(0xB001),
+            sequence_tokens: prompt.clone(),
+            prompt_len: prompt.len(),
+            max_output_tokens: 2,
+            planned_output_ids: None,
+            materialized_tokens: 0,
+            kv_lease: ActiveKvLease::default(),
+            allocated_tokens: 0,
+        }]);
+
+        let admit = get_new_batch_prefill(&mut waiting, &mut kv_manager, &config, 0.7, &[]);
+
+        assert!(waiting.is_empty());
+        assert_eq!(admit.can_run.len(), 1);
+        assert_eq!(admit.can_run[0].materialized_tokens, 16);
+        assert_eq!(admit.total_isl, 16);
+        assert_eq!(admit.total_prefix, 12);
+        assert_eq!(admit.prefill_fpm[0].tokens_computed, 4);
+        assert_eq!(admit.prefill_fpm[0].prefix_tokens, 12);
+        assert_eq!(admit.admissions.len(), 1);
+        assert_eq!(admit.admissions[0].reused_input_tokens, 12);
+    }
+
+    #[test]
+    fn test_shared_prefix_only_charges_fresh_tokens_to_chunk_budget() {
+        let config = SglangConfig {
+            chunked_prefill_size: 8,
+            ..SglangConfig::from_args(
+                &MockEngineArgs::builder()
+                    .block_size(1)
+                    .speedup_ratio(1.0)
+                    .build()
+                    .unwrap(),
+            )
+        };
+        let mut kv_manager = SglangKvManager::new(10000, 1, KvEventPublishers::default(), 0);
+        let shared_prefix = (0..12).collect::<Vec<_>>();
+        let cached = kv_manager.allocate_for_request(&shared_prefix).unwrap();
+        kv_manager.finish(&shared_prefix, cached.lease);
+
+        let mut waiting = VecDeque::new();
+        for (uuid, suffix) in [(0xB011, 100..104), (0xB012, 200..204)] {
+            let mut prompt = shared_prefix.clone();
+            prompt.extend(suffix);
+            waiting.push_back(SglangRequest {
+                uuid: Uuid::from_u128(uuid),
+                sequence_tokens: prompt.clone(),
+                prompt_len: prompt.len(),
+                max_output_tokens: 2,
+                planned_output_ids: None,
+                materialized_tokens: 0,
+                kv_lease: ActiveKvLease::default(),
+                allocated_tokens: 0,
+            });
+        }
+
+        let admit = get_new_batch_prefill(&mut waiting, &mut kv_manager, &config, 0.7, &[]);
+
+        assert!(waiting.is_empty());
+        assert_eq!(admit.can_run.len(), 2);
+        assert_eq!(admit.total_isl, 32);
+        assert_eq!(admit.total_prefix, 24);
+        assert_eq!(
+            admit
+                .prefill_fpm
+                .iter()
+                .map(|item| item.tokens_computed)
+                .collect::<Vec<_>>(),
+            vec![4, 4]
+        );
+        assert!(
+            admit
+                .admissions
+                .iter()
+                .all(|admission| admission.reused_input_tokens == 12)
+        );
+    }
+
+    #[test]
+    fn test_chunk_continuation_does_not_emit_a_second_admission() {
+        let config = SglangConfig {
+            chunked_prefill_size: 8,
+            ..SglangConfig::from_args(
+                &MockEngineArgs::builder()
+                    .block_size(1)
+                    .speedup_ratio(1.0)
+                    .build()
+                    .unwrap(),
+            )
+        };
+        let mut kv_manager = SglangKvManager::new(10000, 1, KvEventPublishers::default(), 0);
+        let mut waiting = VecDeque::from([SglangRequest {
+            uuid: Uuid::from_u128(0xB021),
+            sequence_tokens: (0..16).collect(),
+            prompt_len: 16,
+            max_output_tokens: 2,
+            planned_output_ids: None,
+            materialized_tokens: 0,
+            kv_lease: ActiveKvLease::default(),
+            allocated_tokens: 0,
+        }]);
+
+        let mut first = get_new_batch_prefill(&mut waiting, &mut kv_manager, &config, 0.7, &[]);
+        assert_eq!(first.admissions.len(), 1);
+        waiting.push_back(first.can_run.pop().unwrap());
+
+        let second = get_new_batch_prefill(&mut waiting, &mut kv_manager, &config, 0.7, &[]);
+        assert!(second.admissions.is_empty());
+        assert_eq!(second.can_run[0].materialized_tokens, 16);
+    }
+
+    #[test]
     fn test_chunked_prefill_subpage_budget_defers_next_request() {
         let config = SglangConfig {
             chunked_prefill_size: 8,

@@ -42,6 +42,9 @@ pub(super) struct SglangConfig {
     pub(super) kv_transfer_bandwidth: Option<f64>,
     pub(super) kv_transfer_timing_mode: KvTransferTimingMode,
     pub(super) speculative_max_tokens: Option<usize>,
+    pub(super) cuda_graph_enabled: bool,
+    pub(super) cuda_graph_padding_enabled: bool,
+    pub(super) cuda_graph_batch_sizes: Vec<usize>,
 }
 
 impl SglangConfig {
@@ -93,8 +96,40 @@ impl SglangConfig {
             kv_transfer_bandwidth: args.kv_transfer_bandwidth,
             kv_transfer_timing_mode: args.kv_transfer_timing_mode,
             speculative_max_tokens: args.aic_nextn.map(|nextn| nextn + 1),
+            cuda_graph_enabled: sglang.and_then(|s| s.cuda_graph_enabled).unwrap_or(false),
+            cuda_graph_padding_enabled: sglang
+                .and_then(|s| s.cuda_graph_padding_enabled)
+                .unwrap_or(false),
+            cuda_graph_batch_sizes: sglang
+                .and_then(|s| s.cuda_graph_batch_sizes.clone())
+                .unwrap_or_default(),
         }
     }
+
+    pub(super) fn decode_timing_batch_size(&self, logical_batch_size: usize) -> usize {
+        resolve_cuda_graph_batch_size(
+            logical_batch_size,
+            self.cuda_graph_enabled,
+            self.cuda_graph_padding_enabled,
+            &self.cuda_graph_batch_sizes,
+        )
+    }
+}
+
+fn resolve_cuda_graph_batch_size(
+    logical_batch_size: usize,
+    graph_enabled: bool,
+    padding_enabled: bool,
+    capture_sizes: &[usize],
+) -> usize {
+    if !graph_enabled || !padding_enabled {
+        return logical_batch_size;
+    }
+    capture_sizes
+        .iter()
+        .copied()
+        .find(|&capture_size| capture_size >= logical_batch_size)
+        .unwrap_or(logical_batch_size)
 }
 
 pub(super) fn ceil_to_block(tokens: usize, block_size: usize) -> usize {
@@ -107,4 +142,43 @@ pub(super) fn ceil_to_block(tokens: usize, block_size: usize) -> usize {
 
 pub(super) fn floor_to_block(tokens: usize, block_size: usize) -> usize {
     tokens / block_size * block_size
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_cuda_graph_batch_size;
+
+    const CAPTURE_SIZES: &[usize] = &[1, 2, 4, 8, 12, 16, 24, 32, 40, 48, 56, 64];
+
+    #[test]
+    fn cuda_graph_padding_uses_smallest_fitting_capture() {
+        assert_eq!(
+            resolve_cuda_graph_batch_size(9, true, true, CAPTURE_SIZES),
+            12
+        );
+        assert_eq!(
+            resolve_cuda_graph_batch_size(24, true, true, CAPTURE_SIZES),
+            24
+        );
+    }
+
+    #[test]
+    fn cuda_graph_padding_keeps_batch_above_max_capture() {
+        assert_eq!(
+            resolve_cuda_graph_batch_size(65, true, true, CAPTURE_SIZES),
+            65
+        );
+    }
+
+    #[test]
+    fn cuda_graph_disabled_or_unpadded_keeps_logical_batch() {
+        assert_eq!(
+            resolve_cuda_graph_batch_size(9, false, true, CAPTURE_SIZES),
+            9
+        );
+        assert_eq!(
+            resolve_cuda_graph_batch_size(9, true, false, CAPTURE_SIZES),
+            9
+        );
+    }
 }

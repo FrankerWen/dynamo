@@ -249,8 +249,9 @@ pub(super) fn simulate_decode_step_with_sampler(
         .sum();
     let avg_context = total_context / running.len();
     let active_kv_tokens = total_context.min(config.total_kv_tokens);
+    let timing_batch_size = config.decode_timing_batch_size(running.len());
     let decode_time = config.perf_model.predict_decode_time(
-        running.len(),
+        timing_batch_size,
         active_kv_tokens,
         avg_context,
         config.total_kv_tokens,
