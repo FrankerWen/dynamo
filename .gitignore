@@ -175,3 +175,16 @@ fern/components/install-selector-data.ts
 
 # Local git worktrees
 .worktrees/
+
+# Simulation & Benchmark Results
+results/dynosim_aic_align_acc/run1/
+results/**/*.json
+results/**/*.log
+results/**/*.bin
+
+# Allow committing lightweight Markdown reports, CSV summaries, and rendered images
+!results/**/*.md
+!results/**/*.csv
+!results/**/*.png
+!results/**/*.svg
+

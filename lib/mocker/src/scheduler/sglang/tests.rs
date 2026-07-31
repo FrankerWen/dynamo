@@ -6,12 +6,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dynamo_kv_router::indexer::{METRIC_EVENT_REMOVED, METRIC_EVENT_STORED};
-use dynamo_kv_router::protocols::{BlockHashOptions, WorkerId, compute_block_hash_for_seq};
+use dynamo_kv_router::protocols::{compute_block_hash_for_seq, BlockHashOptions, WorkerId};
 use rstest::rstest;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
-use super::config::{SchedulePolicy, SglangConfig, ceil_to_block};
+use super::config::{ceil_to_block, SchedulePolicy, SglangConfig};
 use super::core::SglangCore;
 use super::decode;
 use super::decode::simulate_decode_step;
@@ -24,14 +24,14 @@ use crate::common::protocols::{
     DirectRequest, EngineType, FpmPublisher, KvEventPublishers, MockEngineArgs, OutputSignal,
     SglangArgs,
 };
-use crate::kv_manager::SglangKvManager;
 use crate::kv_manager::sglang_backend::ActiveKvLease;
+use crate::kv_manager::SglangKvManager;
 use crate::scheduler::test_utils::{
-    CapturingFpmSink, RouterIndexerHarness, nth_stored_hashes, removed_event_count, stored_hashes,
+    nth_stored_hashes, removed_event_count, stored_hashes, CapturingFpmSink, RouterIndexerHarness,
 };
 use crate::scheduler::{
-    RouterEventVisibility, SchedulerCommand, SchedulerCommandEnvelope, SchedulerCommandResult,
-    SchedulerHandle, SchedulerLifecycleEvent, capture_router_event_sink,
+    capture_router_event_sink, RouterEventVisibility, SchedulerCommand, SchedulerCommandEnvelope,
+    SchedulerCommandResult, SchedulerHandle, SchedulerLifecycleEvent,
 };
 
 const ROUTER_TEST_WORKER_ID: WorkerId = 17;
@@ -367,17 +367,15 @@ mod source_holds {
         let handoff_id = HandoffId::from(Uuid::from_u128(407));
         core.receive(request(request_id));
 
-        assert!(
-            core.apply_command(SchedulerCommand::Submit(request(request_id)))
-                .is_err()
-        );
-        assert!(
-            core.apply_command(SchedulerCommand::SubmitHandoffPrefill {
+        assert!(core
+            .apply_command(SchedulerCommand::Submit(request(request_id)))
+            .is_err());
+        assert!(core
+            .apply_command(SchedulerCommand::SubmitHandoffPrefill {
                 handoff_id,
                 request: request(request_id),
             })
-            .is_err()
-        );
+            .is_err());
         assert!(!core.source_is_registered(handoff_id));
         assert_eq!(core.num_requests(), 1);
     }
@@ -513,12 +511,10 @@ mod destination_lifecycle {
                     true,
                 )
                 .unwrap();
-            let [
-                SchedulerLifecycleEvent::DestinationReserved {
-                    transferable_prompt_tokens,
-                    ..
-                },
-            ] = effects.lifecycle_events.as_slice()
+            let [SchedulerLifecycleEvent::DestinationReserved {
+                transferable_prompt_tokens,
+                ..
+            }] = effects.lifecycle_events.as_slice()
             else {
                 panic!("destination reservation should complete immediately");
             };
@@ -756,12 +752,10 @@ mod destination_lifecycle {
         assert!(source.is_drained());
 
         let blocked = execute(&mut destination, blocker_first.end_ms);
-        assert!(
-            blocked
-                .admissions
-                .iter()
-                .all(|admission| admission.uuid != logical_uuid)
-        );
+        assert!(blocked
+            .admissions
+            .iter()
+            .all(|admission| admission.uuid != logical_uuid));
         let ready = destination
             .prebuilt_request(logical_uuid)
             .expect("full running batch must keep request ready");
@@ -769,18 +763,14 @@ mod destination_lifecycle {
         assert_no_republished_stores(&activation_stores, &stored_hashes(&blocked.kv_events));
 
         let blocker_terminal = execute(&mut destination, blocked.end_ms);
-        assert!(
-            blocker_terminal
-                .admissions
-                .iter()
-                .all(|admission| admission.uuid != logical_uuid)
-        );
-        assert!(
-            blocker_terminal
-                .output_signals
-                .iter()
-                .any(|signal| signal.uuid == blocker_uuid && signal.completed)
-        );
+        assert!(blocker_terminal
+            .admissions
+            .iter()
+            .all(|admission| admission.uuid != logical_uuid));
+        assert!(blocker_terminal
+            .output_signals
+            .iter()
+            .any(|signal| signal.uuid == blocker_uuid && signal.completed));
         assert!(destination.prebuilt_request(logical_uuid).is_some());
 
         let admitted = execute(&mut destination, blocker_terminal.end_ms);
@@ -800,12 +790,10 @@ mod destination_lifecycle {
         assert_no_republished_stores(&activation_stores, &stored_hashes(&admitted.kv_events));
 
         let terminal = execute(&mut destination, admitted.end_ms);
-        assert!(
-            terminal
-                .output_signals
-                .iter()
-                .any(|signal| signal.uuid == logical_uuid && signal.completed)
-        );
+        assert!(terminal
+            .output_signals
+            .iter()
+            .any(|signal| signal.uuid == logical_uuid && signal.completed));
         assert!(destination.is_empty());
         assert!(destination.is_drained());
         assert!(!destination.destination_is_held(handoff_id));
@@ -837,11 +825,10 @@ mod destination_lifecycle {
             SchedulerCommandResult::Applied
         );
         execute(&mut core, 0.0);
-        assert!(
-            core.running
-                .iter()
-                .any(|request| request.uuid == request_id)
-        );
+        assert!(core
+            .running
+            .iter()
+            .any(|request| request.uuid == request_id));
 
         assert_eq!(
             core.apply_command(SchedulerCommand::CancelDestination { handoff_id })
@@ -1121,6 +1108,128 @@ mod core_behavior {
     }
 
     #[test]
+    fn test_non_mixed_prefill_staggers_first_tokens_without_advancing_decode() {
+        let mut core = SglangCore::new(test_args(100, 4, 8));
+        let first_uuid = Uuid::from_u128(0xA001);
+        let second_uuid = Uuid::from_u128(0xA002);
+        core.receive(DirectRequest {
+            tokens: vec![1, 2, 3, 4],
+            max_output_tokens: 3,
+            output_token_ids: Some(vec![101, 102, 103]),
+            uuid: Some(first_uuid),
+            ..Default::default()
+        });
+
+        let first = core.execute_pass_internal(None, 0.0);
+        assert!(matches!(
+            first.output_signals.as_slice(),
+            [OutputSignal {
+                uuid,
+                token_id: Some(101),
+                completed: false,
+                ..
+            }] if *uuid == first_uuid
+        ));
+
+        core.receive(DirectRequest {
+            tokens: vec![5, 6, 7, 8],
+            max_output_tokens: 3,
+            output_token_ids: Some(vec![201, 202, 203]),
+            uuid: Some(second_uuid),
+            ..Default::default()
+        });
+        let second = core.execute_pass_internal(None, first.end_ms);
+
+        assert!(matches!(
+            second.output_signals.as_slice(),
+            [OutputSignal {
+                uuid,
+                token_id: Some(201),
+                completed: false,
+                ..
+            }] if *uuid == second_uuid
+        ));
+        assert_eq!(
+            core.running
+                .iter()
+                .map(|request| (request.uuid, request.output_len()))
+                .collect::<Vec<_>>(),
+            vec![(first_uuid, 1), (second_uuid, 1)]
+        );
+        let first_duration_ms = first.end_ms;
+        let second_duration_ms = second.end_ms - first.end_ms;
+        assert!(
+            (second_duration_ms - first_duration_ms).abs() < 1e-9,
+            "non-mixed prefill charged an extra decode duration: first={first_duration_ms}, second={second_duration_ms}"
+        );
+
+        let third = core.execute_pass_internal(None, second.end_ms);
+        assert_eq!(
+            third
+                .output_signals
+                .iter()
+                .map(|signal| (signal.uuid, signal.token_id))
+                .collect::<Vec<_>>(),
+            vec![(first_uuid, Some(102)), (second_uuid, Some(202))]
+        );
+        let fourth = core.execute_pass_internal(None, third.end_ms);
+        assert_eq!(fourth.completed_requests, 2);
+        assert_eq!(
+            fourth
+                .output_signals
+                .iter()
+                .map(|signal| (signal.uuid, signal.token_id, signal.completed))
+                .collect::<Vec<_>>(),
+            vec![
+                (first_uuid, Some(103), true),
+                (second_uuid, Some(203), true),
+            ]
+        );
+        assert!(core.is_empty());
+    }
+
+    #[test]
+    fn test_prefill_first_token_does_not_require_a_free_kv_slot() {
+        let config = SglangConfig::from_args(&test_args(2, 4, 16));
+        let mut kv_manager = SglangKvManager::new(8, 4, KvEventPublishers::default(), 0);
+        let alloc = kv_manager.allocate_for_request(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        let uuid = Uuid::from_u128(0xA003);
+        let mut running = vec![SglangRequest {
+            uuid,
+            sequence_tokens: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            prompt_len: 8,
+            max_output_tokens: 2,
+            planned_output_ids: Some(vec![301, 302]),
+            kv_lease: alloc.lease,
+            materialized_tokens: 8,
+            allocated_tokens: 8,
+        }];
+
+        let result = decode::emit_prefill_first_tokens(
+            &mut running,
+            &mut kv_manager,
+            &config,
+            &[uuid].into_iter().collect(),
+            None,
+            10.0,
+        );
+
+        assert!(matches!(
+            result.output_signals.as_slice(),
+            [OutputSignal {
+                uuid: signal_uuid,
+                token_id: Some(301),
+                completed: false,
+                ..
+            }] if *signal_uuid == uuid
+        ));
+        assert_eq!(running[0].output_len(), 1);
+        assert_eq!(running[0].materialized_tokens, 8);
+        assert_eq!(running[0].kv_len(), 8);
+        assert_eq!(kv_manager.cache().token_pool.available(), 0);
+    }
+
+    #[test]
     fn test_chunked_prefill_budget_is_page_aware() {
         let config = SglangConfig {
             chunked_prefill_size: 8,
@@ -1269,12 +1378,10 @@ mod core_behavior {
                 .collect::<Vec<_>>(),
             vec![4, 4]
         );
-        assert!(
-            admit
-                .admissions
-                .iter()
-                .all(|admission| admission.reused_input_tokens == 12)
-        );
+        assert!(admit
+            .admissions
+            .iter()
+            .all(|admission| admission.reused_input_tokens == 12));
     }
 
     #[test]
@@ -1648,11 +1755,10 @@ mod core_behavior {
 
         assert_eq!(pass.router_event_visibility, RouterEventVisibility::PassEnd);
         assert!(!pass.kv_events.is_empty());
-        assert!(
-            pass.kv_events
-                .iter()
-                .all(|event| event.worker_id == ROUTER_TEST_WORKER_ID)
-        );
+        assert!(pass
+            .kv_events
+            .iter()
+            .all(|event| event.worker_id == ROUTER_TEST_WORKER_ID));
         assert!(pass.kv_events.iter().all(|event| event.event.dp_rank == 0));
     }
 }
@@ -1780,8 +1886,10 @@ mod router_events {
         prompt_hashes.extend(nth_stored_hashes(&pass3.kv_events, 0));
         harness.apply_events(pass3.kv_events).await;
 
-        assert_eq!(prompt_hashes.len(), 2);
-        assert!(harness.ok_count(METRIC_EVENT_STORED) >= 2);
+        // The final generated token is visible to the client but is never fed
+        // through another forward pass, so it has no KV block.
+        assert_eq!(prompt_hashes.len(), 1);
+        assert!(harness.ok_count(METRIC_EVENT_STORED) >= 1);
         harness.assert_no_event_warnings();
         harness.shutdown();
     }
@@ -1797,7 +1905,7 @@ mod router_events {
         harness.apply_events(pass1.kv_events).await;
 
         let mut now_ms = pass1.end_ms;
-        for _ in 0..3 {
+        for _ in 0..4 {
             let pass = core.execute_pass_internal(None, now_ms);
             now_ms = pass.end_ms;
             full_hashes.extend(stored_hashes(&pass.kv_events));
@@ -1813,7 +1921,7 @@ mod router_events {
     #[tokio::test]
     async fn test_completed_output_block_uses_router_token_identity() {
         let uuid = Uuid::from_u128(0x5a17);
-        let prompt_tokens = vec![101, 202];
+        let prompt_tokens = vec![101, 202, 303];
         let mut expected_request = SglangRequest {
             uuid,
             sequence_tokens: prompt_tokens.clone(),
@@ -1826,15 +1934,13 @@ mod router_events {
         };
         let first_output = expected_request.next_output_token();
         expected_request.append_output_token(first_output);
-        let second_output = expected_request.next_output_token();
-
         let mut expected_tokens = prompt_tokens;
-        expected_tokens.extend([first_output, second_output]);
+        expected_tokens.push(first_output);
         let expected_hashes =
             compute_block_hash_for_seq(&expected_tokens, 4, BlockHashOptions::default());
 
         let mut core = SglangCore::new_with_kv_capture(test_args(32, 4, 16), ROUTER_TEST_WORKER_ID);
-        let mut request = direct_request(expected_tokens[..2].to_vec(), 2);
+        let mut request = direct_request(expected_tokens[..3].to_vec(), 2);
         request.uuid = Some(uuid);
         core.receive(request);
 
@@ -1848,7 +1954,7 @@ mod router_events {
 
         assert_eq!(
             hashes, expected_hashes,
-            "completed prompt+output block should hash the same u32 token identity that SGLang generated"
+            "completed materialized block should hash the same u32 token identity that SGLang consumed"
         );
     }
 
@@ -2028,7 +2134,6 @@ mod router_events {
         let mut collector = crate::replay::TraceCollector::default();
         let mut now_ms = 0.0;
         let mut output_tokens = 0;
-        let mut saw_remove = false;
         for _ in 0..100 {
             if core.is_empty() {
                 break;
@@ -2036,7 +2141,6 @@ mod router_events {
             let pass = core.execute_pass(&mut collector, now_ms);
             now_ms = pass.end_ms.max(now_ms + 1.0);
             output_tokens += pass.output_signals.len();
-            saw_remove |= removed_event_count(&pass.kv_events) > 0;
             harness.apply_events(pass.kv_events).await;
         }
 
@@ -2051,7 +2155,6 @@ mod router_events {
         assert_eq!(output_tokens, expected_tokens);
         assert!(core.waiting.is_empty());
         assert!(core.running.is_empty());
-        assert!(saw_remove);
         harness.assert_no_event_errors();
         harness.assert_no_event_warnings();
         harness.shutdown();

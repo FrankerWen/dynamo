@@ -1,5 +1,9 @@
 # DynoSim SGLang B 场景 prefix 修复与 MAPE 对比
 
+> 本文保留首次 B-only 修复验收的边界与数据。B-mixed 7 点完成同一
+> prefix 修复的正式 run1 后，35 点正式结论已更新到
+> `DYNOSIM_PREFIX_FIX_FINAL.md`。
+
 ## 结论
 
 本次只重跑正式 B 场景的 7 个 RPS 点：
@@ -54,7 +58,7 @@ B-4 的运行证据形成了闭环：
   `9970.276894%` → `32.382273%`。
 - input throughput：`36645.920` → `94617.020 tok/s`；MAPE：
   `71.128152%` → `25.455053%`。
-- 两次复跑均无 AIC database miss，ingress 只占旧 TTFT 的极小部分，
+- 正式 run1 无 AIC database miss，ingress 只占旧 TTFT 的极小部分，
   且 scheduler arrival 未改变。
 
 因此，旧 B-4 的 35 秒 TTFT 不是 AIC 缺表、ingress 或 fake/balanced
@@ -116,14 +120,14 @@ root 在本次执行时已不在工作区，因此没有用其他目录冒充源
 DynoSim 算子计时使用 AIC `workload_distribution=balanced`。DynoSim
 不执行 fake TopK，本文不做该声明。
 
-两次完整 B replay 的验收结果：
+单次正式 B replay 的验收结果：
 
-- 每轮 7/7 点、690/690 requests 完成；
+- run1 完成 7/7 点、690/690 requests；
 - canonical trace 与保存的 source manifest SHA256 一致；
 - 无 NaN、负延迟或 AIC database miss；
 - H100 PCIe、SGLang 0.5.9、TP4/attention-DP1/MoE-TP1/EP4 映射合法；
 - preserved before artifacts 未修改；
-- canonical report、per-request、bench metrics、MAPE 两次哈希一致。
+- ACC report 仅由 run1 生成，不进行跨 run 平均。
 
 复跑入口为 `benchmarks/mocker/dynosim_b_prefix_fix_compare.py`。完整机器可读
 结果见输出根目录的 `before_after_mape.json` 和 `acceptance.json`，可读

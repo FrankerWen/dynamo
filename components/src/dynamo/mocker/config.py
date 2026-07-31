@@ -58,6 +58,9 @@ def _build_sglang_args(args: argparse.Namespace) -> SglangArgs | None:
         "cuda_graph_batch_sizes": getattr(
             args, "sglang_cuda_graph_batch_sizes", None
         ),
+        "enable_mixed_chunk": getattr(
+            args, "sglang_enable_mixed_chunk", getattr(args, "enable_mixed_chunk", None)
+        ),
     }
     if not any(value is not None for value in sglang_args.values()):
         return None

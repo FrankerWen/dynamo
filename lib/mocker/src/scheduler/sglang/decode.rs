@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::common::protocols::OutputSignal;
@@ -8,7 +9,7 @@ use crate::common::speculative::SpeculativeDecodeSampler;
 use crate::common::utils::compute_prefill_handoff_delay_ms;
 use crate::kv_manager::SglangKvManager;
 
-use super::config::{SglangConfig, floor_to_block};
+use super::config::{floor_to_block, SglangConfig};
 use super::request::SglangRequest;
 
 #[derive(Default)]
@@ -18,6 +19,106 @@ pub(super) struct DecodeResult {
     pub(super) output_signals: Vec<OutputSignal>,
     pub(super) retracted_any: bool,
     pub(super) end_ms: f64,
+}
+
+/// Emit the first output token for requests whose prompt prefill completed in
+/// the current pass. SGLang's non-mixed scheduler makes this token visible at
+/// the prefill boundary, without charging a second decode timing step. Existing
+/// running decode requests are deliberately not touched here.
+pub(super) fn emit_prefill_first_tokens(
+    running: &mut Vec<SglangRequest>,
+    kv_manager: &mut SglangKvManager,
+    config: &SglangConfig,
+    request_ids: &HashSet<uuid::Uuid>,
+    mut sampler: Option<&mut SpeculativeDecodeSampler>,
+    current_time_ms: f64,
+) -> DecodeResult {
+    let indices = running
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, req)| {
+            (request_ids.contains(&req.uuid) && req.output_len() == 0).then_some(idx)
+        })
+        .collect::<Vec<_>>();
+    if indices.is_empty() {
+        return DecodeResult {
+            end_ms: current_time_ms,
+            ..DecodeResult::default()
+        };
+    }
+
+    let mut bursts = Vec::with_capacity(indices.len());
+    for &idx in &indices {
+        let remaining = running[idx].remaining_output_tokens();
+        let burst = if remaining == 0 {
+            0
+        } else if config.worker_type == crate::common::protocols::WorkerType::Prefill {
+            1
+        } else if let Some(sampler) = sampler.as_deref_mut() {
+            sampler.sample_output_tokens(remaining)
+        } else {
+            1
+        };
+        bursts.push((idx, burst));
+    }
+    let mut output_signals = Vec::with_capacity(indices.len());
+    let mut completed_indices = Vec::new();
+    for &(idx, burst) in &bursts {
+        let req = &mut running[idx];
+        if burst == 0 {
+            output_signals.push(OutputSignal {
+                uuid: req.uuid,
+                token_id: None,
+                completed: true,
+                rejected: false,
+                handoff_delay_ms: compute_prefill_handoff_delay_ms(
+                    config.worker_type,
+                    true,
+                    req.prompt_len(),
+                    config.kv_transfer_bandwidth,
+                    config.kv_bytes_per_token,
+                ),
+            });
+            completed_indices.push(idx);
+            continue;
+        }
+        for _ in 0..burst {
+            let token_id = req.next_output_token();
+            req.append_unmaterialized_output_token(token_id);
+            let completed = req.output_len() >= req.max_output_tokens;
+            output_signals.push(OutputSignal {
+                uuid: req.uuid,
+                token_id: Some(token_id),
+                completed,
+                rejected: false,
+                handoff_delay_ms: compute_prefill_handoff_delay_ms(
+                    config.worker_type,
+                    completed,
+                    req.prompt_len(),
+                    config.kv_transfer_bandwidth,
+                    config.kv_bytes_per_token,
+                ),
+            });
+            if completed {
+                completed_indices.push(idx);
+                break;
+            }
+            cache_materialized_prefix(req, kv_manager, config);
+        }
+        req.debug_assert_invariants(config.block_size);
+    }
+
+    let mut completed_requests = Vec::with_capacity(completed_indices.len());
+    for &idx in completed_indices.iter().rev() {
+        completed_requests.push(running.remove(idx));
+    }
+    completed_requests.reverse();
+    DecodeResult {
+        completed_requests,
+        output_signals,
+        end_ms: current_time_ms,
+        ..DecodeResult::default()
+    }
 }
 
 fn decode_capacity_state(
@@ -37,8 +138,10 @@ fn decode_capacity_state(
         .iter()
         .map(|req| {
             let burst = max_burst.min(req.remaining_output_tokens());
-            let target =
-                super::config::ceil_to_block(req.current_sequence_len() + burst, config.block_size);
+            let target = super::config::ceil_to_block(
+                req.materialized_tokens + burst,
+                config.block_size,
+            );
             target.saturating_sub(req.allocated_tokens)
         })
         .sum();
@@ -161,7 +264,7 @@ pub(super) fn cleanup_completed_request(
     kv_manager: &mut SglangKvManager,
     block_size: usize,
 ) {
-    let tokens_to_cache = floor_to_block(request.current_sequence_len(), block_size);
+    let tokens_to_cache = floor_to_block(request.materialized_tokens, block_size);
     if !request.kv_lease.is_active() {
         return;
     }
@@ -243,10 +346,7 @@ pub(super) fn simulate_decode_step_with_sampler(
         };
     }
 
-    let total_context: usize = running
-        .iter()
-        .map(SglangRequest::current_sequence_len)
-        .sum();
+    let total_context: usize = running.iter().map(|req| req.materialized_tokens).sum();
     let avg_context = total_context / running.len();
     let active_kv_tokens = total_context.min(config.total_kv_tokens);
     let timing_batch_size = config.decode_timing_batch_size(running.len());
@@ -295,7 +395,7 @@ pub(super) fn simulate_decode_step_with_sampler(
             remaining.min(1)
         };
         for _ in 0..burst {
-            let crossing_page_boundary = req.current_sequence_len() + 1 > req.allocated_tokens;
+            let crossing_page_boundary = req.materialized_tokens + 1 > req.allocated_tokens;
             kv_manager.extend_decode(&mut req.kv_lease, &mut reservation);
             if crossing_page_boundary {
                 req.allocated_tokens += config.block_size;

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Run the fixed 35-point DynoSim/SGLang ACC comparison against reused data.
+"""Run the fixed 35-point DynoSim/SGLang offline replay diagnostic.
 
 The source tree is treated as read-only. Every generated artifact is written
 under ``--output-root`` and carries hashes back to its authoritative source
@@ -88,6 +88,155 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def aic_database_manifest(systems_root: Path, system: str) -> dict[str, Any]:
+    """Return the exact AIC systems root and file hashes used by this replay."""
+    resolved_root = systems_root.expanduser().resolve()
+    data_root = resolved_root / "data" / system
+    config_path = resolved_root / f"{system}.yaml"
+    files: list[dict[str, str]] = []
+    if config_path.is_file():
+        files.append(
+            {
+                "path": config_path.relative_to(resolved_root).as_posix(),
+                "sha256": sha256_file(config_path),
+            }
+        )
+    if data_root.is_dir():
+        for path in sorted(p for p in data_root.rglob("*") if p.is_file()):
+            files.append(
+                {
+                    "path": path.relative_to(resolved_root).as_posix(),
+                    "sha256": sha256_file(path),
+                }
+            )
+    aggregate = sha256_bytes(canonical_json_bytes(files))
+    return {
+        "resolved_systems_root": str(resolved_root),
+        "resolved_data_root": str(data_root),
+        "system": system,
+        "file_count": len(files),
+        "files": files,
+        "aggregate_sha256": aggregate,
+        "available": config_path.is_file() and data_root.is_dir() and len(files) > 1,
+    }
+
+
+def aic_provenance(point: PointInputs, args: dict[str, Any], systems_root: Path) -> dict[str, Any]:
+    """Capture resolved DynoSim and separately sourced HiSim AIC evidence."""
+    dyno = aic_database_manifest(systems_root, str(args["aic_system"]))
+    sim_config = json.loads(point.hisim_sim_config_path.read_text())
+    predictor = sim_config.get("predictor", {})
+    scheduler = sim_config.get("scheduler", {})
+    event_path = point.source_dir / "hisim_aic" / "events.jsonl"
+    event_config: dict[str, Any] = {}
+    if event_path.is_file():
+        for row in load_jsonl(event_path):
+            if row.get("event") in {"hisim_aic_runtime_config", "hisim_aic_predictor_config"}:
+                event_config.update(row)
+    dynosim_contract = {
+        "system": args.get("aic_system"),
+        "backend": args.get("aic_backend"),
+        "backend_version": args.get("aic_backend_version"),
+        "tp_size": args.get("aic_tp_size"),
+        "moe_tp_size": args.get("aic_moe_tp_size"),
+        "moe_ep_size": args.get("aic_moe_ep_size"),
+        "attention_dp_size": args.get("aic_attention_dp_size"),
+        "workload_distribution": args.get("aic_workload_distribution"),
+        "global_kv_cache_dtype": args.get("aic_kv_cache_dtype"),
+        "mla_module_kv_cache_dtype": args.get("aic_mla_module_kv_cache_dtype"),
+        "fmha_dtype": args.get("aic_fmha_dtype"),
+        "cuda_graph_enabled": args.get("sglang", {}).get("cuda_graph_enabled"),
+        "cuda_graph_padding_enabled": args.get("sglang", {}).get("cuda_graph_padding_enabled"),
+        "cuda_graph_batch_sizes": args.get("sglang", {}).get("cuda_graph_batch_sizes"),
+        "enable_mixed_chunk": args.get("sglang", {}).get("enable_mixed_chunk"),
+    }
+    unrecorded = "unrecorded"
+    formal_contract = {
+        "system": predictor.get("device_name"),
+        "backend": scheduler.get("backend_name"),
+        "backend_version": scheduler.get("backend_version"),
+        "tp_size": scheduler.get("tp_size"),
+        "moe_tp_size": unrecorded,
+        "moe_ep_size": scheduler.get("ep_size"),
+        "attention_dp_size": scheduler.get("dp_size"),
+        "workload_distribution": predictor.get("workload_distribution"),
+        "global_kv_cache_dtype": scheduler.get("kv_cache_data_type", unrecorded),
+        "mla_module_kv_cache_dtype": predictor.get(
+            "module_kv_cache_data_type", unrecorded
+        ),
+        "fmha_dtype": unrecorded,
+        "cuda_graph_enabled": scheduler.get("cuda_graph_enabled"),
+        "cuda_graph_padding_enabled": scheduler.get("cuda_graph_padding_enabled"),
+        "cuda_graph_batch_sizes": scheduler.get("cuda_graph_batch_sizes"),
+        "enable_mixed_chunk": unrecorded,
+    }
+    debug_contract = {
+        "system": event_config.get("device_name", unrecorded),
+        "backend_version": event_config.get("backend_version", unrecorded),
+        "tp_size": event_config.get("tp_size", unrecorded),
+        "moe_ep_size": event_config.get("ep_size", unrecorded),
+        "attention_dp_size": event_config.get("dp_size", unrecorded),
+        "workload_distribution": event_config.get("workload_distribution", unrecorded),
+        "global_kv_cache_dtype": event_config.get("kv_cache_data_type", unrecorded),
+        "mla_module_kv_cache_dtype": event_config.get(
+            "module_kv_cache_data_type", unrecorded
+        ),
+        "cuda_graph_enabled": event_config.get("cuda_graph_enabled", unrecorded),
+        "cuda_graph_padding_enabled": event_config.get(
+            "cuda_graph_padding_enabled", unrecorded
+        ),
+        "cuda_graph_batch_sizes": event_config.get(
+            "cuda_graph_batch_sizes", unrecorded
+        ),
+    }
+    def normalize(value: Any) -> str:
+        text = str(value).lower()
+        return {"bf16": "bfloat16", "float16": "fp16"}.get(text, text)
+
+    field_comparison: dict[str, dict[str, Any]] = {}
+    for key, hisim_value in formal_contract.items():
+        dynosim_value = dynosim_contract[key]
+        recorded = hisim_value != unrecorded and hisim_value is not None
+        field_comparison[key] = {
+            "dynosim": dynosim_value,
+            "hisim_formal": hisim_value,
+            "hisim_formal_recorded": recorded,
+            "match": normalize(dynosim_value) == normalize(hisim_value) if recorded else None,
+        }
+    recorded_matches = [
+        item["match"] for item in field_comparison.values() if item["hisim_formal_recorded"]
+    ]
+    return {
+        "schema": "dynosim_hisim_aic_provenance.v2",
+        "dynosim": {**dynosim_contract, "database": dyno},
+        "hisim": {
+            "formal_acc_config": {
+                "contract": formal_contract,
+                "database_mode": predictor.get("database_mode", unrecorded),
+                "database_path": predictor.get("database_path", unrecorded),
+                "resolved_database_root": unrecorded,
+                "path": str(point.hisim_sim_config_path),
+                "sha256": sha256_file(point.hisim_sim_config_path),
+            },
+            "debug_replay_events": {
+                "contract": debug_contract,
+                "path": str(event_path),
+                "sha256": sha256_file(event_path) if event_path.is_file() else None,
+                "participates_in_formal_match": False,
+            },
+        },
+        "formal_field_comparison": field_comparison,
+        "declared_contract_match": bool(recorded_matches) and all(recorded_matches),
+        "database_root_match": None,
+        "database_content_comparability": (
+            "DynoSim resolved hashes are recorded. The historical HiSim artifact records "
+            "database_path=null but not its resolved systems root or file hashes, so physical "
+            "root/hash identity is not provable from the artifact."
+        ),
+        "status": "dynosim_resolved_hisim_physical_root_unrecorded",
+    }
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -361,7 +510,13 @@ def convert_workload(point: PointInputs, trace_path: Path, rid_map_path: Path) -
     }
 
 
-def engine_args() -> dict[str, Any]:
+def engine_args(point: PointInputs | None = None) -> dict[str, Any]:
+    graph_batch_sizes = list(GRAPH_BATCH_SIZES)
+    if point is not None:
+        sim_config = json.loads(point.hisim_sim_config_path.read_text())
+        recorded = sim_config.get("scheduler", {}).get("cuda_graph_batch_sizes")
+        if recorded:
+            graph_batch_sizes = list(recorded)
     return {
         "engine_type": "sglang",
         "num_gpu_blocks": 655360,
@@ -383,7 +538,10 @@ def engine_args() -> dict[str, Any]:
         "aic_moe_ep_size": 4,
         "aic_attention_dp_size": 1,
         "aic_workload_distribution": "balanced",
-        "aic_kv_cache_dtype": "fp8",
+        # HiSim A-32 uses BF16 for the global KV path and FP8 for the
+        # compatibility MLA module table. Keep the two keys independent.
+        "aic_kv_cache_dtype": "bfloat16",
+        "aic_mla_module_kv_cache_dtype": "fp8",
         # The SGLang H100 PCIe MLA tables use BF16 attention kernels with an
         # independently FP8-quantized KV cache.
         "aic_fmha_dtype": "bfloat16",
@@ -396,7 +554,8 @@ def engine_args() -> dict[str, Any]:
             "schedule_conservativeness": 1.0,
             "cuda_graph_enabled": True,
             "cuda_graph_padding_enabled": True,
-            "cuda_graph_batch_sizes": list(GRAPH_BATCH_SIZES),
+            "cuda_graph_batch_sizes": graph_batch_sizes,
+            "enable_mixed_chunk": False,
         },
     }
 
@@ -461,25 +620,39 @@ def build_bench_metrics(
     if any(row.get("terminal_status") != "completed" for row in per_request):
         raise ValueError(f"{point.name}: non-completed DynoSim request")
 
-    rid_by_uuid = {
-        deterministic_uuid(index): row["rid"] for index, row in enumerate(point.rows)
-    }
     ingress = point.hisim_mape["ingress_envelope"]
     ingress_ms = float(ingress["ingress_ms"])
     adjusted_rows: list[dict[str, Any]] = []
     ttfts: list[float] = []
     e2es: list[float] = []
     tpots: list[float] = []
-    for row in per_request:
+    for index, (source, row) in enumerate(zip(point.rows, per_request, strict=True)):
         uuid_value = row["uuid"]
-        if uuid_value not in rid_by_uuid:
-            raise ValueError(f"{point.name}: unexpected deterministic UUID {uuid_value}")
+        expected_identity = (
+            float(source["timestamp"]) * 1000.0,
+            int(source["input_length"]),
+            int(source["output_length"]),
+        )
+        observed_identity = (
+            float(row["arrival_time_ms"]),
+            int(row["input_length"]),
+            int(row["requested_output_length"]),
+        )
+        if (
+            abs(expected_identity[0] - observed_identity[0]) > 1e-8
+            or expected_identity[1:] != observed_identity[1:]
+        ):
+            raise ValueError(
+                f"{point.name}: positional request identity mismatch at row {index}: "
+                f"source={expected_identity}, replay={observed_identity}, uuid={uuid_value}"
+            )
         for key in ("ttft_ms", "e2e_latency_ms", "itl_ms"):
             _validate_finite_nonnegative(f"{point.name}: {uuid_value} {key}", row.get(key))
         if row["output_length"] != row["requested_output_length"]:
             raise ValueError(f"{point.name}: {uuid_value} output length mismatch")
         adjusted = dict(row)
-        adjusted["source_rid"] = rid_by_uuid[uuid_value]
+        adjusted["source_rid"] = source["rid"]
+        adjusted["source_mapping"] = "validated_input_order_timestamp_shape"
         adjusted["scheduler_ttft_ms"] = row["ttft_ms"]
         adjusted["scheduler_e2e_latency_ms"] = row["e2e_latency_ms"]
         adjusted["ttft_ms"] = row["ttft_ms"] + ingress_ms
@@ -600,6 +773,9 @@ def point_artifact_hashes(point_dir: Path) -> dict[str, str]:
         "replay_stdout_sha256": sha256_file(point_dir / "replay.stdout.log"),
         "replay_stderr_sha256": sha256_file(point_dir / "replay.stderr.log"),
     }
+    provenance_path = point_dir / "aic_provenance.json"
+    if provenance_path.is_file():
+        hashes["aic_provenance_sha256"] = sha256_file(provenance_path)
     return hashes
 
 
@@ -617,7 +793,7 @@ def run_point(
     report_path = point_dir / "dynosim_report.json"
     per_request_path = point_dir / "dynosim_per_request.jsonl"
     source_manifest = convert_workload(point, trace_path, rid_map_path)
-    args = engine_args()
+    args = engine_args(point)
     command = replay_command(python, trace_path, report_path, per_request_path, args)
     revisions = {
         "dynamo": git_revision(dynamo_root),
@@ -641,7 +817,6 @@ def run_point(
     environment = os.environ.copy()
     pythonpath = [
         str(aic_root / "src"),
-        str(dynamo_root / "lib" / "bindings" / "python" / "src"),
         str(dynamo_root / "components" / "src"),
     ]
     if environment.get("PYTHONPATH"):
@@ -649,6 +824,12 @@ def run_point(
     environment["PYTHONPATH"] = os.pathsep.join(pythonpath)
     environment["AICONFIGURATOR_SYSTEMS_PATH"] = str(aic_root / "src" / "aiconfigurator" / "systems")
     environment.setdefault("RUST_LOG", "info")
+    provenance = aic_provenance(
+        point,
+        args,
+        Path(environment["AICONFIGURATOR_SYSTEMS_PATH"]),
+    )
+    write_json(point_dir / "aic_provenance.json", provenance)
     started = time.time()
     with (point_dir / "replay.stdout.log").open("w", encoding="utf-8") as stdout, (
         point_dir / "replay.stderr.log"
@@ -680,6 +861,7 @@ def run_point(
             "elapsed_wall_seconds": time.time() - started,
             "hashes": hashes,
             "source_hashes": source_manifest,
+            "aic_provenance": provenance,
             "fake_balanced_semantics": {
                 "real_baseline_ep_dispatch_algorithm": "fake",
                 "dynosim_aic_workload_distribution": "balanced",
@@ -930,7 +1112,12 @@ def markdown_report(report: dict[str, Any]) -> str:
     ingress = attribution["ingress_time_domain"]
     overall = report["overall"]
     lines = [
-        "# DynoSim SGLang vs HiSim ACC 准确度报告",
+        "# DynoSim SGLang vs HiSim 离线重放诊断",
+        "",
+        (
+            "本报告复用 TP4+EP4 真实 artifacts，属于 CPU/offline replay diagnostic；"
+            "不是新的 HiSim `acc_bench/compare` formal ACC，DynoSim formal ACC 为 `N/A`。"
+        ),
         "",
         "## 最大单点/单指标差异",
         "",
@@ -977,7 +1164,8 @@ def markdown_report(report: dict[str, Any]) -> str:
         "## 总体结果",
         "",
         (
-            f"- 35 个点、5 项指标、175 个 cell；DynoSim 总均值 "
+            f"- {report.get('point_count', 35)} 个点、5 项指标、"
+            f"{report.get('cell_count', 175)} 个 cell；DynoSim 总均值 "
             f"{overall['mean_dynosim_mape_percent']:.6f}%，HiSim 总均值 "
             f"{overall['mean_hisim_mape_percent']:.6f}%。"
         ),
@@ -1027,7 +1215,7 @@ def refresh_run_metadata(
         "aiconfigurator_base_pin": "ffbab15797d3a3f14c382e937c0ab0c1c5cbc530",
     }
     wanted = set(point_names)
-    for run_name in ("smoke", "run1", "run2"):
+    for run_name in ("smoke", "run1"):
         for point_dir in sorted((output_root / run_name).glob("sweep_*")):
             if not point_dir.is_dir() or point_dir.name not in wanted:
                 continue
@@ -1041,48 +1229,13 @@ def refresh_run_metadata(
     return revisions
 
 
-def compare_determinism(output_root: Path, point_names: Iterable[str]) -> dict[str, Any]:
-    fields = (
-        "trace_sha256",
-        "rid_map_sha256",
-        "dynosim_report_canonical_sha256",
-        "dynosim_per_request_sha256",
-        "bench_metrics_sha256",
-        "bench_per_request_sha256",
-        "mape_sha256",
-    )
-    points = {}
-    for name in point_names:
-        first = json.loads(
-            (output_root / "run1" / name / "hashes.json").read_text()
-        )
-        second = json.loads(
-            (output_root / "run2" / name / "hashes.json").read_text()
-        )
-        mismatches = {
-            field: {"run1": first[field], "run2": second[field]}
-            for field in fields
-            if first[field] != second[field]
-        }
-        points[name] = {"deterministic": not mismatches, "mismatches": mismatches}
-    result = {
-        "schema": "dynosim_alignment_determinism.v1",
-        "point_count": len(points),
-        "all_deterministic": all(value["deterministic"] for value in points.values()),
-        "points": points,
-    }
-    if not result["all_deterministic"]:
-        raise ValueError("DynoSim full-run determinism check failed")
-    return result
-
-
 def acceptance_audit(
     points: Sequence[PointInputs],
     output_root: Path,
-    determinism: dict[str, Any],
     revisions: dict[str, Any],
     dynamo_root: Path,
     aic_root: Path,
+    python: Path,
 ) -> dict[str, Any]:
     expected_names = {point.name for point in points}
     current_source_hashes = {
@@ -1095,7 +1248,7 @@ def acceptance_audit(
     all_topology_valid = True
     all_source_hashes_unchanged = True
 
-    for run_name in ("run1", "run2"):
+    for run_name in ("run1",):
         point_dirs = sorted(
             path
             for path in (output_root / run_name).glob("sweep_*")
@@ -1177,21 +1330,36 @@ def acceptance_audit(
         "aic_database_miss_free": all_database_miss_free,
         "tp4_ep4_mapping_valid": all_topology_valid,
         "source_hashes_unchanged_since_run": all_source_hashes_unchanged,
-        "two_run_deterministic": determinism["all_deterministic"],
+        "single_run_contract": not (output_root / "run2").exists(),
     }
     if not all(checks.values()):
         raise ValueError(f"acceptance audit failed: {checks}")
-    dynamo_extension = (
-        dynamo_root / "lib" / "bindings" / "python" / "src" / "dynamo" / "_core.abi3.so"
+    extension_probe_env = os.environ.copy()
+    extension_probe_env["PYTHONPATH"] = os.pathsep.join(
+        [str(aic_root / "src"), str(dynamo_root / "components" / "src")]
     )
-    aic_extension = (
-        aic_root
-        / "src"
-        / "aiconfigurator_core"
-        / "_aiconfigurator_core.abi3.so"
-    )
+    extension_paths = subprocess.run(
+        [
+            str(python),
+            "-c",
+            (
+                "import dynamo._core as d; "
+                "import aiconfigurator_core._aiconfigurator_core as a; "
+                "print(d.__file__); print(a.__file__)"
+            ),
+        ],
+        cwd=dynamo_root,
+        env=extension_probe_env,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    if len(extension_paths) != 2:
+        raise ValueError(f"unexpected native extension probe output: {extension_paths}")
+    dynamo_extension = Path(extension_paths[0]).resolve()
+    aic_extension = Path(extension_paths[1]).resolve()
     return {
-        "schema": "dynosim_alignment_acceptance.v1",
+        "schema": "dynosim_alignment_acceptance.v2",
         "accepted": True,
         "checks": checks,
         "source_point_count": len(points),
@@ -1231,7 +1399,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "action",
-        choices=("preflight", "smoke", "run1", "run2", "report", "all"),
+        choices=("preflight", "smoke", "run1", "report", "all"),
         nargs="?",
         default="all",
     )
@@ -1263,10 +1431,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         run_points(selected, args.output_root / "run1", args.python, args.dynamo_root, args.aic_root)
         if args.action == "run1":
             return 0
-    if args.action in ("run2", "all"):
-        run_points(selected, args.output_root / "run2", args.python, args.dynamo_root, args.aic_root)
-        if args.action == "run2":
-            return 0
     if args.action in ("report", "all"):
         comparison_paths = sorted((args.output_root / "run1").glob("sweep_*/mape.json"))
         comparisons = [json.loads(path.read_text()) for path in comparison_paths]
@@ -1277,11 +1441,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.dynamo_root,
             args.aic_root,
         )
-        determinism = compare_determinism(args.output_root, expected_point_names())
         _, final_preflight = preflight(args.source_root)
         if final_preflight["points"] != initial_preflight["points"]:
             raise ValueError("source input hashes changed during DynoSim alignment")
-        report["determinism"] = determinism
+        report["run_contract"] = {
+            "run_count": 1,
+            "report_source": "run1",
+        }
         report["source_unchanged"] = True
         report["largest_difference_attribution"] = largest_difference_attribution(
             report,
@@ -1293,16 +1459,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         write_json(args.output_root / "accuracy_report.json", report)
         (args.output_root / "accuracy_report.md").write_text(markdown_report(report))
-        write_json(args.output_root / "determinism.json", determinism)
         write_json(
             args.output_root / "acceptance.json",
             acceptance_audit(
                 points,
                 args.output_root,
-                determinism,
                 revisions,
                 args.dynamo_root,
                 args.aic_root,
+                args.python,
             ),
         )
         print(

@@ -1878,6 +1878,7 @@ impl KvRouter {
                         config.moe_dtype(),
                         config.fmha_dtype(),
                         config.kv_cache_dtype(),
+                        config.mla_module_kv_cache_dtype(),
                         config.comm_dtype(),
                         config.nextn(),
                         config.nextn_accept_rates(),

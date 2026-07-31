@@ -45,6 +45,7 @@ pub(super) struct SglangConfig {
     pub(super) cuda_graph_enabled: bool,
     pub(super) cuda_graph_padding_enabled: bool,
     pub(super) cuda_graph_batch_sizes: Vec<usize>,
+    pub(super) enable_mixed_chunk: bool,
 }
 
 impl SglangConfig {
@@ -103,6 +104,9 @@ impl SglangConfig {
             cuda_graph_batch_sizes: sglang
                 .and_then(|s| s.cuda_graph_batch_sizes.clone())
                 .unwrap_or_default(),
+            enable_mixed_chunk: sglang
+                .and_then(|s| s.enable_mixed_chunk)
+                .unwrap_or(false),
         }
     }
 

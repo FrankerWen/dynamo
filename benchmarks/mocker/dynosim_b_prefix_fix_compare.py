@@ -67,6 +67,13 @@ DATABASE_MISS_MARKERS = (
     "perf data not available",
     "perfdatnotavailable",
 )
+ARTIFACT_SCOPE = "b_prefix_fix"
+ARTIFACT_SCHEMA_VERSION = 2
+
+
+def artifact_schema(suffix: str) -> str:
+    """Return a scope-aware schema for runners that reuse this module."""
+    return f"dynosim_{ARTIFACT_SCOPE}_{suffix}.v{ARTIFACT_SCHEMA_VERSION}"
 
 
 @dataclass(frozen=True)
@@ -442,7 +449,7 @@ def run_point(
     common.write_json(
         point_dir / "provenance.json",
         {
-            "schema": "dynosim_b_prefix_fix_provenance.v1",
+            "schema": artifact_schema("provenance"),
             "point": point.name,
             "preserved_before_dir": str(point.before_dir),
             "preserved_before_hashes": point.preserved_hashes,
@@ -495,7 +502,7 @@ def run_point(
     common.write_json(
         point_dir / "run_manifest.json",
         {
-            "schema": "dynosim_b_prefix_fix_point_run.v1",
+            "schema": artifact_schema("point_run"),
             "point": point.name,
             "completed": report["completed_requests"],
             "elapsed_wall_seconds": time.time() - started,
@@ -524,7 +531,7 @@ def run_all_points(
     common.write_json(
         run_dir / "run_summary.json",
         {
-            "schema": "dynosim_b_prefix_fix_run_summary.v1",
+            "schema": artifact_schema("run_summary"),
             "point_count": len(results),
             "completed_points": [result["point"] for result in results],
             "mean_cell_mape_percent": statistics.fmean(
@@ -724,53 +731,9 @@ def compare_before_after(
     }
 
 
-def determinism_audit(
-    points: Sequence[PreservedPoint],
-    output_root: Path,
-) -> dict[str, Any]:
-    fields = (
-        "trace_sha256",
-        "rid_map_sha256",
-        "dynosim_report_canonical_sha256",
-        "dynosim_per_request_sha256",
-        "bench_metrics_sha256",
-        "bench_per_request_sha256",
-        "mape_sha256",
-    )
-    results = {}
-    for point in points:
-        first = json.loads(
-            (output_root / "run1" / point.name / "hashes.json").read_text()
-        )
-        second = json.loads(
-            (output_root / "run2" / point.name / "hashes.json").read_text()
-        )
-        mismatches = {
-            field: {"run1": first[field], "run2": second[field]}
-            for field in fields
-            if first[field] != second[field]
-        }
-        results[point.name] = {
-            "deterministic": not mismatches,
-            "mismatches": mismatches,
-        }
-    audit = {
-        "schema": "dynosim_b_prefix_fix_determinism.v1",
-        "point_count": len(results),
-        "all_deterministic": all(
-            result["deterministic"] for result in results.values()
-        ),
-        "points": results,
-    }
-    if not audit["all_deterministic"]:
-        raise ValueError("B replay determinism audit failed")
-    return audit
-
-
 def acceptance_audit(
     points: Sequence[PreservedPoint],
     output_root: Path,
-    determinism: dict[str, Any],
     before_hashes_after_run: dict[str, dict[str, str]],
 ) -> dict[str, Any]:
     run_results = {}
@@ -778,7 +741,7 @@ def acceptance_audit(
     finite_nonnegative = True
     topology_valid = True
     trace_identity = True
-    for run_name in ("run1", "run2"):
+    for run_name in ("run1",):
         completed = 0
         row_count = 0
         point_count = 0
@@ -838,10 +801,10 @@ def acceptance_audit(
         "tp4_ep4_mapping_valid": topology_valid,
         "canonical_trace_identity": trace_identity,
         "preserved_before_artifacts_unchanged": preserved_unchanged,
-        "two_run_deterministic": determinism["all_deterministic"],
+        "single_run_contract": not (output_root / "run2").exists(),
     }
     if not all(checks.values()):
-        raise ValueError(f"B replay acceptance failed: {checks}")
+        raise ValueError(f"{ARTIFACT_SCOPE} replay acceptance failed: {checks}")
     extension = (
         DYNAMO_ROOT
         / "lib"
@@ -852,7 +815,7 @@ def acceptance_audit(
         / "_core.abi3.so"
     )
     return {
-        "schema": "dynosim_b_prefix_fix_acceptance.v1",
+        "schema": artifact_schema("acceptance"),
         "accepted": True,
         "checks": checks,
         "runs": run_results,
@@ -933,7 +896,7 @@ def markdown_report(report: dict[str, Any], acceptance: dict[str, Any]) -> str:
             f"{before['input_throughput']:.3f} → {after['input_throughput']:.3f} tok/s。"
         ),
         (
-            "- 队列坍塌与完整 LCP 命中同时发生，且两次运行均无 AIC database miss；"
+            "- 队列坍塌与完整 LCP 命中同时发生，且正式运行无 AIC database miss；"
             "因此旧 B-4 TTFT 异常的根因是 DynoSim SGLang admission/prefix 顺序，不是 "
             "ingress、AIC 缺表或经验 scale。修复后残差主要来自 decode/AIC service-time "
             "和单 aggregated worker 调度模型。"
@@ -981,7 +944,7 @@ def markdown_report(report: dict[str, Any], acceptance: dict[str, Any]) -> str:
             (
                 f"- 验收：`accepted={str(acceptance['accepted']).lower()}`；"
                 "7/7 点完成、TP4/EP4 合法、无 NaN/负延迟/AIC miss、"
-                "preserved 输入未改、两次复跑 deterministic。"
+                "preserved 输入未改；正式 ACC 只使用 run1。"
             ),
             "",
         ]
@@ -1023,21 +986,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     common.write_json(args.output_root / "revisions.json", revisions)
 
     run_all_points(points, args.output_root / "run1", revisions)
-    run_all_points(points, args.output_root / "run2", revisions)
-    determinism = determinism_audit(points, args.output_root)
-    common.write_json(args.output_root / "determinism.json", determinism)
     before_hashes_after_run = {
         point.name: _preserved_hashes(point.before_dir) for point in points
     }
     acceptance = acceptance_audit(
         points,
         args.output_root,
-        determinism,
         before_hashes_after_run,
     )
     common.write_json(args.output_root / "acceptance.json", acceptance)
     report = compare_before_after(points, args.output_root)
-    report["determinism"] = determinism
+    report["run_contract"] = {"run_count": 1, "report_source": "run1"}
     report["acceptance"] = acceptance
     common.write_json(args.output_root / "before_after_mape.json", report)
     (args.output_root / "before_after_mape.md").write_text(

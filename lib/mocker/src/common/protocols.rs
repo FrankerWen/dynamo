@@ -521,6 +521,8 @@ pub struct SglangArgs {
     pub cuda_graph_padding_enabled: Option<bool>,
     /// CUDA graph capture batch sizes used by the target SGLang runtime.
     pub cuda_graph_batch_sizes: Option<Vec<usize>>,
+    /// Whether to enable mixed chunking / hybrid prefill+decode (IFB) batching. Default: false.
+    pub enable_mixed_chunk: Option<bool>,
 }
 
 /// TensorRT-LLM-specific configuration parameters.
@@ -604,6 +606,7 @@ struct MockEngineArgsSerde {
     aic_moe_dtype: OptionalConfigValue<String>,
     aic_fmha_dtype: OptionalConfigValue<String>,
     aic_kv_cache_dtype: OptionalConfigValue<String>,
+    aic_mla_module_kv_cache_dtype: OptionalConfigValue<String>,
     aic_comm_dtype: OptionalConfigValue<String>,
     aic_nextn: OptionalConfigValue<usize>,
     aic_nextn_accept_rates: OptionalConfigValue<String>,
@@ -802,6 +805,11 @@ pub struct MockEngineArgs {
     #[serde(skip)]
     #[builder(default = "None")]
     pub aic_kv_cache_dtype: Option<String>,
+
+    /// Compatibility KV-cache dtype for the archived SGLang MLA module table.
+    #[serde(skip)]
+    #[builder(default = "None")]
+    pub aic_mla_module_kv_cache_dtype: Option<String>,
 
     /// Communication (collective) dtype override for AIC latency prediction.
     #[serde(skip)]
@@ -1224,6 +1232,9 @@ impl TryFrom<MockEngineArgsSerde> for MockEngineArgs {
         }
         if let Some(aic_kv_cache_dtype) = compat.aic_kv_cache_dtype.into_nullable() {
             builder = builder.aic_kv_cache_dtype(aic_kv_cache_dtype);
+        }
+        if let Some(aic_mla_module_kv_cache_dtype) = compat.aic_mla_module_kv_cache_dtype.into_nullable() {
+            builder = builder.aic_mla_module_kv_cache_dtype(aic_mla_module_kv_cache_dtype);
         }
         if let Some(aic_comm_dtype) = compat.aic_comm_dtype.into_nullable() {
             builder = builder.aic_comm_dtype(aic_comm_dtype);
@@ -1665,6 +1676,7 @@ mod tests {
                 "aic_moe_dtype": "w4a16_mxfp4",
                 "aic_fmha_dtype": "bfloat16",
                 "aic_kv_cache_dtype": "fp8",
+                "aic_mla_module_kv_cache_dtype": "bfloat16",
                 "aic_comm_dtype": "fp8",
             })
             .to_string(),
@@ -1675,6 +1687,10 @@ mod tests {
         assert_eq!(args.aic_moe_dtype.as_deref(), Some("w4a16_mxfp4"));
         assert_eq!(args.aic_fmha_dtype.as_deref(), Some("bfloat16"));
         assert_eq!(args.aic_kv_cache_dtype.as_deref(), Some("fp8"));
+        assert_eq!(
+            args.aic_mla_module_kv_cache_dtype.as_deref(),
+            Some("bfloat16")
+        );
         assert_eq!(args.aic_comm_dtype.as_deref(), Some("fp8"));
     }
 

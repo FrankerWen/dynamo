@@ -139,7 +139,20 @@ def test_engine_args_fix_sglang_graph_and_tp4_ep4_balanced_mapping():
         args["aic_moe_tp_size"] * args["aic_moe_ep_size"]
     )
     assert args["aic_workload_distribution"] == "balanced"
-    assert args["aic_kv_cache_dtype"] == "fp8"
+    assert args["aic_kv_cache_dtype"] == "bfloat16"
+    assert args["aic_mla_module_kv_cache_dtype"] == "fp8"
     assert args["aic_fmha_dtype"] == "bfloat16"
     assert args["sglang"]["cuda_graph_padding_enabled"] is True
     assert args["sglang"]["cuda_graph_batch_sizes"][-1] == 64
+
+
+def test_engine_args_reuses_per_point_formal_cuda_graph_contract(tmp_path):
+    point_path = _write_point(tmp_path, "sweep_d_rps_point_32")
+    sim_config_path = point_path / "acc_bench" / "hisim_aic" / "sim_config.json"
+    sim_config = json.loads(sim_config_path.read_text())
+    sim_config["scheduler"]["cuda_graph_batch_sizes"] = [1, 2, 4, 8, 16, 32, 64, 128]
+    sim_config_path.write_text(json.dumps(sim_config))
+
+    args = engine_args(load_and_validate_point(point_path))
+
+    assert args["sglang"]["cuda_graph_batch_sizes"] == [1, 2, 4, 8, 16, 32, 64, 128]

@@ -510,6 +510,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Strictly increasing SGLang CUDA graph capture batch sizes.",
     )
+    parser.add_argument(
+        "--sglang-enable-mixed-chunk",
+        "--enable-mixed-chunk",
+        action=argparse.BooleanOptionalAction,
+        dest="sglang_enable_mixed_chunk",
+        default=None,
+        help="Enable SGLang mixed chunking / hybrid prefill+decode (IFB) batching (default: False).",
+    )
 
     # TensorRT-LLM-specific configuration
     parser.add_argument(

@@ -96,6 +96,10 @@ impl SglangRequest {
         self.materialized_tokens += 1;
     }
 
+    pub(super) fn append_unmaterialized_output_token(&mut self, token: u32) {
+        self.sequence_tokens.push(token);
+    }
+
     pub(super) fn debug_assert_invariants(&self, _block_size: usize) {
         #[cfg(debug_assertions)]
         {

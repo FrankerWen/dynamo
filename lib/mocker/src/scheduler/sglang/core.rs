@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::time::Duration;
 
@@ -9,10 +10,10 @@ use uuid::Uuid;
 
 use crate::common::handoff::HandoffId;
 use crate::common::protocols::{DirectRequest, KvEventPublishers, MockEngineArgs, WorkerType};
-use crate::common::speculative::{SpeculativeDecodeSampler, normalize_conditional_accept_rates};
+use crate::common::speculative::{normalize_conditional_accept_rates, SpeculativeDecodeSampler};
 use crate::common::utils::prefill_handoff_transfer_timing;
-use crate::kv_manager::SglangKvManager;
 use crate::kv_manager::sglang_backend::SglangDestinationReservation;
+use crate::kv_manager::SglangKvManager;
 use crate::replay::TraceCollector;
 
 use super::config::SglangConfig;
@@ -23,11 +24,11 @@ use super::policy::apply_schedule_policy;
 use super::prefill::get_new_batch_prefill;
 use super::request::SglangRequest;
 use crate::scheduler::{
-    ActiveHandoffRequests, AdmissionInvariant, AdmissionStage, CapturedRouterEventBuffer,
-    DestinationHolds, EnginePassResult, MockerMetrics, PendingDestinations, RemovedSource,
-    RouterEventVisibility, SchedulerCommand, SchedulerCommandEffects, SchedulerCommandResult,
-    SchedulerLifecycleEvent, SourceCompletion, SourceHolds, accept_length_sample,
-    build_fpm_snapshot, capture_router_event_sink,
+    accept_length_sample, build_fpm_snapshot, capture_router_event_sink, ActiveHandoffRequests,
+    AdmissionInvariant, AdmissionStage, CapturedRouterEventBuffer, DestinationHolds,
+    EnginePassResult, MockerMetrics, PendingDestinations, RemovedSource, RouterEventVisibility,
+    SchedulerCommand, SchedulerCommandEffects, SchedulerCommandResult, SchedulerLifecycleEvent,
+    SourceCompletion, SourceHolds,
 };
 
 pub(crate) struct SglangCore {
@@ -614,11 +615,15 @@ impl SglangCore {
         let prefill_time =
             simulate_prefill_duration(batch_size, mean_isl, mean_prefix, &self.config, true);
 
+        let mut prefilled_first_tokens = HashSet::new();
         for mut req in admit.can_run {
             if req.materialized_tokens < req.current_sequence_len() {
                 cache_materialized_prefix(&mut req, &mut self.kv_manager, &self.config);
                 self.waiting.push_front(req);
             } else {
+                if req.output_len() == 0 {
+                    prefilled_first_tokens.insert(req.uuid);
+                }
                 self.running.push(req);
             }
         }
@@ -628,18 +633,29 @@ impl SglangCore {
             .running
             .iter()
             .filter(|req| req.remaining_output_tokens() > 0)
-            .map(|req| req.current_sequence_len() as u64)
+            .map(|req| req.materialized_tokens as u64)
             .collect();
 
         let decode_start_ms = now_ms + prefill_time.as_secs_f64() * 1000.0;
-        let mut decode = simulate_decode_step_with_sampler(
-            &mut self.running,
-            &mut self.kv_manager,
-            &self.config,
-            self.speculative_sampler.as_mut(),
-            decode_start_ms,
-            true,
-        );
+        let mut decode = if !self.config.enable_mixed_chunk && batch_size > 0 {
+            super::decode::emit_prefill_first_tokens(
+                &mut self.running,
+                &mut self.kv_manager,
+                &self.config,
+                &prefilled_first_tokens,
+                self.speculative_sampler.as_mut(),
+                decode_start_ms,
+            )
+        } else {
+            simulate_decode_step_with_sampler(
+                &mut self.running,
+                &mut self.kv_manager,
+                &self.config,
+                self.speculative_sampler.as_mut(),
+                decode_start_ms,
+                true,
+            )
+        };
 
         for request in decode.completed_requests.drain(..) {
             self.complete_source(request);

@@ -106,7 +106,7 @@ impl SglangArgs {
 #[pymethods]
 impl SglangArgs {
     #[new]
-    #[pyo3(signature = (schedule_policy=None, page_size=None, max_prefill_tokens=None, chunked_prefill_size=None, clip_max_new_tokens=None, schedule_conservativeness=None, cuda_graph_enabled=None, cuda_graph_padding_enabled=None, cuda_graph_batch_sizes=None))]
+    #[pyo3(signature = (schedule_policy=None, page_size=None, max_prefill_tokens=None, chunked_prefill_size=None, clip_max_new_tokens=None, schedule_conservativeness=None, cuda_graph_enabled=None, cuda_graph_padding_enabled=None, cuda_graph_batch_sizes=None, enable_mixed_chunk=None))]
     fn new(
         schedule_policy: Option<String>,
         page_size: Option<usize>,
@@ -117,6 +117,7 @@ impl SglangArgs {
         cuda_graph_enabled: Option<bool>,
         cuda_graph_padding_enabled: Option<bool>,
         cuda_graph_batch_sizes: Option<Vec<usize>>,
+        enable_mixed_chunk: Option<bool>,
     ) -> PyResult<Self> {
         let inner = RsSglangArgs {
             schedule_policy,
@@ -128,6 +129,7 @@ impl SglangArgs {
             cuda_graph_enabled,
             cuda_graph_padding_enabled,
             cuda_graph_batch_sizes,
+            enable_mixed_chunk,
         };
         Ok(Self { inner })
     }
@@ -1791,6 +1793,7 @@ fn materialize_replay_mocker_args(
         let moe_dtype = args.aic_moe_dtype.clone();
         let fmha_dtype = args.aic_fmha_dtype.clone();
         let kv_cache_dtype = args.aic_kv_cache_dtype.clone();
+        let mla_module_kv_cache_dtype = args.aic_mla_module_kv_cache_dtype.clone();
         let comm_dtype = args.aic_comm_dtype.clone();
         let nextn = args.aic_nextn;
         let undiscounted_accept_rates = args.undiscounted_aic_accept_rates();
@@ -1851,6 +1854,7 @@ fn materialize_replay_mocker_args(
             moe_dtype.as_deref(),
             fmha_dtype.as_deref(),
             kv_cache_dtype.as_deref(),
+            mla_module_kv_cache_dtype.as_deref(),
             comm_dtype.as_deref(),
             nextn,
             undiscounted_accept_rates.as_deref(),
@@ -2004,6 +2008,7 @@ fn load_replay_prefill_load_estimator(
         aic_perf_config.moe_dtype(),
         aic_perf_config.fmha_dtype(),
         aic_perf_config.kv_cache_dtype(),
+        aic_perf_config.mla_module_kv_cache_dtype(),
         aic_perf_config.comm_dtype(),
         aic_perf_config.nextn(),
         aic_perf_config.nextn_accept_rates(),

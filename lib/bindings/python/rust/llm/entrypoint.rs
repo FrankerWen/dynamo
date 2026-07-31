@@ -97,6 +97,7 @@ pub struct AicPerfConfig {
     aic_moe_dtype: Option<String>,
     aic_fmha_dtype: Option<String>,
     aic_kv_cache_dtype: Option<String>,
+    aic_mla_module_kv_cache_dtype: Option<String>,
     aic_comm_dtype: Option<String>,
     aic_nextn: Option<usize>,
     aic_nextn_accept_rates: Option<String>,
@@ -153,6 +154,10 @@ impl AicPerfConfig {
 
     pub(crate) fn kv_cache_dtype(&self) -> Option<&str> {
         self.aic_kv_cache_dtype.as_deref()
+    }
+
+    pub(crate) fn mla_module_kv_cache_dtype(&self) -> Option<&str> {
+        self.aic_mla_module_kv_cache_dtype.as_deref()
     }
 
     pub(crate) fn comm_dtype(&self) -> Option<&str> {
@@ -235,6 +240,7 @@ impl AicPerfConfig {
             aic_moe_dtype,
             aic_fmha_dtype,
             aic_kv_cache_dtype,
+            aic_mla_module_kv_cache_dtype: None,
             aic_comm_dtype,
             aic_nextn,
             aic_nextn_accept_rates,
@@ -832,6 +838,7 @@ async fn select_engine(
                             config.moe_dtype(),
                             config.fmha_dtype(),
                             config.kv_cache_dtype(),
+                            config.mla_module_kv_cache_dtype(),
                             config.comm_dtype(),
                             config.nextn(),
                             config.nextn_accept_rates(),
@@ -881,6 +888,7 @@ async fn select_engine(
                 let moe_dtype = mocker_args.aic_moe_dtype.as_deref();
                 let fmha_dtype = mocker_args.aic_fmha_dtype.as_deref();
                 let kv_cache_dtype = mocker_args.aic_kv_cache_dtype.as_deref();
+                let mla_module_kv_cache_dtype = mocker_args.aic_mla_module_kv_cache_dtype.as_deref();
                 let comm_dtype = mocker_args.aic_comm_dtype.as_deref();
                 let nextn = mocker_args.aic_nextn;
                 let undiscounted_accept_rates = mocker_args.undiscounted_aic_accept_rates();
@@ -900,6 +908,7 @@ async fn select_engine(
                         moe_dtype,
                         fmha_dtype,
                         kv_cache_dtype,
+                        mla_module_kv_cache_dtype,
                         comm_dtype,
                         nextn,
                         undiscounted_accept_rates.as_deref(),

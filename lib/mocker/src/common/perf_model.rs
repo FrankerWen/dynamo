@@ -25,8 +25,8 @@ pub trait DecodeInterpolator: Send + Sync {
     fn interp(&self, x: f64, y: f64) -> Result<f64, InterpolateError>;
 }
 
-/// Callback trait for direct AIC SDK calls.
-/// Implementors call the Python AIC SDK via PyO3 GIL.
+/// Callback trait for direct AIC predictions.
+/// The current runtime implementation executes a compiled AIC engine in Rust.
 pub trait AicCallback: Send + Sync {
     /// Predict prefill latency in ms.
     /// Parameters: (batch_size, effective_isl, prefix)

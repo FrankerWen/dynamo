@@ -114,6 +114,7 @@ fn build_rust_engine(
     moe_dtype: Option<&str>,
     fmha_dtype: Option<&str>,
     kv_cache_dtype: Option<&str>,
+    mla_module_kv_cache_dtype: Option<&str>,
     comm_dtype: Option<&str>,
     nextn: Option<usize>,
     nextn_accept_rates: Option<&str>,
@@ -153,6 +154,7 @@ fn build_rust_engine(
     let moe_dtype = resolve_quant_mode("moe", moe_dtype)?;
     let fmha_dtype = resolve_quant_mode("fmha", fmha_dtype)?;
     let kv_cache_dtype = resolve_quant_mode("kvcache", kv_cache_dtype)?;
+    let mla_module_kv_cache_dtype = resolve_quant_mode("kvcache", mla_module_kv_cache_dtype)?;
     let comm_dtype = resolve_quant_mode("comm", comm_dtype)?;
 
     // Cache the compiled engine per identity. build_aic_engine compiles the
@@ -162,7 +164,7 @@ fn build_rust_engine(
     // paid once per unique config (speculative config included).
     static CACHE: OnceLock<Mutex<HashMap<String, Arc<AicEngine>>>> = OnceLock::new();
     let base_identity = format!(
-        "{backend_name}|{system}|{backend_version:?}|{model_path}|{tp_size}|{moe_tp_size:?}|{moe_ep_size:?}|{attention_dp_size:?}|{gemm_dtype:?}|{moe_dtype:?}|{fmha_dtype:?}|{kv_cache_dtype:?}|{comm_dtype:?}|{nextn}|{nextn_accept_rates:?}"
+        "{backend_name}|{system}|{backend_version:?}|{model_path}|{tp_size}|{moe_tp_size:?}|{moe_ep_size:?}|{attention_dp_size:?}|{gemm_dtype:?}|{moe_dtype:?}|{fmha_dtype:?}|{kv_cache_dtype:?}|{mla_module_kv_cache_dtype:?}|{comm_dtype:?}|{nextn}|{nextn_accept_rates:?}"
     );
     let key = include_workload_distribution_in_cache_identity(base_identity, workload_distribution);
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -191,6 +193,7 @@ fn build_rust_engine(
         gemm_dtype.as_deref(),     // gemm_quant_mode
         moe_dtype.as_deref(),      // moe_quant_mode
         kv_cache_dtype.as_deref(), // kvcache_quant_mode
+        mla_module_kv_cache_dtype.as_deref(), // MLA module compatibility dtype
         fmha_dtype.as_deref(),     // fmha_quant_mode
         comm_dtype.as_deref(),     // comm_quant_mode
         workload_distribution,     // MoE workload distribution
@@ -229,6 +232,7 @@ pub(super) fn create_aic_callback(
     moe_dtype: Option<&str>,
     fmha_dtype: Option<&str>,
     kv_cache_dtype: Option<&str>,
+    mla_module_kv_cache_dtype: Option<&str>,
     comm_dtype: Option<&str>,
     nextn: Option<usize>,
     nextn_accept_rates: Option<&str>,
@@ -250,6 +254,7 @@ pub(super) fn create_aic_callback(
             moe_dtype,
             fmha_dtype,
             kv_cache_dtype,
+            mla_module_kv_cache_dtype,
             comm_dtype,
             nextn,
             nextn_accept_rates,
@@ -281,6 +286,7 @@ pub(super) fn create_aic_prefill_load_estimator(
     moe_dtype: Option<&str>,
     fmha_dtype: Option<&str>,
     kv_cache_dtype: Option<&str>,
+    mla_module_kv_cache_dtype: Option<&str>,
     comm_dtype: Option<&str>,
     nextn: Option<usize>,
     nextn_accept_rates: Option<&str>,
@@ -302,6 +308,7 @@ pub(super) fn create_aic_prefill_load_estimator(
             moe_dtype,
             fmha_dtype,
             kv_cache_dtype,
+            mla_module_kv_cache_dtype,
             comm_dtype,
             nextn,
             nextn_accept_rates,
