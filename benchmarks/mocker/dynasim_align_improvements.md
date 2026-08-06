@@ -327,7 +327,73 @@ P2 没有消除全部 TTFT 误差。正确生命周期移除了过去的偶然�
 
 联合结果说明：P1/P2 对 decode/TPOT/ITL 的方向正确，但 TTFT 和 throughput 仍存在系统性偏差。旧结果中的部分低 MAPE 来自错误生命周期或服务时间的偶然抵消，不应使用全局 scale 或修改 AIC 表值掩盖剩余 scheduler time-domain 问题。
 
-## 7. 最终验证与 artifacts
+## 7. P1 补充验证：compiled engine 与 Python op-walk 配对 A/B
+
+这部分是 P1 的调用模式验证，不是 P3，也没有把实验性 Python callback 合入正式 DynoSim。
+
+### 7.1 验证动机
+
+P0 已证明 HiSim CSV 与 DynoSim Parquet 的底层表值等价，但“数据库相同”仍不等于“完整查询函数相同”。当前正式 mocker 直接构造 pure-Rust `RustAicCallback`，而 HiSim 使用 Python model/op query 路径。
+
+另外，当前正式代码中的 `DYNAMO_AIC_DISABLE_COMPILED_ENGINE=1` 只由 Python `AicSession` 读取；mocker 已经取消 Python fallback，因此只设置该变量仍会打印 `pure-Rust RustAicCallback`，不能形成有效 A/B。
+
+### 7.2 验证内容
+
+在隔离 worktree 中恢复一个仅受 `DYNAMO_AIC_DISABLE_COMPILED_ENGINE=1` 控制的 `PyAicCallback`，完整透传 TP/EP/DP、dtype 和 workload distribution。主 worktree 未改这个执行路径。
+
+两组都复用 `prefix_fixed_full/run1`：
+
+- 35 个 RPS + 35 个 single-batch，共 70 点、3,867 请求；
+- 每点 trace 在 source/compiled/op-walk 三方 hash 一致；
+- 两组 engine args hash 一致；35 个 RPS 点还与历史 source args 逐点一致；
+- 历史 single-batch 目录没有保存 engine args，两组统一使用历史 35 个 RPS 点中唯一的一套共同参数；
+- 两组使用相同 AIC manifest，`aggregate_sha256=b93c0ac775ef1122441e5777c20c174223a2c542d3434ae21367e92142f833bb`；
+- 70/70 compiled 日志命中 pure-Rust marker，70/70 实验日志命中 Python op-walk marker。
+
+历史 `prefix_fixed_full` 与本次 A/B 的 Dynamo/AIC revision 不同，因此历史列只作上下文。调用模式的因果效果只比较本次 current compiled control 与 current Python op-walk。
+
+### 7.3 验证效果
+
+| Scope | 历史 prefix_fixed | current compiled | Python op-walk | HiSim 既有参考 | op-walk - compiled |
+|---|---:|---:|---:|---:|---:|
+| 70 points / 350 cells | 41.296005% | 34.898321% | 11.486348% | 9.481926% | -23.411973 pp |
+| RPS / 175 cells | 56.379043% | 39.631435% | 14.275396% | 13.164734% | -25.356038 pp |
+| Single batch / 175 cells | 26.212967% | 30.165208% | 8.697300% | 5.799118% | -21.467907 pp |
+
+Python op-walk 使总体 MAPE 相对下降 67.086244%；323/350 个 metric cells 改善，27 个回退。分场景结果：
+
+| 场景 | current compiled | Python op-walk | HiSim | 变化 |
+|---|---:|---:|---:|---:|
+| A | 42.574442% | 5.117086% | 1.725423% | -37.457356 pp |
+| B | 42.295176% | 10.909814% | 6.072986% | -31.385362 pp |
+| B-mixed | 43.430685% | 7.642436% | 3.618379% | -35.788249 pp |
+| C | 30.941717% | 23.543424% | 25.029007% | -7.398293 pp |
+| D | 15.249588% | 10.218983% | 10.963837% | -5.030605 pp |
+
+这证明 P0/P1/P2 后剩余差异中，compiled AIC 查询实现仍占主要部分，不能把 34.9% 全部归因于 Rust scheduler。
+
+### 7.4 白盒根因
+
+相同 prefill shape 的查询结果：
+
+| `(bs, new_tokens, prefix)` | compiled | Python op-walk | op-walk / compiled |
+|---|---:|---:|---:|
+| `(1, 8192, 0)` | 108.765 ms | 132.103 ms | 1.21x |
+| `(1, 8192, 8192)` | 108.233 ms | 170.708 ms | 1.58x |
+| `(1, 8192, 16384)` | 106.974 ms | 203.984 ms | 1.91x |
+| `(1, 8192, 24576)` | 106.142 ms | 236.207 ms | 2.23x |
+
+差值集中在 `context_mla_block`。compiled graph 将 WideEP MLA 的 `num_heads` 序列化为 TP size=4；Python `WideEPContextMLA` 则按 `128 / TP = 32` 查询 per-rank heads。只在内存中把 compiled spec 的 4 改成 32 后：
+
+- `(1,8192,0)` 和 `(1,8192,8192)` prefill 与 Python op-walk 完全一致；
+- 表内 decode 探针恢复完全或近似一致；
+- 更长 prefix 仍有 8.54%–20.39% 残差，来自 Rust/Python 插值、外推实现差异。
+
+因此这不是底层表值不同，而是同一表之上的 compiled graph 参数和插值执行语义不等价。
+
+完整报告：`dynosim_sglang_compare_deep_gemm_acc_layer20_32768_tp4ep4_h100pcie_gsp_mixed_seed11_full/aic_mode_ab/aic_call_mode_diagnostic_report.md`。
+
+## 8. 最终验证与 artifacts
 
 最终目录：`/workspace/hisim_align/dynamo/dynosim_p012_final`
 
@@ -353,13 +419,13 @@ P2 没有消除全部 TTFT 误差。正确生命周期移除了过去的偶然�
 - `dynosim_p012_final/sweep_diagnostic_report.md`：P0/P1/P2 provenance 和极值归因。
 - `dynosim_p012_final/aic_database_equivalence.json`：17 表数据库审计。
 
-## 8. 能否在不大改的情况下达到 HiSim 高精度
+## 9. 能否在不大改的情况下达到 HiSim 高精度
 
 1. AIC predictor 层可以通过相对局部的改动复用 HiSim+AIC graph/config/database contract。P0/P1 已将 A-32 decode step 从约 50/34 ms 修正到约 22.5/14.5 ms。
 2. Request lifecycle 层需要 P2 这种 scheduler 语义修复，已经超出纯参数校准，但改动仍集中在 token/KV/cache 生命周期。
-3. 端到端精度层目前不能认为“小改即可达到 HiSim 高精度”。最终总体 MAPE 为 34.89%，RPS 为 39.62%，仍明显高于 HiSim 既有参考 9.48%/13.16%。
-4. 剩余主要问题位于长输入 prefill admission、首 token visibility、单 worker contention 和 client/server envelope。P3 应在接受 P0/P1/P2 后再逐 batch 对齐这些时域。
+3. 调用模式配对 A/B 将总体/RPS MAPE 从 34.90%/39.63% 降到 11.49%/14.28%，已接近 HiSim 的 9.48%/13.16%。这说明达到接近 HiSim 的精度不需要重写 Rust scheduler，但需要修正 compiled WideEP MLA graph 参数及长 prefix 插值/外推，不能只调整数据库值。
+4. op-walk 并未消除全部调度差异：C 场景仍为 23.54%，C-RPS24 单点为 61.44%。P3 继续保持 deferred；先把 compiled engine 对 Python op-walk 的 fixed-shape parity 修到位，再用逐 forward trace 区分剩余 scheduler/admission/time-domain 误差。
 
-结论：`hisim+aic` 可以作为 DynoSim 的高精度算子预测底座，但不能替代后续 scheduler/time-domain 修复。P3 当前保持 deferred。
+结论：`hisim+aic` 可以作为 DynoSim 的高精度算子预测底座。当前最大的可局部修复问题是 compiled AIC 查询与 Python op-walk 不等价；修正后仍需要 P3 处理 C 等场景的 scheduler/time-domain 残差。P3 当前保持 deferred。
 
-文档更新时间：2026-07-31
+文档更新时间：2026-08-05
