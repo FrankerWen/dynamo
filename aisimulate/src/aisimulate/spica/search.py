@@ -36,10 +36,17 @@ from typing import Any, Protocol
 
 from tqdm import tqdm
 
-from .config import Candidate, OptimizationGoal, SmartSearchConfig
+from .config import (
+    Candidate,
+    OptimizationGoal,
+    SearchEvaluation,
+    SmartSearchConfig,
+    SmartSearchRunResult,
+)
 from .deploy import build_deployment
-from .evaluator import ReplayEvaluator
+from .evaluator import EVALUATION_CACHE_HIT_METRIC, ReplayEvaluator
 from .kv_estimate import resolve_backend_version
+from .kv_footprint import UnsupportedKVFootprint, resolve_candidate_kv_footprint
 from .kv_load import InfeasibleKVCapacity, resolve_kv_load
 from .load_predictor_sweep import LoadPredictorResult, sweep_load_predictor
 from .planner import filter_scaling_policies, scaling_fields
@@ -54,8 +61,7 @@ logger = logging.getLogger(__name__)
 class _Evaluator(Protocol):
     def evaluate(
         self, plan: Any, *, concurrency_override: int | None = None
-    ) -> dict[str, float]:
-        ...
+    ) -> dict[str, float]: ...
 
 
 # Result of evaluating one suggestion (no Vizier here): (candidate|None, observe_metrics|None,
@@ -119,6 +125,7 @@ def _evaluate_one(
         # on the candidate so downstream artifact generation cannot independently
         # select a different backend version.
         sample["backend_version"] = backend_version
+        resolve_candidate_kv_footprint(sample, config.workload)
         concurrency = config.workload.concurrency
         if "kv_load_ratio" in selection:
             ratio = float(selection["kv_load_ratio"])
@@ -148,7 +155,7 @@ def _evaluate_one(
             optimization_target=goal.target.planner_optimization_target,
             planner_sla=goal.sla,
         )
-    except InfeasibleKVCapacity as exc:
+    except (InfeasibleKVCapacity, UnsupportedKVFootprint) as exc:
         return None, None, "infeasible", f"candidate KV capacity infeasible: {exc}"
     except Exception as exc:
         logger.exception("Spica candidate build failed")
@@ -163,6 +170,7 @@ def _evaluate_one(
     except Exception as exc:  # one candidate failing must not abort the sweep
         logger.exception("Spica candidate replay failed")
         return None, None, "failed", f"replay failed: {type(exc).__name__}: {exc}"
+    cache_hit = bool(report.pop(EVALUATION_CACHE_HIT_METRIC, 0.0))
     if not is_feasible(int(sample["used_gpus"]), config.search_space.gpu_budget):
         # Over gpu_budget: report as infeasible to the optimizer (observe_infeasible, not
         # observe(metrics)) so a high score doesn't steer the sampler into the infeasible
@@ -187,7 +195,12 @@ def _evaluate_one(
         observe_metrics = {
             "objective": candidate.score
         }  # single metric, pre-signed higher-is-better
-    return candidate, observe_metrics, "feasible", ""
+    return (
+        candidate,
+        observe_metrics,
+        "cache_hit" if cache_hit else "feasible",
+        "evaluation_cache_hit" if cache_hit else "",
+    )
 
 
 # Worker-process plumbing: the shared read-only state (config/goal/load_predictor/
@@ -218,6 +231,7 @@ def run_smart_search(
     sampler_factory: Callable[..., BranchSampler] = make_branch_sampler,
     show_progress: bool = True,
     on_round: Callable[[int, list[Candidate]], None] | None = None,
+    on_evaluation: Callable[[SearchEvaluation], None] | None = None,
 ) -> list[Candidate]:
     """Run the sweep and return feasible candidates sorted best-first.
 
@@ -325,6 +339,7 @@ def run_smart_search(
         "cache_hit": 0,
     }
     failure_reasons: dict[str, int] = {}
+    evaluation_index = 0
     # Unique per run: Vizier's datastore persists studies by id, so a fixed id would
     # make a later run inherit a stale study (and its old param space) -> decode crash.
     run_nonce = uuid.uuid4().hex[:8]
@@ -344,6 +359,34 @@ def run_smart_search(
         }
     )
     replay_cache: dict[Any, tuple[Candidate, dict[str, float]]] = {}
+
+    def _emit_evaluation(
+        suggestion: Suggestion,
+        outcome: str,
+        *,
+        reason: str = "",
+        candidate: Candidate | None = None,
+    ) -> None:
+        nonlocal evaluation_index
+        if on_evaluation is None:
+            return
+        evaluation_index += 1
+        parallel_config = (
+            asdict(suggestion.parallel_config)
+            if is_dataclass(suggestion.parallel_config)
+            else {"value": repr(suggestion.parallel_config)}
+        )
+        on_evaluation(
+            SearchEvaluation(
+                index=evaluation_index,
+                branch=suggestion.selection["deployment_mode"],
+                outcome=outcome,
+                reason=reason,
+                selection=dict(suggestion.selection),
+                parallel_config=parallel_config,
+                candidate=candidate,
+            )
+        )
 
     def _best() -> float | None:
         return max((c.score for c in candidates), default=None)
@@ -493,13 +536,22 @@ def run_smart_search(
             )
 
         round_no = 0
-        for branch in branches:
+        for branch_index, branch in enumerate(branches):
             branch_stalled = False
-            sampler = sampler_factory(
-                branch,
-                study_id=f"spica_{branch.deployment_mode}_{run_nonce}",
-                objectives=sampler_objectives,
-            )
+            sampler_kwargs = {
+                "study_id": f"spica_{branch.deployment_mode}_{run_nonce}",
+                "objectives": sampler_objectives,
+            }
+            if sampler_factory is make_branch_sampler:
+                sampler_kwargs.update(
+                    {
+                        "algorithm": sweep.sampler_algorithm,
+                        "seed": None
+                        if sweep.search_seed is None
+                        else sweep.search_seed + branch_index,
+                    }
+                )
+            sampler = sampler_factory(branch, **sampler_kwargs)
             bar.set_description(f"smart-sweep {branch.deployment_mode}")
             for _ in range(sweep.max_rounds):
                 unique_this_round = 0
@@ -537,15 +589,23 @@ def run_smart_search(
                                 suggestion,
                                 f"backend {backend!r} does not support this parallel config",
                             )
+                            _emit_evaluation(
+                                suggestion,
+                                "unsupported",
+                                reason=f"backend {backend!r} does not support this parallel config",
+                            )
                             _record("unsupported", None)
                             continue
 
                         key = _suggestion_cache_key(suggestion, cache_context)
                         cached = replay_cache.get(key)
                         if cached is not None:
-                            _, cached_metrics = cached
+                            cached_candidate, cached_metrics = cached
                             sampler.observe(suggestion, cached_metrics)
                             tally["cache_hit"] += 1
+                            _emit_evaluation(
+                                suggestion, "cache_hit", candidate=cached_candidate
+                            )
                             continue
                         if key in primary_by_key:
                             duplicates_by_key.setdefault(key, []).append(suggestion)
@@ -570,8 +630,10 @@ def run_smart_search(
                                     failure_reasons.get(reason, 0) + 1 + len(duplicates)
                                 )
                             _record(outcome, None)
+                            _emit_evaluation(suggestion, outcome, reason=reason)
                             for _duplicate in duplicates:
                                 _record(outcome, None)
+                                _emit_evaluation(_duplicate, outcome, reason=reason)
                             continue
 
                         if candidate is None or observe_metrics is None:
@@ -585,6 +647,11 @@ def run_smart_search(
                             sampler.observe(duplicate, observe_metrics)
                             tally["cache_hit"] += 1
                         _record(outcome, candidate)
+                        _emit_evaluation(suggestion, outcome, candidate=candidate)
+                        for duplicate in duplicates:
+                            _emit_evaluation(
+                                duplicate, "cache_hit", candidate=candidate
+                            )
                         unique_this_round += 1
                 round_no += 1
                 if on_round is not None:
@@ -631,3 +698,31 @@ def run_smart_search(
                 f"smart-sweep failure reason(s): {' | '.join(displayed)}{suffix}"
             )
     return result
+
+
+def run_smart_search_with_history(
+    config: SmartSearchConfig,
+    *,
+    evaluator: _Evaluator | None = None,
+    sampler_factory: Callable[..., BranchSampler] = make_branch_sampler,
+    show_progress: bool = True,
+    on_round: Callable[[int, list[Candidate]], None] | None = None,
+) -> SmartSearchRunResult:
+    """Run Spica while retaining every optimizer trial and failure reason."""
+    evaluations: list[SearchEvaluation] = []
+    candidates = run_smart_search(
+        config,
+        evaluator=evaluator,
+        sampler_factory=sampler_factory,
+        show_progress=show_progress,
+        on_round=on_round,
+        on_evaluation=evaluations.append,
+    )
+    tally: dict[str, int] = {}
+    for evaluation in evaluations:
+        tally[evaluation.outcome] = tally.get(evaluation.outcome, 0) + 1
+    return SmartSearchRunResult(
+        candidates=candidates,
+        evaluations=evaluations,
+        tally=tally,
+    )

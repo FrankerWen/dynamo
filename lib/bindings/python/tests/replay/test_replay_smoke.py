@@ -793,6 +793,16 @@ def test_run_trace_replay_materializes_kv_bytes_from_aic_model(monkeypatch, tmp_
     )
 
 
+def test_mock_engine_args_keeps_pd_handoff_bytes_separate_from_kvbm():
+    args = MockEngineArgs(
+        kv_bytes_per_token=30_720,
+        kv_transfer_bytes_per_token=122_880,
+    )
+
+    assert args.kv_bytes_per_token == 30_720
+    assert args.kv_transfer_bytes_per_token == 122_880
+
+
 @pytest.mark.parametrize("router_mode", ["round_robin", "kv_router"])
 def test_run_trace_replay_supports_disagg_offline(tmp_path, router_mode):
     trace_path = _write_trace_and_args(tmp_path)

@@ -33,6 +33,7 @@ from typing import Any
 from .config import SearchSpace
 from .load_predictor_sweep import LoadPredictorResult, predictor_fields
 from .parallel_enum import DisaggParallelConfig, ParallelShape, ReplicaParallelConfig
+from .pd_topology import resolve_compact_pd_placement
 from .planner import fpm_fields, load_sensitivity_fields, scaling_fields
 
 # Pinned deployment/runtime scalars folded in so the selected sample stands alone.
@@ -41,6 +42,8 @@ from .planner import fpm_fields, load_sensitivity_fields, scaling_fields
 # into replay and generated deployment artifacts.
 _DEPLOYMENT_PINNED = (
     "model_name",
+    "model_id",
+    "model_variant_id",
     "hardware_sku",
     "gpu_budget",
     "min_gpu_budget",
@@ -48,6 +51,22 @@ _DEPLOYMENT_PINNED = (
     "context_length",
     "startup_time",
     "aic_nextn",
+    "aic_gemm_dtype",
+    "aic_moe_dtype",
+    "aic_fmha_dtype",
+    "aic_kv_cache_dtype",
+    "aic_comm_dtype",
+    "kv_footprint",
+    "kv_footprint_policy",
+    "pd_profile_id",
+    "pd_placement",
+    "pd_bandwidth_source",
+    "kvbm_profile_id",
+    "kv_transfer_bandwidth",
+    "pd_prefill_to_decode_bandwidth_gbps",
+    "pd_decode_to_prefill_bandwidth_gbps",
+    "kv_transfer_timing_mode",
+    "pd_deployability",
 )
 _KV_MANAGER = (
     "num_g2_blocks",
@@ -55,6 +74,10 @@ _KV_MANAGER = (
     "bandwidth_g1_to_g2_gbps",
     "bandwidth_g2_to_g1_gbps",
     "offload_batch_size",
+    "g2_capacity_gib",
+    "g2_capacity_scope",
+    "g2_target_hit_rate",
+    "kvbm_deployability",
 )
 
 # engine knobs per branch: searched batching + pinned scalars.
@@ -97,6 +120,7 @@ def _shape_fields(shape: ParallelShape) -> dict[str, Any]:
     return {
         "tp": shape.tp,
         "pp": shape.pp,
+        "cp": 1,
         "attention_dp": shape.dp,
         "moe_tp": shape.moe_tp,
         "moe_ep": shape.moe_ep,
@@ -112,6 +136,9 @@ def _unroll_parallel(
             raise TypeError("agg deployment_mode needs a ReplicaParallelConfig")
         out = _shape_fields(parallel_config.shape)
         out["replicas"] = parallel_config.replicas
+        out["worker_gpus"] = parallel_config.shape.gpus_per_worker
+        out["num_workers"] = parallel_config.replicas
+        out["instances"] = parallel_config.replicas
         out["used_gpus"] = parallel_config.total_gpus
         return out
     if not isinstance(parallel_config, DisaggParallelConfig):
@@ -124,6 +151,9 @@ def _unroll_parallel(
         for key, value in _shape_fields(rc.shape).items():
             out[f"{role}_{key}"] = value
         out[f"{role}_replicas"] = rc.replicas
+        out[f"{role}_worker_gpus"] = rc.shape.gpus_per_worker
+        out[f"{role}_workers"] = rc.replicas
+        out[f"{role}_instances"] = rc.replicas
     out["used_gpus"] = parallel_config.total_gpus
     return out
 
@@ -186,9 +216,29 @@ def unroll_sample(
     sample: dict[str, Any] = {"deployment_mode": mode, "backend": selection["backend"]}
 
     for key in _DEPLOYMENT_PINNED + _KV_MANAGER:
-        sample[key] = getattr(search_space, key)
+        value = getattr(search_space, key)
+        sample[key] = (
+            value.model_dump(mode="python") if hasattr(value, "model_dump") else value
+        )
 
     sample.update(_unroll_parallel(mode, parallel_config))
+    if mode == "disagg" and search_space.pd_bandwidth_source == "topology":
+        topology = search_space.pd_transfer_topology
+        if topology is None:  # SearchSpace validation should make this unreachable.
+            raise ValueError("topology-resolved P/D bandwidth has no topology")
+        resolution = resolve_compact_pd_placement(
+            topology,
+            prefill_worker_gpus=int(sample["prefill_worker_gpus"]),
+            prefill_replicas=int(sample["prefill_replicas"]),
+            decode_worker_gpus=int(sample["decode_worker_gpus"]),
+            decode_replicas=int(sample["decode_replicas"]),
+        )
+        if resolution.group_gpus != int(sample["used_gpus"]):
+            raise ValueError(
+                "resolved P/D placement GPU count does not match parallel config: "
+                f"{resolution.group_gpus} != {sample['used_gpus']}"
+            )
+        sample.update(resolution.sample_fields())
 
     # engine knobs for the active branch only
     if mode == "agg":

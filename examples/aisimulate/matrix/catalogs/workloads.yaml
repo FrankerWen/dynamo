@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+schema_version: 1
+kind: workloads
+workloads:
+  - id: synthetic_4k
+    loader: synthetic
+    tags: [production-study, synthetic, context-4k]
+    config:
+      isl: 3072
+      osl: 1024
+      prefix_length: 2048
+      request_rates: [1, 2, 4, 8, 16, 32]
+      num_request_ratio: 20
+      num_prefix_groups: 8
+  - id: synthetic_32k
+    loader: synthetic
+    tags: [production-study, synthetic, context-32k]
+    config:
+      isl: 28672
+      osl: 4096
+      prefix_length: 24576
+      request_rates: [0.25, 0.5, 1, 2, 4, 8]
+      num_request_ratio: 20
+      num_prefix_groups: 8
+  - id: agentic_from_file
+    loader: agentic_mooncake_trace
+    tags: [agentic, requires-local-trace]
+    config:
+      path: traces/agentic.jsonl
+      arrival_speedup_ratios: [0.5, 1, 2, 4, 8]
+      trace_block_size: 512

@@ -6,7 +6,7 @@
 Pure — selection + parallel_config are inputs, so no perf DB / aiconfigurator
 model build is needed."""
 
-from aisimulate.spica.config import SearchSpace
+from aisimulate.spica.config import PDTransferTopology, SearchSpace
 from aisimulate.spica.load_predictor_sweep import LoadPredictorResult
 from aisimulate.spica.parallel_enum import (
     DisaggParallelConfig,
@@ -85,6 +85,101 @@ def test_disagg_parallel_unrolls_prefill_and_decode():
     assert s["used_gpus"] == 8 + 16  # 8*1 + 8*2
     assert s["prefill_max_num_seqs"] == 4 and s["decode_max_num_seqs"] == 512
     assert "tp" not in s and "agg_max_num_seqs" not in s
+
+
+def _disagg_selection() -> dict:
+    return _agg_selection(
+        deployment_mode="disagg",
+        prefill_max_num_batched_tokens=16384,
+        prefill_max_num_seqs=4,
+        decode_max_num_batched_tokens=8192,
+        decode_max_num_seqs=512,
+    )
+
+
+def _topology_space(topology: PDTransferTopology) -> SearchSpace:
+    return _space(
+        pd_profile_id="topology_aware_full_prompt",
+        pd_placement="compact",
+        pd_bandwidth_source="topology",
+        pd_transfer_topology=topology,
+    )
+
+
+def test_topology_pd_bandwidth_resolves_intra_node_and_records_placement():
+    topology = PDTransferTopology(
+        gpus_per_node=8,
+        intra_node_gbytes_per_s_per_gpu=900,
+        inter_node_gbytes_per_s_per_gpu=100,
+    )
+    cfg = DisaggParallelConfig(
+        prefill=ReplicaParallelConfig(ParallelShape(1, 1, 1, 1), 2),
+        decode=ReplicaParallelConfig(ParallelShape(1, 1, 1, 1), 2),
+    )
+
+    sample = unroll_sample(
+        search_space=_topology_space(topology),
+        selection=_disagg_selection(),
+        parallel_config=cfg,
+    )
+
+    assert sample["pd_bandwidth_domain"] == "intra_node"
+    assert sample["pd_group_gpus"] == 4
+    assert sample["pd_prefill_gpus"] == sample["pd_decode_gpus"] == 2
+    assert sample["pd_nodes_spanned"] == 1
+    assert "pd_racks_spanned" not in sample
+    assert sample["kv_transfer_bandwidth"] == 900
+    assert sample["pd_transfer_bandwidth_gbytes_per_s"] == 900
+
+
+def test_topology_pd_bandwidth_resolves_intra_and_inter_rack():
+    topology = PDTransferTopology(
+        gpus_per_node=4,
+        gpus_per_rack=72,
+        intra_node_gbytes_per_s_per_gpu=900,
+        intra_rack_gbytes_per_s_per_gpu=900,
+        inter_rack_gbytes_per_s_per_gpu=100,
+    )
+    intra_rack = unroll_sample(
+        search_space=_topology_space(topology),
+        selection=_disagg_selection(),
+        parallel_config=DISAGG_CFG,
+    )
+    assert intra_rack["used_gpus"] == 24
+    assert intra_rack["pd_bandwidth_domain"] == "intra_rack"
+    assert intra_rack["pd_nodes_spanned"] == 6
+    assert intra_rack["pd_racks_spanned"] == 1
+    assert intra_rack["kv_transfer_bandwidth"] == 900
+
+    inter_rack_cfg = DisaggParallelConfig(
+        prefill=ReplicaParallelConfig(ParallelShape(8, 1, 1, 8), 5),
+        decode=ReplicaParallelConfig(ParallelShape(8, 1, 1, 8), 5),
+    )
+    inter_rack = unroll_sample(
+        search_space=_topology_space(topology),
+        selection=_disagg_selection(),
+        parallel_config=inter_rack_cfg,
+    )
+    assert inter_rack["used_gpus"] == 80
+    assert inter_rack["pd_bandwidth_domain"] == "inter_rack"
+    assert inter_rack["pd_racks_spanned"] == 2
+    assert inter_rack["kv_transfer_bandwidth"] == 100
+
+
+def test_topology_pd_bandwidth_uses_inter_node_when_no_rack_tier():
+    topology = PDTransferTopology(
+        gpus_per_node=8,
+        intra_node_gbytes_per_s_per_gpu=900,
+        inter_node_gbytes_per_s_per_gpu=100,
+    )
+    sample = unroll_sample(
+        search_space=_topology_space(topology),
+        selection=_disagg_selection(),
+        parallel_config=DISAGG_CFG,
+    )
+    assert sample["used_gpus"] == 24
+    assert sample["pd_bandwidth_domain"] == "inter_node"
+    assert sample["kv_transfer_bandwidth"] == 100
 
 
 def test_scaling_policy_disabled_emits_only_flags():

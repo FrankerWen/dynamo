@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+schema_version: 1
+kind: slas
+slas:
+  - id: default_sla
+    ttft_ms: 2000
+    tpot_ms: 50
+    tps_per_user: 20
+    p95_ttft_ms: 3000
+    p95_tpot_ms: 60
+    p10_tps_per_user: 20
+    min_goodput_ratio: 0.99
+    min_completion_rate: 1.0

@@ -102,6 +102,15 @@ def _engine_args_payload(
         "gpu_memory_utilization": float(sample[f"{role}_gpu_memory_utilization"]),
         "enable_prefix_caching": bool(sample[f"{role}_enable_prefix_caching"]),
     }
+    for sample_key, payload_key in (
+        ("aic_gemm_dtype", "aic_gemm_dtype"),
+        ("aic_moe_dtype", "aic_moe_dtype"),
+        ("aic_fmha_dtype", "aic_fmha_dtype"),
+        ("aic_kv_cache_dtype", "aic_kv_cache_dtype"),
+        ("aic_comm_dtype", "aic_comm_dtype"),
+    ):
+        if sample.get(sample_key) is not None:
+            payload[payload_key] = str(sample[sample_key])
     # MoE expert sharding only for MoE shapes (tp*attention_dp == moe_tp*moe_ep);
     # dense (moe_tp==moe_ep==1) leaves them unset.
     if moe_tp * moe_ep > 1:
@@ -114,6 +123,13 @@ def _engine_args_payload(
         payload["aic_nextn"] = int(sample["aic_nextn"])
     if sample.get("startup_time") is not None:
         payload["startup_time"] = float(sample["startup_time"])
+    if role != "agg" and sample.get("kv_transfer_bandwidth") is not None:
+        payload["kv_transfer_bandwidth"] = float(sample["kv_transfer_bandwidth"])
+        payload["kv_transfer_timing_mode"] = sample["kv_transfer_timing_mode"]
+        if sample.get("kv_transfer_bytes_per_token") is not None:
+            payload["kv_transfer_bytes_per_token"] = int(
+                sample["kv_transfer_bytes_per_token"]
+            )
     # KVBM is disabled when G2 has no blocks. When enabled it runs on aggregate or
     # prefill workers only; disaggregated decode workers use the transfer connector
     # and must not be scored with a second local offload tier.

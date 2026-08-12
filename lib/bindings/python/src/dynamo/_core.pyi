@@ -1939,6 +1939,7 @@ class MockEngineArgs:
         bootstrap_port: Optional[int] = None,
         handoff_session_timeout_ms: int = 300000,
         kv_bytes_per_token: Optional[int] = None,
+        kv_transfer_bytes_per_token: Optional[int] = None,
         kv_transfer_bandwidth: Optional[float] = None,
         kv_transfer_timing_mode: str = "full_prompt",
         reasoning: Optional[ReasoningConfig] = None,
@@ -2159,6 +2160,9 @@ class MockEngineArgs:
     @property
     def free_gpu_memory_fraction(self) -> Optional[float]: ...
 
+    @property
+    def kv_transfer_bytes_per_token(self) -> Optional[int]: ...
+
     @free_gpu_memory_fraction.setter
     def free_gpu_memory_fraction(self, value: Optional[float]) -> None: ...
 
@@ -2178,6 +2182,7 @@ class MockEngineArgs:
         zmq_kv_events_port: Optional[int] = None,
         zmq_replay_port: Optional[int] = None,
         kv_bytes_per_token: Optional[int] = None,
+        kv_transfer_bytes_per_token: Optional[int] = None,
         num_gpu_blocks: Optional[int] = None,
         aic_backend: Optional[str] = None,
         aic_system: Optional[str] = None,

@@ -1,0 +1,84 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+schema_version: 1
+kind: search_policy
+epsilon_pareto: 0.03
+kv_footprint:
+  nonlinear_kvbm: fixed_synthetic_average
+  heterogeneous_trace: fail_closed
+static_prune:
+  max_candidates: 128
+  topk_per_strategy: 8
+spica:
+  # 10 rounds x 16 candidates keeps the formal policy's 160 samples/study.
+  max_rounds: 10
+  parallel_evals: 16
+  candidates_per_round: 16
+  max_eval_seconds: 600
+  sampler_algorithm: QUASI_RANDOM_SEARCH
+  search_seed: 20260810
+  deployment_mode: [disagg, agg]
+  search_space:
+    backend: [vllm]
+    gpu_budget: 72
+    router_mode: [kv_router, round_robin]
+    overlap_score_credit: [0, 0.5, 1]
+    prefill_load_scale: [0.25, 0.5, 1, 2, 4, 8]
+    host_cache_hit_weight: [0.5, 0.75, 1]
+    disk_cache_hit_weight: [0]
+    router_temperature: [0, 0.2]
+pd_profiles:
+  - id: topology_aware_full_prompt
+    placement: compact
+    timing_mode: full_prompt
+    bandwidth_source: topology
+    deployability: deployable
+kvbm_profiles:
+  - id: g2_off
+    num_g2_blocks: 0
+  - id: g2_50_hit_bw_025
+    capacity_gib: 512
+    capacity_scope: deployment_total
+    target_hit_rate: 0.50
+    bandwidth_to_g2_ratio: 0.25
+    bandwidth_from_g2_ratio: 0.25
+    offload_batch_size: 32
+  - id: g2_75_hit_bw_05
+    capacity_gib: 1024
+    capacity_scope: deployment_total
+    target_hit_rate: 0.75
+    bandwidth_to_g2_ratio: 0.5
+    bandwidth_from_g2_ratio: 0.5
+    offload_batch_size: 32
+  - id: g2_90_hit_bw_1
+    capacity_gib: 2048
+    capacity_scope: deployment_total
+    target_hit_rate: 0.90
+    bandwidth_to_g2_ratio: 1
+    bandwidth_from_g2_ratio: 1
+    offload_batch_size: 32
+  - id: g2_95_hit_bw_2
+    capacity_gib: 4096
+    capacity_scope: deployment_total
+    target_hit_rate: 0.95
+    bandwidth_to_g2_ratio: 2
+    bandwidth_from_g2_ratio: 2
+    offload_batch_size: 128
+capacity_search:
+  enabled: true
+  # Discovery uses fixed closed-loop concurrency. Only its deduplicated
+  # finalists receive an open-loop, bidirectional SLA-boundary certification.
+  stage: finalists
+  finalists_per_load: 2
+  max_finalists_per_cell: 16
+  expansion_factor: 2
+  tolerance: 0.03
+  max_expansions: 16
+  max_binary_steps: 12
+  min_load: 0.01
+  require_failed_upper: false
+robustness:
+  enabled: true
+  seeds: [0, 1, 2]
+  bandwidth_multipliers: [0.8, 1.0, 1.2]

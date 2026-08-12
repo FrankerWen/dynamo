@@ -883,7 +883,7 @@ impl VllmCore {
         if let Some(planned_output_ids) = planned_output_ids.as_ref()
             && planned_output_ids.len() != max_output_tokens
         {
-            tracing::warn!(
+            tracing::debug!(
                 %uuid,
                 requested = max_output_tokens,
                 planned = planned_output_ids.len(),
@@ -973,7 +973,7 @@ impl VllmCore {
             prefill_handoff_transfer_timing(
                 request.sequence.num_input_tokens(),
                 self.args.kv_transfer_bandwidth,
-                self.args.kv_bytes_per_token,
+                self.args.resolved_kv_transfer_bytes_per_token(),
                 self.args.kv_transfer_timing_mode,
             )
         });
@@ -2212,7 +2212,7 @@ impl VllmCore {
                     true,
                     request.sequence.num_input_tokens(),
                     self.args.kv_transfer_bandwidth,
-                    self.args.kv_bytes_per_token,
+                    self.args.resolved_kv_transfer_bytes_per_token(),
                 );
                 let effects = split_terminal_effects(request.sequence.terminal_signals());
                 debug_assert!(effects.immediate.is_empty());
@@ -2366,7 +2366,7 @@ impl VllmCore {
                     completed,
                     request.sequence.num_input_tokens(),
                     self.args.kv_transfer_bandwidth,
-                    self.args.kv_bytes_per_token,
+                    self.args.resolved_kv_transfer_bytes_per_token(),
                 )
             });
             let output_signal = OutputSignal {
@@ -2618,7 +2618,7 @@ impl VllmCore {
                         is_complete,
                         prompt_tokens,
                         self.args.kv_transfer_bandwidth,
-                        self.args.kv_bytes_per_token,
+                        self.args.resolved_kv_transfer_bytes_per_token(),
                     ),
                 });
                 if is_complete {

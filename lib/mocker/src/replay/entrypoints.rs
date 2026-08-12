@@ -628,7 +628,22 @@ pub fn simulate_trace_file_disagg_with_router_mode_and_format_and_scaling_policy
     let config = config.normalized()?;
     validate_offline_disagg_replay_args(&config, router_mode)?;
     if trace_format == TraceFileFormat::AgenticMooncake {
-        bail!("agentic_mooncake trace format is not supported for disaggregated replay");
+        anyhow::ensure!(
+            scaling_policy.is_none(),
+            "scaling_policy replay only supports standard Mooncake traces"
+        );
+        let trace =
+            load_agentic_trace_from_file(trace_path, trace_block_size, arrival_speedup_ratio)?;
+        return crate::replay::offline::simulate_agentic_trace_workload_disagg(
+            config,
+            router_config,
+            prefill_load_estimator,
+            trace,
+            router_mode,
+            record_per_request,
+            max_sim_time_ms,
+            sla,
+        );
     }
     if trace_format == TraceFileFormat::AppliedComputeAgentic {
         bail!(
@@ -2555,6 +2570,68 @@ mod tests {
         .unwrap();
         assert_eq!(report.request_counts.completed_requests, 2);
         assert_eq!(report.per_request.len(), 2);
+    }
+
+    #[test]
+    fn agentic_mooncake_disagg_preserves_dependencies_and_handoffs_once() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "request_id": "parent",
+                "timestamp": 0.0,
+                "input_length": 4,
+                "output_length": 1,
+                "hash_ids": [1]
+            })
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "request_id": "child",
+                "timestamp": 0.0,
+                "wait_for": ["parent"],
+                "tool_wait_ms": 5.0,
+                "input_length": 4,
+                "output_length": 1,
+                "hash_ids": [1]
+            })
+        )
+        .unwrap();
+
+        let report = simulate_trace_file_disagg_with_router_mode_and_format(
+            disagg_test_config(),
+            None,
+            None,
+            file.path(),
+            4,
+            1.0,
+            ReplayRouterMode::RoundRobin,
+            TraceFileFormat::AgenticMooncake,
+            0.0,
+            0,
+            true,
+            None,
+            SlaThresholds::default(),
+        )
+        .unwrap();
+
+        assert_eq!(report.request_counts.completed_requests, 2);
+        assert_eq!(report.per_request.len(), 2);
+        for request in &report.per_request {
+            assert!(request.prefill_admit_ms.is_some());
+            assert!(request.decode_admit_ms.is_some());
+            assert!(request.source_released_ms.is_some());
+            assert_eq!(request.admission_count, 2);
+        }
+        let mut requests = report.per_request.iter().collect::<Vec<_>>();
+        requests.sort_by(|left, right| left.arrival_time_ms.total_cmp(&right.arrival_time_ms));
+        let parent = requests[0];
+        let child = requests[1];
+        assert!(child.arrival_time_ms >= parent.terminal_time_ms + 5.0);
     }
 
     #[test]

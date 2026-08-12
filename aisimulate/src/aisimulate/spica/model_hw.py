@@ -65,7 +65,10 @@ class ModelHardware:
 
 
 def resolve_model_hardware(
-    model_name: str, hardware_sku: str, *, backend: str
+    model_name: str,
+    hardware_sku: str,
+    *,
+    backend: str,
 ) -> ModelHardware:
     """Read the model weights + SKU spec (via AIC) to derive is_moe / mla / wideep
     and the model's max context length."""
@@ -115,6 +118,11 @@ def parallel_configs_for(
     max_num_tokens: int = DEFAULT_MAX_NUM_TOKENS,
     max_batch_size: int = DEFAULT_MAX_BATCH_SIZE,
     memory_fraction: float = DEFAULT_MEMORY_FRACTION,
+    gemm_quant_mode: str | None = None,
+    moe_quant_mode: str | None = None,
+    fmha_quant_mode: str | None = None,
+    kvcache_quant_mode: str | None = None,
+    comm_quant_mode: str | None = None,
 ) -> list[ReplicaParallelConfig] | list[DisaggParallelConfig]:
     """Resolve the model/hardware, then enumerate the parallel configs that fit
     the GPU budget and can hold a ``max_seq_len``-token sequence.
@@ -176,6 +184,11 @@ def parallel_configs_for(
         max_num_tokens=max_num_tokens,
         max_batch_size=max_batch_size,
         memory_fraction=memory_fraction,
+        gemm_quant_mode=gemm_quant_mode,
+        moe_quant_mode=moe_quant_mode,
+        fmha_quant_mode=fmha_quant_mode,
+        kvcache_quant_mode=kvcache_quant_mode,
+        comm_quant_mode=comm_quant_mode,
     )
     if deployment_mode == "agg":
         kept = [c for c in configs if c.shape in feasible]

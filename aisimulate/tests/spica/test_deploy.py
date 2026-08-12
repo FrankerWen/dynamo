@@ -72,6 +72,42 @@ def test_agg_static_disabled_uses_plain_path():
     assert "num_gpu_blocks" not in ea  # replay estimates it
 
 
+def test_explicit_aic_quantization_profile_reaches_engine_payload():
+    sample = unroll_sample(
+        search_space=_space(
+            model_id="deepseek_v4_pro",
+            model_variant_id="deepseek_v4_pro_native_vllm",
+            aic_gemm_dtype="fp8_block",
+            aic_moe_dtype="w4a8_mxfp4_mxfp8",
+            aic_fmha_dtype="bfloat16",
+            aic_kv_cache_dtype="fp8",
+            aic_comm_dtype="half",
+        ),
+        selection=_agg_sel(),
+        parallel_config=AGG_MOE,
+    )
+
+    plan = build_deployment(sample, backend_version=AIC_PERF_DB_VERSION)
+
+    assert sample["model_variant_id"] == "deepseek_v4_pro_native_vllm"
+    assert {
+        key: plan.agg_engine_args[key]
+        for key in (
+            "aic_gemm_dtype",
+            "aic_moe_dtype",
+            "aic_fmha_dtype",
+            "aic_kv_cache_dtype",
+            "aic_comm_dtype",
+        )
+    } == {
+        "aic_gemm_dtype": "fp8_block",
+        "aic_moe_dtype": "w4a8_mxfp4_mxfp8",
+        "aic_fmha_dtype": "bfloat16",
+        "aic_kv_cache_dtype": "fp8",
+        "aic_comm_dtype": "half",
+    }
+
+
 def test_agg_scaling_builds_planner_config():
     lp = LoadPredictorResult(
         best_by_interval={180: "prophet_w20_log1p"}, reason="swept"
@@ -336,6 +372,34 @@ def test_disagg_offload_is_scored_on_prefill_only():
     assert "num_g2_blocks" not in plan.decode_engine_args
     assert "kv_bytes_per_token" not in plan.decode_engine_args
     assert "offload_batch_size" not in plan.decode_engine_args
+
+
+def test_pd_handoff_scalar_is_independent_of_kvbm_and_present_when_g2_is_off():
+    cfg = DisaggParallelConfig(
+        prefill=ReplicaParallelConfig(ParallelShape(tp=4, dp=1, moe_tp=1, moe_ep=4), 1),
+        decode=ReplicaParallelConfig(ParallelShape(tp=4, dp=1, moe_tp=1, moe_ep=4), 1),
+    )
+    sample = unroll_sample(
+        search_space=_space(
+            kv_transfer_bandwidth=100.0,
+            num_g2_blocks=0,
+        ),
+        selection=_agg_sel(
+            deployment_mode="disagg",
+            prefill_max_num_batched_tokens=8192,
+            prefill_max_num_seqs=256,
+            decode_max_num_batched_tokens=8192,
+            decode_max_num_seqs=256,
+        ),
+        parallel_config=cfg,
+    )
+    sample["kv_transfer_bytes_per_token"] = 31_232
+    plan = build_deployment(sample, backend_version=AIC_PERF_DB_VERSION)
+
+    assert plan.prefill_engine_args["kv_transfer_bytes_per_token"] == 31_232
+    assert plan.decode_engine_args["kv_transfer_bytes_per_token"] == 31_232
+    assert "kv_bytes_per_token" not in plan.prefill_engine_args
+    assert "kv_bytes_per_token" not in plan.decode_engine_args
 
 
 def test_e2e_only_sla_with_sla_target_raises():

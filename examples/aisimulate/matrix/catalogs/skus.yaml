@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+schema_version: 1
+kind: skus
+skus:
+  - id: b300_sxm
+    aic_system: b300_sxm
+    # Decimal GB/s per GPU, single direction. 100 GB/s = 800 Gb/s.
+    compute_nic_gbytes_per_s_per_gpu: 100
+    pd_transfer_topology:
+      gpus_per_node: 8
+      # Decimal GB/s per GPU, single direction (1.8 TB/s bidirectional / 2).
+      intra_node_gbytes_per_s_per_gpu: 900
+      # No rack-local NVSwitch tier: leaving one node uses the compute network.
+      inter_node_gbytes_per_s_per_gpu: 100
+    tags: [blackwell]
+  - id: gb300
+    aic_system: gb300
+    # Decimal GB/s per GPU, single direction. 100 GB/s = 800 Gb/s.
+    compute_nic_gbytes_per_s_per_gpu: 100
+    pd_transfer_topology:
+      gpus_per_node: 4
+      gpus_per_rack: 72
+      # NVLink 5 within one physical node.
+      intra_node_gbytes_per_s_per_gpu: 900
+      # NVLink/NVSwitch within one NVL72 rack.
+      intra_rack_gbytes_per_s_per_gpu: 900
+      # CX8 XDR 800 Gb/s between NVL72 racks.
+      inter_rack_gbytes_per_s_per_gpu: 100
+    tags: [blackwell, grace-blackwell]

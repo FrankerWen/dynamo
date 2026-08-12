@@ -185,6 +185,13 @@ impl DisaggRequestState {
     pub(crate) fn build_prefill_request(&mut self) -> Result<DirectRequest> {
         let mut request = self.materialize_original_request()?.clone();
         request.max_output_tokens = request.max_output_tokens.min(1);
+        // The prefill scheduler must emit exactly one token before handoff. Keep
+        // the original replay payload intact for decode, but make this cloned
+        // request internally consistent: vLLM treats a planned token list as
+        // authoritative and would otherwise restore the full output length.
+        if let Some(output_token_ids) = request.output_token_ids.as_mut() {
+            output_token_ids.truncate(request.max_output_tokens);
+        }
         Ok(request)
     }
 
@@ -620,6 +627,41 @@ mod tests {
         assert_eq!(request.max_output_tokens, 1);
         assert_eq!(request.priority, -3);
         assert_eq!(request.strict_priority, 9);
+    }
+
+    #[test]
+    fn disagg_prefill_request_truncates_planned_output_to_one_token() {
+        let planned_output_ids = vec![101, 102, 103, 104];
+        let mut state = DisaggRequestState::new(
+            ReplayRequestPayload::materialized(DirectRequest {
+                tokens: vec![1; 8],
+                max_output_tokens: planned_output_ids.len(),
+                output_token_ids: Some(planned_output_ids.clone()),
+                uuid: Some(Uuid::from_u128(11)),
+                dp_rank: 0,
+                arrival_timestamp_ms: Some(0.0),
+                priority: 0,
+                strict_priority: 0,
+                policy_class: None,
+            }),
+            0.0,
+            HandoffId::from(Uuid::from_u128(12)),
+            HandoffOrder::SourceFirst,
+            None,
+            None,
+        );
+
+        let request = state.build_prefill_request().unwrap();
+
+        assert_eq!(request.max_output_tokens, 1);
+        assert_eq!(request.output_token_ids, Some(vec![101]));
+        assert_eq!(
+            state
+                .materialize_original_request()
+                .unwrap()
+                .output_token_ids,
+            Some(planned_output_ids)
+        );
     }
 
     #[test]

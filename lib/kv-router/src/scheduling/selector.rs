@@ -633,7 +633,7 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             let effective_overlap_blocks = request.effective_overlap_blocks_for(worker);
             let cached_tokens = request.effective_cached_tokens_for(worker);
 
-            tracing::info!(
+            tracing::debug!(
                 request_id,
                 "Selected pinned worker: worker_type={}, worker_id={} dp_rank={:?}, logit: {:.3}, effective cached blocks: {:.2}",
                 self.worker_type,
@@ -704,7 +704,7 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             .get(&best_worker.worker_id)
             .and_then(|cfg| cfg.total_kv_blocks());
 
-        tracing::info!(
+        tracing::debug!(
             router_mode = "kv",
             request_id,
             worker_id = best_worker.worker_id,

@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+schema_version: 1
+kind: models
+models:
+  - id: deepseek_v4_flash
+    kv_footprint:
+      source: aic_native
+      layout: compressed_sparse_mla
+      scope: per_rank
+    tags: [formal-or-experimental, moe, deepseek]
+  - id: deepseek_v4_pro
+    kv_footprint:
+      source: aic_native
+      layout: compressed_sparse_mla
+      scope: per_rank
+    tags: [formal-or-experimental, moe, deepseek]
+  - id: minimax_m3
+    kv_footprint:
+      source: aic_native
+      layout: sparse_attention_gqa
+      scope: per_rank
+    tags: [formal-or-experimental, moe, hybrid-pass]
+  - id: glm_5_2
+    kv_footprint:
+      source: aic_native
+      layout: mla_with_indexer_cache
+      scope: per_rank
+    tags: [formal-or-experimental, moe, glm]
+  - id: kimi_k3
+    kv_footprint:
+      source: aic_native
+      layout: hybrid_mla_kda_fixed_state
+      scope: per_rank
+    tags: [formal-or-experimental, moe, kimi]

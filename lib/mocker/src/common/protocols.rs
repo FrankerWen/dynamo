@@ -623,6 +623,7 @@ struct MockEngineArgsSerde {
     bootstrap_port: OptionalConfigValue<u16>,
     handoff_session_timeout_ms: OptionalConfigValue<u64>,
     kv_bytes_per_token: OptionalConfigValue<usize>,
+    kv_transfer_bytes_per_token: OptionalConfigValue<usize>,
     kv_transfer_bandwidth: OptionalConfigValue<f64>,
     kv_transfer_timing_mode: OptionalConfigValue<String>,
     num_g2_blocks: OptionalConfigValue<usize>,
@@ -872,10 +873,20 @@ pub struct MockEngineArgs {
     #[validate(range(min = 1))]
     pub handoff_session_timeout_ms: u64,
 
-    /// KV cache bytes per token, auto-computed from model config by Python CLI.
-    /// Formula: num_layers * 2 * num_kv_heads * head_dim * dtype_bytes
+    /// KV bytes per token used to size one KVBM logical block payload.
+    /// The caller owns the scope; Matrix supplies a rank-local value and no TP
+    /// multiplier is applied here. Legacy Python entrypoints may still populate
+    /// this with their generic model-config formula.
     #[builder(default = "None")]
     pub kv_bytes_per_token: Option<usize>,
+
+    /// Effective KV bytes per prompt token assigned to the busiest per-GPU
+    /// transfer link, used only for P/D handoff timing. The caller resolves any
+    /// TP reshard/fan-out before setting it. Kept separate from
+    /// `kv_bytes_per_token`, which sizes KVBM blocks. When unset, transfer
+    /// timing falls back to the legacy shared scalar.
+    #[builder(default = "None")]
+    pub kv_transfer_bytes_per_token: Option<usize>,
 
     /// KV cache transfer bandwidth in GB/s for disaggregated serving latency simulation.
     /// Default: 64.0 (inter-node InfiniBand). Set to 0 to disable KV transfer delay.
@@ -1279,6 +1290,11 @@ impl TryFrom<MockEngineArgsSerde> for MockEngineArgs {
         if let Some(kv_bytes_per_token) = compat.kv_bytes_per_token.into_nullable() {
             builder = builder.kv_bytes_per_token(kv_bytes_per_token);
         }
+        if let Some(kv_transfer_bytes_per_token) =
+            compat.kv_transfer_bytes_per_token.into_nullable()
+        {
+            builder = builder.kv_transfer_bytes_per_token(kv_transfer_bytes_per_token);
+        }
         if let Some(kv_transfer_bandwidth) = compat.kv_transfer_bandwidth.into_nullable() {
             builder = builder.kv_transfer_bandwidth(kv_transfer_bandwidth);
         }
@@ -1375,6 +1391,11 @@ impl MockEngineArgs {
 
     pub fn builder() -> MockEngineArgsBuilder {
         MockEngineArgsBuilder::default()
+    }
+
+    /// Handoff sizing scalar with backward compatibility for old configs.
+    pub fn resolved_kv_transfer_bytes_per_token(&self) -> Option<usize> {
+        self.kv_transfer_bytes_per_token.or(self.kv_bytes_per_token)
     }
 
     /// GPUs occupied by one worker (engine), derived from tensor parallelism

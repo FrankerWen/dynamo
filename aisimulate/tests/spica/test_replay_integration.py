@@ -130,9 +130,9 @@ def test_static_path_emits_goodput():
 def test_static_path_runs_with_kvbm_host_offload():
     """The planner wheel must initialize and run replay with Spica's G2 knobs."""
 
-    assert (
-        _core.MOCKER_KVBM_OFFLOAD_ENABLED
-    ), "planner wheel must enable mocker-kvbm-offload"
+    assert _core.MOCKER_KVBM_OFFLOAD_ENABLED, (
+        "planner wheel must enable mocker-kvbm-offload"
+    )
     cfg = _config()
     cfg = cfg.model_copy(
         update={

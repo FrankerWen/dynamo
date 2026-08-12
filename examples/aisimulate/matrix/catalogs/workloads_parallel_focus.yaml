@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+schema_version: 1
+kind: workloads
+workloads:
+  - id: synthetic_8k_1k_no_prefix
+    loader: synthetic
+    tags: [parallel-validation, synthetic, no-prefix]
+    config:
+      isl: 8192
+      osl: 1024
+      prefix_length: 0
+      # AIC enumerates parallelism x batch/context and supplies realistic
+      # closed-loop operating points. Matrix then runs Spica independently at
+      # every selected concurrency; these are not hand-picked RPS anchors.
+      concurrency_sweep:
+        source: aic_operating_points
+        min_concurrency: 1
+        max_points: 8
+        include_static_pareto: true
+        topk_per_parallel: 1
+      num_request_ratio: 20
+      num_prefix_groups: 0

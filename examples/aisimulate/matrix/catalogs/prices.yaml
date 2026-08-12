@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Relative units make this example reproducible without asserting a vendor price.
+# Replace this file with the versioned TCO catalog used for a real study.
+schema_version: 1
+kind: prices
+prices:
+  - id: b300_relative
+    sku_id: b300_sxm
+    currency: RELATIVE_UNIT
+    gpu_hour: 1.0
+    g2_gib_hour: 0.0001
+    network_gb: 0.00001
+    all_in_multiplier: 1.25
+  - id: gb300_relative
+    sku_id: gb300
+    currency: RELATIVE_UNIT
+    gpu_hour: 1.0
+    g2_gib_hour: 0.0001
+    network_gb: 0.00001
+    all_in_multiplier: 1.25

@@ -39,6 +39,8 @@ import json
 from .config import OptimizationGoal, Workload
 from .deploy import DeploymentPlan
 
+EVALUATION_CACHE_HIT_METRIC = "__aisimulate_evaluation_cache_hit"
+
 
 def _build_kv_router_config(payload: dict | None):
     """A Dynamo ``KvRouterConfig`` from Spica's router-knob dict (its keys map 1:1 to
@@ -92,12 +94,14 @@ class ReplayEvaluator:
         workload: Workload,
         goal: OptimizationGoal,
         *,
-        trace_block_size: int = 512,
+        trace_block_size: int | None = None,
         benchmark_granularity: int = 8,
     ):
         self.workload = workload
         self.goal = goal
-        self.trace_block_size = trace_block_size
+        self.trace_block_size = (
+            workload.trace_block_size if trace_block_size is None else trace_block_size
+        )
         self.benchmark_granularity = benchmark_granularity
 
     def _goodput_sla_kwargs(self) -> dict[str, float | None]:
@@ -126,6 +130,7 @@ class ReplayEvaluator:
             output_tokens=wl.osl,
             request_count=wl.resolved_request_count(concurrency_override),
             arrival_interval_ms=wl.synthetic_arrival_interval_ms,
+            arrival_seed=wl.arrival_seed,
             turns_per_session=wl.turns_per_session,
             shared_prefix_ratio=wl.shared_prefix_ratio,
             num_prefix_groups=wl.num_prefix_groups,
@@ -159,7 +164,10 @@ class ReplayEvaluator:
             router_mode=plan.router_mode,
             router_config=self._router_config(plan),
             arrival_speedup_ratio=wl.arrival_speedup_ratio,
+            trace_format=wl.trace_format,
             trace_block_size=self.trace_block_size,
+            trace_shared_prefix_ratio=wl.shared_prefix_ratio,
+            trace_num_prefix_groups=wl.num_prefix_groups,
             replay_concurrency=wl.effective_in_flight_cap(),  # None -> arrival timestamps
             planner_config=None if plan.is_static else plan.planner_config,
             benchmark_granularity=self.benchmark_granularity,

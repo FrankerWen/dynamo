@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Full matrix throughput-oriented variant.  Replay semantics and simulator
+# revision match experiment.yaml, so exact evaluation-cache hits are reusable.
+schema_version: 1
+catalogs:
+  models: [catalogs/models.yaml]
+  model_variants: [catalogs/model_variants.yaml]
+  skus: [catalogs/skus.yaml]
+  workloads: [catalogs/workloads.yaml]
+  slas: [catalogs/slas.yaml]
+  search_policy: policies/vllm_pd_g2_parallel16.yaml
+matrix:
+  model_selector: {tags: [formal-or-experimental]}
+  model_variant_selector: {tags: [native]}
+  sku_selector: {ids: [b300_sxm, gb300]}
+  workload_selector: {tags: [production-study]}
+  sla_profile: default_sla
+run:
+  cell_workers: 4
+  topk: 20
+  simulator_revision: formal-matrix-2026-08-11-model-variant-v3

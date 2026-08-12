@@ -22,7 +22,7 @@ from __future__ import annotations
 import math
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -90,6 +90,103 @@ class SLATarget(BaseModel):
     ttft_ms: float | None = Field(default=None, gt=0)
     itl_ms: float | None = Field(default=None, gt=0)
     e2e_ms: float | None = Field(default=None, gt=0)
+
+
+class PDTransferTopology(BaseModel):
+    """Bandwidth domains available to one compact P/D placement group.
+
+    Bandwidths are decimal GB/s (1e9 byte/s), per GPU, single direction.  A
+    rack-aware system has an ``intra_rack`` domain between the physical-node
+    and inter-rack domains.  A system without that tier uses ``inter_node`` as
+    soon as the P/D group no longer fits in one node.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    gpus_per_node: int = Field(gt=0)
+    gpus_per_rack: int | None = Field(default=None, gt=0)
+    intra_node_gbytes_per_s_per_gpu: float = Field(gt=0)
+    intra_rack_gbytes_per_s_per_gpu: float | None = Field(default=None, gt=0)
+    inter_node_gbytes_per_s_per_gpu: float | None = Field(default=None, gt=0)
+    inter_rack_gbytes_per_s_per_gpu: float | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def _complete_domain_ladder(self) -> PDTransferTopology:
+        if self.gpus_per_rack is None:
+            if self.inter_node_gbytes_per_s_per_gpu is None:
+                raise ValueError(
+                    "a topology without a rack tier requires inter_node_gbytes_per_s_per_gpu"
+                )
+            if self.intra_rack_gbytes_per_s_per_gpu is not None:
+                raise ValueError(
+                    "intra_rack_gbytes_per_s_per_gpu requires gpus_per_rack"
+                )
+            if self.inter_rack_gbytes_per_s_per_gpu is not None:
+                raise ValueError(
+                    "inter_rack_gbytes_per_s_per_gpu requires gpus_per_rack"
+                )
+            return self
+        if self.gpus_per_rack < self.gpus_per_node:
+            raise ValueError("gpus_per_rack must be >= gpus_per_node")
+        if self.intra_rack_gbytes_per_s_per_gpu is None:
+            raise ValueError(
+                "a rack-aware topology requires intra_rack_gbytes_per_s_per_gpu"
+            )
+        if self.inter_rack_gbytes_per_s_per_gpu is None:
+            raise ValueError(
+                "a rack-aware topology requires inter_rack_gbytes_per_s_per_gpu"
+            )
+        return self
+
+
+class KVFootprintSpec(BaseModel):
+    """Source and semantic scope of a model's KV-cache footprint.
+
+    ``aic_native`` resolves the candidate-specific per-rank sequence footprint
+    through ``BaseModel.get_kvcache_bytes_per_sequence``.  ``explicit_linear``
+    is the compatibility path for ordinary linear KV layouts whose byte rate is
+    supplied by the caller.  The scope is intentionally explicit: DynoSim's
+    KVBM instance models one rank-local pool and P/D timing uses per-GPU links
+    operating in parallel, so neither value is multiplied by TP implicitly.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["aic_native", "explicit_linear"] = "aic_native"
+    layout: str
+    scope: Literal["per_rank"] = "per_rank"
+    dtype: str | None = None
+    explicit_bytes_per_token: int | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def _validate_source(self) -> KVFootprintSpec:
+        if not self.layout.strip():
+            raise ValueError("KV footprint layout must not be empty")
+        if self.source == "explicit_linear" and self.explicit_bytes_per_token is None:
+            raise ValueError(
+                "explicit_linear KV footprint requires explicit_bytes_per_token"
+            )
+        if self.source == "aic_native" and self.explicit_bytes_per_token is not None:
+            raise ValueError(
+                "aic_native KV footprint cannot also set explicit_bytes_per_token"
+            )
+        return self
+
+
+class KVFootprintPolicy(BaseModel):
+    """How scalar-only replay handles a non-linear native KV footprint.
+
+    For a fixed-length synthetic workload, averaging the exact native bytes at
+    that length preserves aggregate bytes per request, but individual KVBM
+    block timings remain an approximation.  Heterogeneous traces and
+    destination-missing P/D transfers fail closed because one scalar cannot
+    represent their request- or position-dependent footprint.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    nonlinear_kvbm: Literal["fail_closed", "fixed_synthetic_average"] = "fail_closed"
+    heterogeneous_trace: Literal["fail_closed"] = "fail_closed"
 
 
 # Goodput-based scalar targets — the only ones that need an SLA (their metric counts
@@ -219,11 +316,13 @@ class Workload(BaseModel):
     # dynamic trace source (mutually exclusive with the synthetic fields)
     trace_path: str | None = None
     trace_format: str = "mooncake"  # replay-ready trace schema
+    trace_block_size: int = Field(default=512, gt=0)
     arrival_speedup_ratio: float = 1.0  # scale trace inter-arrival times
     # Closed-loop replay over a *trace*: cap in-flight requests at this many (the
     # trace's timestamps are ignored; a new request starts as one finishes). For a
     # *synthetic* closed-loop workload use ``concurrency`` or ``kv_load_ratio`` instead.
     replay_concurrency: int | None = None
+    arrival_seed: int = 0
 
     @property
     def is_trace_based(self) -> bool:
@@ -470,6 +569,8 @@ class SearchSpace(BaseModel):
     )  # generated when empty
     # pinned
     model_name: str  # HF id or private model name
+    model_id: str | None = None  # catalog semantic model identity
+    model_variant_id: str | None = None  # concrete checkpoint/precision identity
     hardware_sku: str  # e.g. "h200_sxm"
     gpu_budget: int = 32  # max GPUs per candidate
     min_gpu_budget: int | None = None
@@ -477,6 +578,30 @@ class SearchSpace(BaseModel):
     context_length: int | None = None
     startup_time: float | None = None
     aic_nextn: int | None = None  # speculative-decode (MTP) depth, 1..5
+    # Explicit AIC quantization profile. None preserves the standalone Spica
+    # checkpoint-default behavior; Matrix model variants always pin all five.
+    aic_gemm_dtype: str | None = None
+    aic_moe_dtype: str | None = None
+    aic_fmha_dtype: str | None = None
+    aic_kv_cache_dtype: str | None = None
+    aic_comm_dtype: str | None = None
+    kv_footprint: KVFootprintSpec | None = None
+    kv_footprint_policy: KVFootprintPolicy = Field(default_factory=KVFootprintPolicy)
+    # Matrix-orchestrator provenance and pinned prefill/decode transfer policy.
+    # Profiles are expanded into separate Spica studies so the existing scalar
+    # SmartSearchConfig remains backward compatible.
+    pd_profile_id: str | None = None
+    pd_placement: str | None = None
+    pd_bandwidth_source: (
+        Literal["topology", "compute_nic", "local_fabric", "explicit"] | None
+    ) = None
+    pd_transfer_topology: PDTransferTopology | None = None
+    kvbm_profile_id: str | None = None
+    kv_transfer_bandwidth: float | None = Field(default=None, gt=0)
+    pd_prefill_to_decode_bandwidth_gbps: float | None = Field(default=None, gt=0)
+    pd_decode_to_prefill_bandwidth_gbps: float | None = Field(default=None, gt=0)
+    kv_transfer_timing_mode: str = "full_prompt"
+    pd_deployability: str | None = None
 
     # prefill engine (disagg branch): scheduler batching capacity
     prefill_max_num_batched_tokens: list[int] = [8192, 16384, 32768]
@@ -506,10 +631,14 @@ class SearchSpace(BaseModel):
     num_g2_blocks: int = Field(default=0, ge=0)  # 0 disables host offload
     kv_bytes_per_token: int | None = Field(
         default=None, gt=0
-    )  # required replay transfer sizing when G2 is on
+    )  # rank-local KVBM block sizing only; P/D handoff has a separate resolved scalar
     bandwidth_g1_to_g2_gbps: float | None = None
     bandwidth_g2_to_g1_gbps: float | None = None
     offload_batch_size: int | None = None
+    g2_capacity_gib: float | None = Field(default=None, ge=0)
+    g2_capacity_scope: Literal["deployment_total", "per_rank"] = "deployment_total"
+    g2_target_hit_rate: float | None = Field(default=None, ge=0, le=1)
+    kvbm_deployability: str | None = None
 
     # router (KV-router knobs are ignored under round_robin)
     router_mode: list[str] = ["kv_router", "round_robin"]
@@ -634,9 +763,53 @@ class SearchSpace(BaseModel):
         offload engine. Requiring the pinned value keeps replay and deployment
         artifacts on the same KVBM policy.
         """
-        if self.num_g2_blocks > 0 and self.kv_bytes_per_token is None:
+        offload_enabled = self.num_g2_blocks > 0 or bool(
+            self.g2_capacity_gib is not None and self.g2_capacity_gib > 0
+        )
+        if (
+            offload_enabled
+            and self.kv_bytes_per_token is None
+            and self.kv_footprint is None
+        ):
             raise ValueError(
-                "kv_bytes_per_token is required when num_g2_blocks > 0 so replay can model KVBM offload"
+                "kv_bytes_per_token or kv_footprint is required when G2 is enabled "
+                "so replay can model KVBM offload"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_transfer_timing_mode(self) -> SearchSpace:
+        if self.kv_transfer_timing_mode not in {
+            "full_prompt",
+            "destination_missing",
+        }:
+            raise ValueError(
+                "kv_transfer_timing_mode must be 'full_prompt' or 'destination_missing'"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_pd_topology_resolution(self) -> SearchSpace:
+        if self.pd_bandwidth_source != "topology":
+            return self
+        if self.pd_transfer_topology is None:
+            raise ValueError(
+                "pd_transfer_topology is required when pd_bandwidth_source='topology'"
+            )
+        if self.pd_placement != "compact":
+            raise ValueError(
+                "topology-resolved P/D bandwidth currently requires pd_placement='compact'"
+            )
+        if any(
+            value is not None
+            for value in (
+                self.kv_transfer_bandwidth,
+                self.pd_prefill_to_decode_bandwidth_gbps,
+                self.pd_decode_to_prefill_bandwidth_gbps,
+            )
+        ):
+            raise ValueError(
+                "topology-resolved P/D bandwidth cannot also pin a scalar transfer bandwidth"
             )
         return self
 
@@ -720,6 +893,22 @@ class SweepConfig(BaseModel):
     # instead of hanging the sweep (e.g. an over-subscribed config that churns). Only enforced
     # on the worker-pool path (parallel_evals > 1); None disables the cap.
     max_eval_seconds: float | None = Field(default=600.0, gt=0)
+    sampler_algorithm: (
+        Literal["DEFAULT", "RANDOM_SEARCH", "QUASI_RANDOM_SEARCH"] | None
+    ) = None
+    search_seed: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _seed_requires_supported_sampler(self) -> SweepConfig:
+        if self.search_seed is not None and self.sampler_algorithm not in (
+            "RANDOM_SEARCH",
+            "QUASI_RANDOM_SEARCH",
+        ):
+            raise ValueError(
+                "search_seed requires sampler_algorithm RANDOM_SEARCH or "
+                "QUASI_RANDOM_SEARCH"
+            )
+        return self
 
 
 class Candidate(BaseModel):
@@ -735,6 +924,30 @@ class Candidate(BaseModel):
     # OptimizationTarget value (e.g. {"throughput_per_gpu": .., "throughput_per_user": ..});
     # None for a single-objective sweep. Drives Pareto dominance in score.pareto_front.
     objectives: dict[str, float] | None = None
+
+
+class SearchEvaluation(BaseModel):
+    """One optimizer trial, including infeasible, failed, and cache-hit outcomes."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    index: int
+    branch: str
+    outcome: str
+    reason: str = ""
+    selection: dict[str, Any]
+    parallel_config: dict[str, Any]
+    candidate: Candidate | None = None
+
+
+class SmartSearchRunResult(BaseModel):
+    """Ranked result plus the complete ask/evaluate history."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    candidates: list[Candidate]
+    evaluations: list[SearchEvaluation]
+    tally: dict[str, int]
 
 
 class SmartSearchConfig(BaseModel):

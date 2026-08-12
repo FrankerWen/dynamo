@@ -46,8 +46,11 @@ Folded straight off the `SearchSpace` (`_DEPLOYMENT_PINNED` + `_KV_MANAGER`):
 - deployment/runtime context: `model_name`, `hardware_sku`, `context_length`,
   `startup_time`, `aic_nextn`
 - planner limits: `gpu_budget`, `min_gpu_budget`, `min_endpoint`
-- kv-manager offload: `num_g2_blocks`, `kv_bytes_per_token`, `bandwidth_g1_to_g2_gbps`,
-  `bandwidth_g2_to_g1_gbps`, `offload_batch_size`
+- KV footprint and offload: `kv_footprint`, `kv_footprint_policy`, `num_g2_blocks`,
+  `g2_capacity_gib`, `g2_capacity_scope`, `kv_bytes_per_token`,
+  `bandwidth_g1_to_g2_gbps`, `bandwidth_g2_to_g1_gbps`, `offload_batch_size`.
+  Candidate resolution also emits role-specific native footprint metadata and
+  the independent P/D `kv_transfer_bytes_per_token` scalar.
 
 The GPU bounds and endpoint floor constrain candidate enumeration, and they also become
 live runtime policy (`max_gpu_budget`, `min_gpu_budget`, `min_endpoint`) when the selected

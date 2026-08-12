@@ -12,11 +12,12 @@ import pytest
 
 import aisimulate.spica.search as search_mod
 from aisimulate.spica.config import SmartSearchConfig
+from aisimulate.spica.evaluator import EVALUATION_CACHE_HIT_METRIC
 from aisimulate.spica.kv_load import KVLoadResolution
 from aisimulate.spica.load_predictor_sweep import LoadPredictorResult
 from aisimulate.spica.parallel_enum import ParallelShape, ReplicaParallelConfig
 from aisimulate.spica.sampler import Suggestion
-from aisimulate.spica.search import run_smart_search
+from aisimulate.spica.search import run_smart_search, run_smart_search_with_history
 from aisimulate.spica.search_space import BranchSpace
 
 TRACE = str(Path(__file__).parent / "data" / "mooncake_tiny.jsonl")
@@ -129,6 +130,50 @@ def test_ranks_feasible_best_first(monkeypatch):
     assert all(c.used_gpus == 8 for c in cands)
     assert all(c.config["backend_version"] == "1.3.0rc10" for c in cands)
     assert cands[0].metrics["gpu_hours"] == 1.0
+
+
+def test_history_retains_every_feasible_trial(monkeypatch):
+    branch = _branch(
+        ReplicaParallelConfig(ParallelShape(tp=4, dp=1, moe_tp=1, moe_ep=4), replicas=2)
+    )
+    _stub(monkeypatch, branch)
+
+    result = run_smart_search_with_history(
+        _config(),
+        evaluator=_FakeEvaluator(),
+        sampler_factory=_FakeSampler,
+        show_progress=False,
+    )
+
+    assert len(result.candidates) == 3
+    assert [evaluation.index for evaluation in result.evaluations] == [1, 2, 3]
+    assert {evaluation.outcome for evaluation in result.evaluations} == {"feasible"}
+    assert result.tally == {"feasible": 3}
+    assert all(evaluation.candidate is not None for evaluation in result.evaluations)
+
+
+def test_persistent_cache_hits_are_ranked_without_counting_as_replay(monkeypatch):
+    branch = _branch(
+        ReplicaParallelConfig(ParallelShape(tp=4, dp=1, moe_tp=1, moe_ep=4), replicas=2)
+    )
+    _stub(monkeypatch, branch)
+
+    class CachedEvaluator(_FakeEvaluator):
+        def evaluate(self, plan, *, concurrency_override=None):
+            report = super().evaluate(plan, concurrency_override=concurrency_override)
+            report[EVALUATION_CACHE_HIT_METRIC] = 1.0
+            return report
+
+    result = run_smart_search_with_history(
+        _config(),
+        evaluator=CachedEvaluator(),
+        sampler_factory=_FakeSampler,
+        show_progress=False,
+    )
+
+    assert len(result.candidates) == 3
+    assert result.tally == {"cache_hit": 3}
+    assert {evaluation.outcome for evaluation in result.evaluations} == {"cache_hit"}
 
 
 def test_show_progress_is_forwarded_to_load_predictor_sweep(monkeypatch):

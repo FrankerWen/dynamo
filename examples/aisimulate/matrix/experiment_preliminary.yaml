@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+schema_version: 1
+catalogs:
+  models: [catalogs/models.yaml]
+  model_variants: [catalogs/model_variants.yaml]
+  skus: [catalogs/skus.yaml]
+  workloads: [catalogs/workloads_preliminary.yaml]
+  slas: [catalogs/slas.yaml]
+  search_policy: policies/vllm_pd_g2_preliminary.yaml
+matrix:
+  model_selector:
+    ids: [deepseek_v4_flash, deepseek_v4_pro, minimax_m3, glm_5_2, kimi_k3]
+  model_variant_selector: {tags: [native]}
+  sku_selector: {ids: [b300_sxm, gb300]}
+  workload_selector: {tags: [preliminary-study]}
+  sla_profile: default_sla
+run:
+  cell_workers: 1
+  topk: 10
+  simulator_revision: preliminary-matrix-2026-08-11-model-variant-v3

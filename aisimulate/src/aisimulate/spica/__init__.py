@@ -12,11 +12,16 @@ from __future__ import annotations
 
 from .config import (
     Candidate,
+    KVFootprintPolicy,
+    KVFootprintSpec,
     OptimizationGoal,
     OptimizationTarget,
+    PDTransferTopology,
+    SearchEvaluation,
     SearchSpace,
     SLATarget,
     SmartSearchConfig,
+    SmartSearchRunResult,
     SweepConfig,
     Workload,
 )
@@ -53,19 +58,25 @@ from .planner import (
 from .sample import unroll_sample
 from .sampler import BranchSampler, Suggestion, make_branch_sampler
 from .score import is_feasible, make_candidate, objective_value, rank, score_report
-from .search import run_smart_search
+from .search import run_smart_search, run_smart_search_with_history
 from .search_space import BranchSpace, enumerate_branches
 
 __all__ = [
     "Candidate",
+    "KVFootprintPolicy",
+    "KVFootprintSpec",
     "OptimizationGoal",
     "OptimizationTarget",
+    "PDTransferTopology",
     "SearchSpace",
+    "SearchEvaluation",
     "SLATarget",
     "SmartSearchConfig",
+    "SmartSearchRunResult",
     "SweepConfig",
     "Workload",
     "run_smart_search",
+    "run_smart_search_with_history",
     # parallel-config enumeration
     "ParallelShape",
     "ReplicaParallelConfig",

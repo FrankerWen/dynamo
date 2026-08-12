@@ -113,6 +113,23 @@ def test_suggest_produces_valid_selections():
         assert s.parallel_config in branch.parallel_configs
 
 
+def test_seeded_quasi_random_suggestions_are_reproducible():
+    def selections(seed):
+        sampler = make_branch_sampler(
+            _branch(),
+            study_id=f"seeded_{seed}_{uuid.uuid4().hex}",
+            algorithm="QUASI_RANDOM_SEARCH",
+            seed=seed,
+        )
+        suggestions = sampler.suggest(count=8)
+        for suggestion in suggestions:
+            sampler.observe(suggestion, {"objective": 1.0})
+        return [suggestion.selection for suggestion in suggestions]
+
+    assert selections(7) == selections(7)
+    assert selections(7) != selections(8)
+
+
 def test_dict_form_composite_decodes_via_index():
     # planner_scaling_policy mixes a preset id and a pinned dict; the sampler
     # categorizes over the index and decodes back to the exact entry (str or dict).

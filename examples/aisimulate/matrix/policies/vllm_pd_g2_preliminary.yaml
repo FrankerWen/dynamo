@@ -1,0 +1,69 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+schema_version: 1
+kind: search_policy
+epsilon_pareto: 0.05
+kv_footprint:
+  nonlinear_kvbm: fixed_synthetic_average
+  heterogeneous_trace: fail_closed
+static_prune:
+  max_candidates: 12
+  topk_per_strategy: 3
+spica:
+  max_rounds: 2
+  parallel_evals: 2
+  candidates_per_round: 2
+  max_eval_seconds: 180
+  sampler_algorithm: QUASI_RANDOM_SEARCH
+  search_seed: 20260810
+  deployment_mode: [disagg, agg]
+  search_space:
+    backend: [vllm]
+    gpu_budget: 16
+    router_mode: [kv_router, round_robin]
+    overlap_score_credit: [0.5, 1]
+    prefill_load_scale: [0.5, 1, 2]
+    host_cache_hit_weight: [0.5, 1]
+    disk_cache_hit_weight: [0]
+    router_temperature: [0, 0.2]
+    prefill_max_num_batched_tokens: [8192, 32768]
+    prefill_max_num_seqs: [128, 256]
+    decode_max_num_batched_tokens: [8192]
+    decode_max_num_seqs: [256, 512]
+    agg_max_num_batched_tokens: [8192, 32768]
+    agg_max_num_seqs: [256, 512]
+pd_profiles:
+  - id: topology_aware_full_prompt
+    placement: compact
+    timing_mode: full_prompt
+    bandwidth_source: topology
+    deployability: deployable
+kvbm_profiles:
+  - id: g2_off
+    num_g2_blocks: 0
+  - id: g2_50_hit_bw_025
+    capacity_gib: 64
+    capacity_scope: deployment_total
+    target_hit_rate: 0.50
+    bandwidth_to_g2_ratio: 0.25
+    bandwidth_from_g2_ratio: 0.25
+    offload_batch_size: 32
+  - id: g2_90_hit_bw_1
+    capacity_gib: 256
+    capacity_scope: deployment_total
+    target_hit_rate: 0.90
+    bandwidth_to_g2_ratio: 1
+    bandwidth_from_g2_ratio: 1
+    offload_batch_size: 64
+capacity_search:
+  enabled: true
+  expansion_factor: 2
+  tolerance: 0.10
+  max_expansions: 4
+  max_binary_steps: 4
+  max_load: 4
+robustness:
+  enabled: true
+  seeds: [0]
+  bandwidth_multipliers: [0.8, 1.0]

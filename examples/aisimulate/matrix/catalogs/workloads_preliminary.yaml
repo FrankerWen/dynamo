@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+schema_version: 1
+kind: workloads
+workloads:
+  - id: synthetic_preliminary_4k
+    loader: synthetic
+    tags: [preliminary-study, synthetic, context-4k]
+    config:
+      isl: 3072
+      osl: 1024
+      prefix_length: 2304
+      request_rates: [0.25]
+      num_request_ratio: 128
+      num_prefix_groups: 32
+  - id: synthetic_preliminary_32k
+    loader: synthetic
+    tags: [preliminary-study, synthetic, context-32k]
+    config:
+      isl: 28672
+      osl: 4096
+      prefix_length: 24576
+      request_rates: [0.05]
+      num_request_ratio: 512
+      num_prefix_groups: 64

@@ -428,6 +428,46 @@ pub(crate) fn simulate_agentic_trace_workload(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn simulate_agentic_trace_workload_disagg(
+    config: OfflineDisaggReplayConfig,
+    router_config: Option<ReplayKvRouterConfig>,
+    prefill_load_estimator: Option<ReplayPrefillLoadEstimator>,
+    trace: AgenticTrace,
+    router_mode: ReplayRouterMode,
+    record_per_request: bool,
+    max_sim_time_ms: Option<f64>,
+    sla: SlaThresholds,
+) -> Result<TraceSimulationReport> {
+    let started_at = Instant::now();
+    let driver = agentic_workload_driver(trace, config.prefill_args.block_size, router_mode)?;
+    let prepared = match router_mode {
+        ReplayRouterMode::RoundRobin => PreparedOfflineReplay::DisaggRoundRobin(
+            RoundRobinDisaggRuntime::new_round_robin_workload(
+                &config,
+                driver,
+                DisaggReplayMode::Trace,
+            )?
+            .with_per_request_records(record_per_request)
+            .with_max_sim_time_ms(max_sim_time_ms),
+        ),
+        ReplayRouterMode::KvRouter => PreparedOfflineReplay::DisaggKv(
+            DisaggRuntime::new_workload(
+                &config,
+                router_config,
+                prefill_load_estimator,
+                driver,
+                DisaggReplayMode::Trace,
+                router_mode,
+            )?
+            .with_per_request_records(record_per_request)
+            .with_max_sim_time_ms(max_sim_time_ms),
+        ),
+    };
+    let collector = prepared.run(None)?;
+    Ok(finish_with_replay_wall_time(collector, started_at, sla))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn simulate_trace_workload_accumulating_deltas(
     args: MockEngineArgs,
     router_config: Option<ReplayKvRouterConfig>,

@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Preliminary public-cloud anchor, not a procurement quote. AWS published the
+# p6-b300.48xlarge Linux shared unused-capacity rate as USD 142.416/instance-hour
+# for eight B300 GPUs (USD 17.802/GPU-hour). AWS had no GB300 line in the same
+# catalog when accessed, so GB300 deliberately uses the same per-GPU anchor.
+schema_version: 1
+kind: prices
+prices:
+  - id: aws_p6_b300_20260806
+    sku_id: b300_sxm
+    currency: USD
+    gpu_hour: 17.802
+    g2_gib_hour: 0.000109589
+    network_gb: 0.01
+    all_in_multiplier: 1.0
+    source_url: https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/us-east-1/index.csv
+    source_date: "2026-08-06"
+    basis: AWS p6-b300.48xlarge Linux shared unused-capacity rate divided by 8 GPUs
+    notes: G2 uses the AWS gp3 USD 0.08/GB-month anchor divided by 730 hours; network uses a USD 0.01/GB same-AZ planning allowance.
+  - id: gb300_proxy_aws_p6_b300_20260806
+    sku_id: gb300
+    currency: USD
+    gpu_hour: 17.802
+    g2_gib_hour: 0.000109589
+    network_gb: 0.01
+    all_in_multiplier: 1.0
+    source_url: https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/us-east-1/index.csv
+    source_date: "2026-08-06"
+    basis: Explicit GB300 proxy using the same per-GPU AWS B300 public anchor
+    notes: No GB300 entry was present in the referenced AWS catalog; replace this proxy before procurement use.

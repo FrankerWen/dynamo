@@ -68,7 +68,7 @@ pub fn compute_kv_transfer_delay(
         true,
         num_input_tokens,
         args.kv_transfer_bandwidth,
-        args.kv_bytes_per_token,
+        args.resolved_kv_transfer_bytes_per_token(),
     )
     .map(|delay_ms| Duration::from_secs_f64(delay_ms / 1000.0))
 }
@@ -153,6 +153,37 @@ mod tests {
                 Some(1_000_000),
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn dedicated_handoff_byte_rate_does_not_alias_kvbm_block_sizing() {
+        let args = MockEngineArgs::builder()
+            .worker_type(WorkerType::Prefill)
+            .kv_bytes_per_token(Some(1_000_000))
+            .kv_transfer_bytes_per_token(Some(2_000_000))
+            .kv_transfer_bandwidth(Some(1.0))
+            .build()
+            .unwrap();
+
+        let delay = compute_kv_transfer_delay(&args, 10).unwrap();
+        assert_eq!(delay, Duration::from_millis(20));
+        assert_eq!(args.kv_bytes_per_token, Some(1_000_000));
+        assert_eq!(args.resolved_kv_transfer_bytes_per_token(), Some(2_000_000));
+    }
+
+    #[test]
+    fn handoff_byte_rate_falls_back_to_legacy_shared_scalar() {
+        let args = MockEngineArgs::builder()
+            .worker_type(WorkerType::Prefill)
+            .kv_bytes_per_token(Some(1_000_000))
+            .kv_transfer_bandwidth(Some(1.0))
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            compute_kv_transfer_delay(&args, 10),
+            Some(Duration::from_millis(10))
         );
     }
 }

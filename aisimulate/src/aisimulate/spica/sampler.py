@@ -51,19 +51,38 @@ class Suggestion:
     projection: ParallelProjection | None = field(default=None, repr=False)
 
 
+@dataclass
+class _LocalTrialHandle:
+    """Minimal ask/tell handle for a deterministic in-process designer."""
+
+    parameters: Any
+    metadata: Any = field(default=None, repr=False)
+    measurement: Any = field(default=None, repr=False)
+    infeasibility_reason: str | None = field(default=None, repr=False)
+
+    def update_metadata(self, metadata: Any) -> None:
+        self.metadata = metadata
+
+    def complete(
+        self,
+        measurement: Any,
+        *,
+        infeasible_reason: str | None = None,
+    ) -> None:
+        self.measurement = measurement
+        self.infeasibility_reason = infeasible_reason
+
+
 class BranchSampler(Protocol):
     """Stateful optimizer over one branch (swappable: Vizier, random, ...)."""
 
     branch: BranchSpace
 
-    def suggest(self, count: int) -> list[Suggestion]:
-        ...
+    def suggest(self, count: int) -> list[Suggestion]: ...
 
-    def observe(self, suggestion: Suggestion, metrics: dict[str, float]) -> None:
-        ...
+    def observe(self, suggestion: Suggestion, metrics: dict[str, float]) -> None: ...
 
-    def observe_infeasible(self, suggestion: Suggestion, reason: str) -> None:
-        ...
+    def observe_infeasible(self, suggestion: Suggestion, reason: str) -> None: ...
 
 
 def _decoder_for(choices: list[Any]) -> Callable[[Any], Any]:
@@ -110,6 +129,8 @@ class VizierBranchSampler:
         *,
         study_id: str,
         objectives: list[tuple[str, bool]] | None = None,
+        algorithm: str | None = None,
+        seed: int | None = None,
     ):
         configure_vizier_runtime()
         clients, vz = _vizier_modules()
@@ -205,15 +226,50 @@ class VizierBranchSampler:
         # EXPERIMENT (env-gated; default DEFAULT = GP-bandit). The multi-objective GP suggest
         # can spin/hang at low observation counts; SPICA_VIZIER_ALGO=RANDOM_SEARCH bypasses the
         # GP (instant suggest, uniform exploration) to cover the curve ends without that stall.
-        study_config.algorithm = os.environ.get("SPICA_VIZIER_ALGO", "DEFAULT")
-        self._study = clients.Study.from_study_config(
-            study_config, owner="spica", study_id=study_id
-        )
+        resolved_algorithm = algorithm or os.environ.get("SPICA_VIZIER_ALGO", "DEFAULT")
+        study_config.algorithm = resolved_algorithm
+        self._study = None
+        self._designer = None
+        if seed is None:
+            self._study = clients.Study.from_study_config(
+                study_config, owner="spica", study_id=study_id
+            )
+        else:
+            if resolved_algorithm == "RANDOM_SEARCH":
+                # Vizier's public designers namespace eagerly imports optional
+                # CVXPY-based designers. Import the two seedable implementations
+                # directly so deterministic random search keeps a minimal runtime.
+                from vizier._src.algorithms.designers import random
+
+                self._designer = random.RandomDesigner(problem.search_space, seed=seed)
+            elif resolved_algorithm == "QUASI_RANDOM_SEARCH":
+                from vizier._src.algorithms.designers import quasi_random
+
+                self._designer = quasi_random.QuasiRandomDesigner(
+                    problem.search_space, seed=seed
+                )
+            else:
+                raise ValueError(
+                    "a deterministic search_seed is supported only for "
+                    "RANDOM_SEARCH or QUASI_RANDOM_SEARCH"
+                )
 
     def suggest(self, count: int) -> list[Suggestion]:
         suggestions: list[Suggestion] = []
-        for trial in self._study.suggest(count=count):
-            params = dict(trial.parameters)
+        if self._designer is None:
+            assert self._study is not None
+            trials = self._study.suggest(count=count)
+        else:
+            trials = [
+                _LocalTrialHandle(parameters=trial.parameters)
+                for trial in self._designer.suggest(count=count)
+            ]
+        for trial in trials:
+            params = (
+                trial.parameters.as_dict()
+                if isinstance(trial, _LocalTrialHandle)
+                else dict(trial.parameters)
+            )
             # backend is a searched knob now (in knob_choices) -> comes via _constants
             # (single backend) or _decoders (multiple), not a per-branch constant.
             selection: dict[str, Any] = {
@@ -274,7 +330,15 @@ def make_branch_sampler(
     *,
     study_id: str,
     objectives: list[tuple[str, bool]] | None = None,
+    algorithm: str | None = None,
+    seed: int | None = None,
 ) -> BranchSampler:
     """Construct the default (Vizier) sampler for a branch. ``objectives`` (name, maximize)
     pairs default to a single maximized ``"objective"``; pass >=2 for a Pareto study."""
-    return VizierBranchSampler(branch, study_id=study_id, objectives=objectives)
+    return VizierBranchSampler(
+        branch,
+        study_id=study_id,
+        objectives=objectives,
+        algorithm=algorithm,
+        seed=seed,
+    )

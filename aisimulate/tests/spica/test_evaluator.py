@@ -225,11 +225,22 @@ def test_static_trace_threads_replay_concurrency(monkeypatch):
         "run_trace_replay",
         lambda **kw: rec.update(kw) or _report({"output_throughput_tok_s": 1.0}),
     )
-    wl = Workload(trace_path=TRACE, replay_concurrency=32)
+    wl = Workload(
+        trace_path=TRACE,
+        trace_format="agentic_mooncake",
+        trace_block_size=64,
+        replay_concurrency=32,
+        shared_prefix_ratio=0.5,
+        num_prefix_groups=2,
+    )
     ReplayEvaluator(
         wl, OptimizationGoal(target=OptimizationTarget.THROUGHPUT)
     ).evaluate(_agg_plan(static=True))
     assert rec["replay_concurrency"] == 32
+    assert rec["trace_format"] == "agentic_mooncake"
+    assert rec["trace_block_size"] == 64
+    assert rec["trace_shared_prefix_ratio"] == 0.5
+    assert rec["trace_num_prefix_groups"] == 2
 
 
 def test_scaling_trace_threads_replay_concurrency(monkeypatch):

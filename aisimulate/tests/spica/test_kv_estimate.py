@@ -34,6 +34,43 @@ def test_estimate_kv_tokens_returns_capacity(monkeypatch):
     assert estimate_kv_tokens(sh, **_COMMON) == 123456
 
 
+def test_estimate_kv_tokens_forwards_complete_quantization_profile(monkeypatch):
+    captured = {}
+
+    def fake(*args, **kwargs):
+        captured.update(kwargs)
+        return {"total_kv_size_tokens": 123456}
+
+    monkeypatch.setattr(kv_estimate_mod, "estimate_kv_cache", fake)
+    shape = ParallelShape(tp=4, dp=1, moe_tp=1, moe_ep=4)
+    estimate_kv_tokens(
+        shape,
+        **_COMMON,
+        gemm_quant_mode="fp8_block",
+        moe_quant_mode="w4a8_mxfp4_mxfp8",
+        fmha_quant_mode="bfloat16",
+        kvcache_quant_mode="fp8",
+        comm_quant_mode="half",
+    )
+
+    assert {
+        key: captured[key]
+        for key in (
+            "gemm_quant_mode",
+            "moe_quant_mode",
+            "fmha_quant_mode",
+            "kvcache_quant_mode",
+            "comm_quant_mode",
+        )
+    } == {
+        "gemm_quant_mode": "fp8_block",
+        "moe_quant_mode": "w4a8_mxfp4_mxfp8",
+        "fmha_quant_mode": "bfloat16",
+        "kvcache_quant_mode": "fp8",
+        "comm_quant_mode": "half",
+    }
+
+
 def test_estimate_kv_tokens_oom_returns_none(monkeypatch):
     def boom(*a, **k):
         raise ValueError(

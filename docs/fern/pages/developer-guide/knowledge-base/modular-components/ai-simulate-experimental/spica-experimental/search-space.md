@@ -96,15 +96,23 @@ separate study. `min_gpu_budget` is validated against `gpu_budget` by `_validate
 
 All fields are pinned. The current Spica schema configures only G2 host offload;
 it does not expose G3 or G4 tiers. Offload is **off by default**
-(`num_g2_blocks = 0`). When G2 is enabled, `kv_bytes_per_token` is required so
-replay cannot silently disable offload if model metadata is private or
-unavailable. In disaggregated deployments, these settings are applied only to
-prefill workers; decode workers do not receive a second local offload tier.
+(`num_g2_blocks = 0`). When G2 is enabled, either the legacy explicit
+`kv_bytes_per_token` or a structured `kv_footprint` is required. The structured
+path resolves a candidate-specific, per-rank sequence footprint through AIC;
+`g2_capacity_gib` can then be converted to logical blocks after TP,
+attention-DP, and replica count are known (`TP × attention-DP × replicas`
+physical rank-local pools). In disaggregated deployments, these settings are applied only
+to prefill workers; decode workers do not receive a second local offload tier.
+P/D handoff uses the independent `kv_transfer_bytes_per_token` resolved on the
+unrolled candidate, so its timing scalar cannot alias KVBM block sizing.
 
 | knob | type | default | searched / pinned | allowed choices |
 |---|---|---|---|---|
 | `num_g2_blocks` | int | `0` | pinned | `0` disables host offload |
 | `kv_bytes_per_token` | int? | `None` | pinned | required when `num_g2_blocks > 0` |
+| `kv_footprint` | object? | `None` | pinned | AIC-native or explicit-linear per-rank footprint |
+| `g2_capacity_gib` | float? | `None` | pinned | physical G2 capacity; enables G2 when positive |
+| `g2_capacity_scope` | string | `deployment_total` | pinned | `deployment_total` or `per_rank` |
 | `bandwidth_g1_to_g2_gbps` | float? | `None` | pinned | — |
 | `bandwidth_g2_to_g1_gbps` | float? | `None` | pinned | — |
 | `offload_batch_size` | int? | `None` | pinned | — |

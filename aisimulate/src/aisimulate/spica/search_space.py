@@ -136,7 +136,10 @@ def branch_knob_choices(search_space, deployment_mode: str) -> dict[str, list[An
     (``num_g2_blocks > 0``) — see :data:`_OFFLOAD_ONLY_ROUTER_KNOBS`."""
     router_is_round_robin_only = set(search_space.router_mode) == {"round_robin"}
     router = ("router_mode",) if router_is_round_robin_only else _ROUTER_KNOBS
-    if not router_is_round_robin_only and search_space.num_g2_blocks == 0:
+    offload_enabled = search_space.num_g2_blocks > 0 or bool(
+        search_space.g2_capacity_gib is not None and search_space.g2_capacity_gib > 0
+    )
+    if not router_is_round_robin_only and not offload_enabled:
         router = tuple(k for k in router if k not in _OFFLOAD_ONLY_ROUTER_KNOBS)
 
     planner_scaling_is_disabled = not any(
@@ -190,6 +193,17 @@ def enumerate_branches(
             if not _backend_supports_replay_mode(backend, deployment_mode):
                 continue
             try:
+                quantization = {
+                    key: value
+                    for key, value in {
+                        "gemm_quant_mode": ss.aic_gemm_dtype,
+                        "moe_quant_mode": ss.aic_moe_dtype,
+                        "fmha_quant_mode": ss.aic_fmha_dtype,
+                        "kvcache_quant_mode": ss.aic_kv_cache_dtype,
+                        "comm_quant_mode": ss.aic_comm_dtype,
+                    }.items()
+                    if value is not None
+                }
                 legal = parallel_configs_for(
                     ss.model_name,
                     ss.hardware_sku,
@@ -198,6 +212,7 @@ def enumerate_branches(
                     backend=backend,
                     min_gpu_budget=ss.min_gpu_budget,
                     max_seq_len=max_seq_len,
+                    **quantization,
                 )
             except (NoPerfDatabase, NoViableParallelConfig):
                 continue  # backend unusable for this mode -> drop it from the search

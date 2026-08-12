@@ -190,7 +190,7 @@ def test_round_robin_ignores_router_admission_controls():
 
 
 def test_kv_offload_requires_explicit_replay_transfer_sizing():
-    with pytest.raises(ValidationError, match="kv_bytes_per_token is required"):
+    with pytest.raises(ValidationError, match="kv_bytes_per_token or kv_footprint"):
         SearchSpace(**_search_space(num_g2_blocks=128))
 
     cfg = SearchSpace(**_search_space(num_g2_blocks=128, kv_bytes_per_token=131072))
@@ -576,6 +576,14 @@ def test_positive_sla_accepted():
 def test_sweep_non_positive_rejected(kwargs):
     with pytest.raises(ValidationError):
         SweepConfig(**kwargs)
+
+
+def test_seeded_sweep_requires_deterministic_sampler():
+    with pytest.raises(ValidationError, match="search_seed requires"):
+        SweepConfig(search_seed=7, sampler_algorithm="DEFAULT")
+
+    sweep = SweepConfig(search_seed=7, sampler_algorithm="QUASI_RANDOM_SEARCH")
+    assert sweep.search_seed == 7
 
 
 # --- min_gpu_budget bounds ---
