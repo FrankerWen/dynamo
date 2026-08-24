@@ -144,14 +144,29 @@ def enumerate_branches(
             ):
                 continue
             try:
+                parallel_kwargs = {
+                    "gpu_budget": ss.gpu_budget,
+                    "deployment_mode": deployment_mode,
+                    "backend": backend,
+                    "min_gpu_budget": ss.min_gpu_budget,
+                    "max_seq_len": max_seq_len,
+                }
+                if ss.database_mode.value != "SILICON":
+                    parallel_kwargs["database_mode"] = ss.database_mode.value
+                for field, argument in (
+                    ("aic_gemm_dtype", "gemm_dtype"),
+                    ("aic_moe_dtype", "moe_dtype"),
+                    ("aic_fmha_dtype", "fmha_dtype"),
+                    ("aic_kv_cache_dtype", "kv_cache_dtype"),
+                    ("aic_comm_dtype", "comm_dtype"),
+                ):
+                    value = getattr(ss, field)
+                    if value is not None:
+                        parallel_kwargs[argument] = value
                 legal = parallel_configs_for(
                     ss.model_name,
                     ss.hardware_sku,
-                    gpu_budget=ss.gpu_budget,
-                    deployment_mode=deployment_mode,
-                    backend=backend,
-                    min_gpu_budget=ss.min_gpu_budget,
-                    max_seq_len=max_seq_len,
+                    **parallel_kwargs,
                 )
             except (NoPerfDatabase, NoViableParallelConfig):
                 continue  # backend unusable for this mode -> drop it from the search

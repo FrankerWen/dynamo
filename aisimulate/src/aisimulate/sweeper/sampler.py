@@ -27,9 +27,10 @@ import json
 import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 from ._quiet import configure_vizier_runtime
+from .checkpoint import SamplerObservation
 from .parallel_enum import DisaggParallelConfig, ReplicaParallelConfig
 from .parallel_projection import ParallelConfigProjector, ParallelProjection
 from .search_space import BranchSpace
@@ -70,6 +71,25 @@ class BranchSampler(Protocol):
         ...
 
     def observe_infeasible(self, suggestion: Suggestion, reason: str) -> None:
+        ...
+
+
+@runtime_checkable
+class CheckpointableSampler(Protocol):
+    """Optional sampler capability for round-checkpoint warm starts."""
+
+    def checkpoint_observation(
+        self,
+        suggestion: Suggestion,
+        *,
+        metrics: dict[str, float] | None = None,
+        infeasible_reason: str | None = None,
+    ) -> SamplerObservation:
+        ...
+
+    def restore_observations(
+        self, observations: list[SamplerObservation]
+    ) -> None:
         ...
 
 
@@ -277,6 +297,45 @@ class VizierBranchSampler:
 
         self._update_projection_metadata(suggestion)
         suggestion.handle.complete(vz.Measurement(), infeasible_reason=reason)
+
+    def checkpoint_observation(
+        self,
+        suggestion: Suggestion,
+        *,
+        metrics: dict[str, float] | None = None,
+        infeasible_reason: str | None = None,
+    ) -> SamplerObservation:
+        """Serialize one completed trial without retaining its client handle."""
+
+        return SamplerObservation(
+            parameters=dict(suggestion.handle.parameters),
+            metrics=metrics,
+            infeasible_reason=infeasible_reason,
+        )
+
+    def restore_observations(
+        self, observations: list[SamplerObservation]
+    ) -> None:
+        """Warm-start this fresh study with trials from completed barriers."""
+
+        _, vz = _vizier_modules()
+        for observation in observations:
+            trial = vz.Trial(parameters=observation.parameters)
+            if observation.metrics is not None:
+                trial.complete(
+                    vz.Measurement(
+                        metrics={
+                            key: float(value)
+                            for key, value in observation.metrics.items()
+                        }
+                    )
+                )
+            else:
+                trial.complete(
+                    vz.Measurement(),
+                    infeasibility_reason=observation.infeasible_reason,
+                )
+            self._study.add_trial(trial)
 
 
 def make_branch_sampler(

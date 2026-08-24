@@ -55,6 +55,11 @@ To use another replay implementation, pass its `RunnerFactory` to the `Sweeper` 
 The GLM-5-FP8 Pareto-front configuration captures a disaggregated search over `kv_load_ratio`.
 Update `workload.trace_path` before running a trace-backed configuration.
 
+For a trace-backed load curve, add a top-level `load_sweep` with explicit
+`arrival_speedup_ratio` values and use a Pareto goal. Sweeper runs a separate deployment study per
+load, then returns `load_conditioned_pareto` and `global_operating_envelope`. Add `--output-json`
+to the Dynamo command above to preserve both structures in one artifact.
+
 ## Generate a Synthetic Trace
 
 Generate a Mooncake-format trace whose request rate follows a sine wave:

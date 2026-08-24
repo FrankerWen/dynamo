@@ -114,6 +114,52 @@ def test_resolve_backend_version_missing(monkeypatch):
         resolve_backend_version("nosuch_sku", "trtllm")
 
 
+def test_analytical_version_never_probes_perf_database(monkeypatch):
+    monkeypatch.setattr(
+        "aisimulate.sweeper.kv_estimate.get_latest_database_version",
+        lambda *a, **k: pytest.fail("ANALYTICAL must not inspect perf data"),
+    )
+    assert (
+        resolve_backend_version(
+            "yaml_only_sku", "sglang", database_mode="ANALYTICAL"
+        )
+        == "estimate"
+    )
+
+
+def test_analytical_kv_estimate_forwards_table_free_mode(monkeypatch):
+    seen = {}
+
+    def fake(*args, **kwargs):
+        seen.update(kwargs)
+        return {"total_kv_size_tokens": 42_000}
+
+    monkeypatch.setattr(kv_estimate_mod, "estimate_kv_cache", fake)
+    shape = ParallelShape(tp=2, dp=1, moe_tp=1, moe_ep=1)
+    assert (
+        estimate_kv_tokens(
+            shape,
+            model_name="m",
+            hardware_sku="yaml_only_sku",
+            backend="sglang",
+            backend_version="estimate",
+            database_mode="ANALYTICAL",
+            gemm_dtype="fp8_block",
+            moe_dtype="nvfp4",
+            fmha_dtype="bfloat16",
+            kv_cache_dtype="fp8",
+            comm_dtype="half",
+        )
+        == 42_000
+    )
+    assert seen["database_mode"] == "ANALYTICAL"
+    assert seen["gemm_quant_mode"] == "fp8_block"
+    assert seen["moe_quant_mode"] == "nvfp4"
+    assert seen["fmha_quant_mode"] == "bfloat16"
+    assert seen["kvcache_quant_mode"] == "fp8"
+    assert seen["comm_quant_mode"] == "half"
+
+
 # --- integration: real AIC Core estimate ---
 
 

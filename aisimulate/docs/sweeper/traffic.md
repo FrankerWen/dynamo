@@ -14,7 +14,9 @@ subtitle: Trace, request-rate, concurrency, and KV-load workload definitions
 The `workload:` block of a `SmartSearchConfig` YAML is the traffic **every candidate is
 replayed against**. Most workload fields are pinned. The exception is a ranged
 `kv_load_ratio` under a `pareto` goal: Vizier searches it as a continuous load dimension.
-The block maps to `Workload` in `aisimulate/src/aisimulate/sweeper/config.py`.
+For an open-loop trace, the optional top-level `load_sweep` block instead runs one independent
+deployment search per arrival-pressure point. The blocks map to `Workload` and `LoadSweepConfig`
+in `aisimulate/src/aisimulate/sweeper/config.py`.
 
 A workload is **exactly one of four load shapes**. The shape is inferred from which field
 is set (`Workload._validate_workload`), and each shape is either **open-loop** (requests
@@ -42,6 +44,39 @@ The closed-loop in-flight cap is resolved by `effective_in_flight_cap()` (`None`
 - synthetic KV load -> the candidate-derived `concurrency_override`;
 - synthetic fixed `concurrency` -> that value;
 - request-rate -> `None` (open-loop).
+
+## Trace Load Scan and Pareto Envelope
+
+Use `load_sweep` when the trace should fix request lengths, ordering, and prefix/hash structure but
+not offered load:
+
+```yaml
+workload:
+  trace_path: /data/replay/traffic.jsonl
+  trace_format: mooncake
+
+load_sweep:
+  axis: arrival_speedup_ratio
+  values: [0.5, 1.0, 2.0, 4.0]
+
+goal:
+  target: pareto
+  pareto_objectives: [goodput_per_gpu, throughput_per_user]
+  sla: {ttft_ms: 2000, itl_ms: 30}
+```
+
+Each value creates a fresh optimizer study whose deployment search space and replay budget are
+unchanged. Replay receives one scalar `arrival_speedup_ratio`; the load is not offered to Vizier as
+a deployment knob. Sweeper returns a Pareto front for each fixed load and then applies the same
+dominance rules to their union to produce a `global_operating_envelope`.
+
+`arrival_speedup_ratio = r` divides timestamp offsets by `r`, so its approximate offered rate is
+the trace's original rate multiplied by `r`. The complete time axis is compressed or stretched,
+including bursts; this is not merely a replacement for the mean RPS field.
+
+`load_sweep` requires an open-loop trace and a Pareto goal. It rejects `replay_concurrency` because
+closed-loop trace replay ignores arrival timestamps. Use each load-conditioned front for decisions
+at a specified demand level; the global envelope is a cross-load operating view.
 
 ## Fields
 
@@ -134,6 +169,8 @@ when unset (`max(1, …)` keeps at least one request).
   `min < max`; `SmartSearchConfig._validate_kv_load_ratio_range` rejects it for scalar
   goals. A scalar `kv_load_ratio` is valid for every goal. A synthetic Pareto config that
   omits all three load fields defaults to `kv_load_ratio: [0.0, 1.0]`.
+- **Trace load scan only under Pareto** — `load_sweep.values` must be non-empty, unique, finite,
+  and positive. The workload must be trace-backed and must not set `replay_concurrency`.
 
 ## Replay Routing
 

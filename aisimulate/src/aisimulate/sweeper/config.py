@@ -22,7 +22,7 @@ from __future__ import annotations
 import math
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -59,6 +59,46 @@ class OptimizationTarget(str, Enum):
         if self is OptimizationTarget.PARETO:
             raise ValueError("'pareto' is multi-objective and has no scalar direction")
         return self is not OptimizationTarget.E2E_LATENCY
+
+
+class AicDatabaseMode(str, Enum):
+    """AIC latency source carried unchanged into every replay engine."""
+
+    SILICON = "SILICON"
+    HYBRID = "HYBRID"
+    EMPIRICAL = "EMPIRICAL"
+    SOL = "SOL"
+    SOL_FULL = "SOL_FULL"
+    ANALYTICAL = "ANALYTICAL"
+
+
+class AnalyticalConfig(BaseModel):
+    """Immutable table-free KernelSim policy serialized into ``EngineSpec``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    level: str = Field(default="standard", pattern="^(low|standard|high)$")
+    fp8_gemm_recipe: str = Field(
+        default="sglang",
+        pattern="^(sglang|deepgemm-hopper|deepgemm-blackwell)$",
+    )
+    attention_algorithm: str = Field(default="fa2", pattern="^fa[23]$")
+    sparse_attention_head_quantum: int | None = Field(default=None)
+    communication_mode: str = Field(
+        default="empirical", pattern="^(empirical|silicon)$"
+    )
+    moe_dispatch_dtype: str = Field(default="half", pattern="^(half|fp8|int8)$")
+    moe_combine_dtype: str = Field(default="half", pattern="^(half|fp8|int8)$")
+    wideep_dispatch_dtype: str = Field(default="half", pattern="^(half|fp8|int8)$")
+    wideep_combine_dtype: str = Field(default="half", pattern="^(half|fp8|int8)$")
+
+    @model_validator(mode="after")
+    def _validate_sparse_head_quantum(self) -> AnalyticalConfig:
+        if self.sparse_attention_head_quantum not in (None, 64, 128):
+            raise ValueError(
+                "sparse_attention_head_quantum must be omitted, 64, or 128"
+            )
+        return self
 
 
 class SLATarget(BaseModel):
@@ -198,7 +238,9 @@ class Workload(BaseModel):
     # dynamic trace source (mutually exclusive with the synthetic fields)
     trace_path: str | None = None
     trace_format: str = "mooncake"  # replay-ready trace schema
-    arrival_speedup_ratio: float = 1.0  # scale trace inter-arrival times
+    arrival_speedup_ratio: float = Field(
+        default=1.0, gt=0
+    )  # scale trace inter-arrival times
     # Closed-loop replay over a *trace*: cap in-flight requests at this many (the
     # trace's timestamps are ignored; a new request starts as one finishes). For a
     # *synthetic* closed-loop workload use ``concurrency`` or ``kv_load_ratio`` instead.
@@ -354,6 +396,16 @@ SEARCH_CHOICES: dict[str, tuple] = {
 }
 
 
+class PdTransferConfig(BaseModel):
+    """Pinned per-request P-to-D KV transfer timing model."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kv_bytes_per_token: int = Field(gt=0)
+    bandwidth_gb_s: float = Field(gt=0)
+    timing_mode: Literal["full_prompt", "destination_missing"] = "full_prompt"
+
+
 class SearchSpace(BaseModel):
     """Dynamo-independent backend inputs to one search run.
 
@@ -380,6 +432,14 @@ class SearchSpace(BaseModel):
     context_length: int | None = None
     startup_time: float | None = None
     aic_nextn: int | None = None  # speculative-decode (MTP) depth, 1..5
+    database_mode: AicDatabaseMode = AicDatabaseMode.SILICON
+    analytical_config: AnalyticalConfig | None = None
+    aic_gemm_dtype: str | None = None
+    aic_moe_dtype: str | None = None
+    aic_fmha_dtype: str | None = None
+    aic_kv_cache_dtype: str | None = None
+    aic_comm_dtype: str | None = None
+    pd_transfer: PdTransferConfig | None = None
 
     # prefill engine (disagg branch): scheduler batching capacity
     prefill_max_num_batched_tokens: list[int] = [8192, 16384, 32768]
@@ -430,6 +490,25 @@ class SearchSpace(BaseModel):
             raise ValueError(
                 f"min_gpu_budget must satisfy 0 < min_gpu_budget <= gpu_budget "
                 f"(got min_gpu_budget={self.min_gpu_budget}, gpu_budget={self.gpu_budget})"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_analytical_policy(self) -> SearchSpace:
+        if (
+            self.analytical_config is not None
+            and self.database_mode is not AicDatabaseMode.ANALYTICAL
+        ):
+            raise ValueError(
+                "analytical_config is only valid when database_mode is 'ANALYTICAL'"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_pd_transfer(self) -> SearchSpace:
+        if self.pd_transfer is not None and "disagg" not in self.deployment_mode:
+            raise ValueError(
+                "pd_transfer is only valid when deployment_mode includes 'disagg'"
             )
         return self
 
@@ -489,6 +568,28 @@ class SweepConfig(BaseModel):
     max_eval_seconds: float | None = Field(default=600.0, gt=0)
 
 
+class LoadSweepConfig(BaseModel):
+    """Outer load axis for independent trace-backed Pareto studies.
+
+    Load is an exogenous workload condition, not a deployment decision. Each value
+    therefore receives a fresh optimizer study; it is never offered to Vizier as a
+    joint search parameter alongside deployment knobs.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    axis: Literal["arrival_speedup_ratio"] = "arrival_speedup_ratio"
+    values: list[float] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_values(self) -> LoadSweepConfig:
+        if any(not math.isfinite(value) or value <= 0.0 for value in self.values):
+            raise ValueError("load_sweep values must be finite positive numbers")
+        if len(set(self.values)) != len(self.values):
+            raise ValueError("load_sweep values must be unique")
+        return self
+
+
 class AdapterSearchConfig(BaseModel):
     """One optional simulation adapter and the search space it owns."""
 
@@ -512,6 +613,25 @@ class Candidate(BaseModel):
     objectives: dict[str, float] | None = None
 
 
+class LoadConditionedPareto(BaseModel):
+    """Non-dominated candidates at one fixed offered-load point."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    load_value: float
+    candidates: list[Candidate]
+
+
+class LoadSweepResult(BaseModel):
+    """Per-load Pareto fronts plus their cross-load operating envelope."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    load_axis: Literal["arrival_speedup_ratio"]
+    load_conditioned_pareto: list[LoadConditionedPareto]
+    global_operating_envelope: list[Candidate]
+
+
 class SmartSearchConfig(BaseModel):
     """Top-level config integrating every search input; one YAML maps to this."""
 
@@ -522,6 +642,7 @@ class SmartSearchConfig(BaseModel):
     workload: Workload
     goal: OptimizationGoal = Field(default_factory=OptimizationGoal)
     sweep: SweepConfig = Field(default_factory=SweepConfig)
+    load_sweep: LoadSweepConfig | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -623,6 +744,22 @@ class SmartSearchConfig(BaseModel):
                 "a ranged workload.kv_load_ratio is only allowed when goal.target is 'pareto' "
                 f"(got target={self.goal.target.value}); use one scalar kv_load_ratio"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_load_sweep(self) -> SmartSearchConfig:
+        """A load envelope is an open-loop trace Pareto study only."""
+        if self.load_sweep is None:
+            return self
+        if not self.workload.is_trace_based:
+            raise ValueError("load_sweep currently requires a trace workload")
+        if self.workload.replay_concurrency is not None:
+            raise ValueError(
+                "load_sweep cannot be combined with replay_concurrency because "
+                "closed-loop trace replay ignores arrival timestamps"
+            )
+        if not self.goal.is_pareto:
+            raise ValueError("load_sweep requires goal.target='pareto'")
         return self
 
     @classmethod

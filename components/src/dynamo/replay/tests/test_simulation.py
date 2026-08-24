@@ -72,6 +72,30 @@ def _agg_deployment() -> BackendDeploymentSpec:
     )
 
 
+def _disagg_attention_dp_deployment() -> BackendDeploymentSpec:
+    return BackendDeploymentSpec(
+        deployment_mode="disagg",
+        backend="sglang",
+        backend_version="0.5.6",
+        prefill_engine_args={
+            "worker_type": "prefill",
+            "aic_attention_dp_size": 2,
+            "kv_bytes_per_token": 1_000_000,
+            "kv_transfer_bandwidth": 1.0,
+            "kv_transfer_timing_mode": "full_prompt",
+        },
+        decode_engine_args={
+            "worker_type": "decode",
+            "aic_attention_dp_size": 4,
+            "kv_bytes_per_token": 1_000_000,
+            "kv_transfer_bandwidth": 1.0,
+            "kv_transfer_timing_mode": "full_prompt",
+        },
+        num_prefill_workers=2,
+        num_decode_workers=4,
+    )
+
+
 def test_trace_runner_preserves_current_replay_arguments(monkeypatch) -> None:
     seen = {}
 
@@ -164,15 +188,7 @@ def test_synthetic_disagg_preserves_request_count_and_load(monkeypatch) -> None:
         "run_synthetic_trace_replay",
         fake_run_synthetic_trace_replay,
     )
-    deployment = BackendDeploymentSpec(
-        deployment_mode="disagg",
-        backend="sglang",
-        backend_version="0.5.6",
-        prefill_engine_args={"worker_type": "prefill"},
-        decode_engine_args={"worker_type": "decode"},
-        num_prefill_workers=2,
-        num_decode_workers=4,
-    )
+    deployment = _disagg_attention_dp_deployment()
     spec = ReplaySpec(
         backend_deployment=deployment,
         workload={
@@ -202,7 +218,49 @@ def test_synthetic_disagg_preserves_request_count_and_load(monkeypatch) -> None:
     assert seen["arrival_interval_ms"] is None
     assert seen["num_prefill_workers"] == 2
     assert seen["num_decode_workers"] == 4
+    assert json.loads(seen["prefill_engine_args"].payload)["aic_attention_dp_size"] == 2
+    assert json.loads(seen["decode_engine_args"].payload)["aic_attention_dp_size"] == 4
     assert report.metrics == {"output_throughput_tok_s": 99.0}
+
+
+@pytest.mark.parametrize(
+    "provider,kind,config",
+    [
+        (
+            "dynamo.planner",
+            "scaling_policy",
+            {"planner_config": {"mode": "disagg"}},
+        ),
+        (
+            "dynamo.router",
+            "placement_policy",
+            {"router_mode": "kv_router", "router_config": {}},
+        ),
+    ],
+)
+def test_disagg_attention_dp_rejects_planner_and_router_hooks(
+    provider: str, kind: str, config: dict
+) -> None:
+    spec = ReplaySpec(
+        backend_deployment=_disagg_attention_dp_deployment(),
+        workload={"trace_path": "tiny.jsonl"},
+        goal={"target": "throughput"},
+        adapters={
+            provider: AdapterReplaySpec(
+                runtime_hooks=(
+                    RuntimeHookSpec(
+                        provider=provider,
+                        kind=kind,
+                        api_version=1,
+                        config=config,
+                    ),
+                )
+            )
+        },
+    )
+
+    with pytest.raises(ValueError, match="only supports fixed round_robin"):
+        simulation.DynamoReplayRunnerFactory().create(0).run(spec)
 
 
 def test_synthetic_request_rate_preserves_open_loop_load(monkeypatch) -> None:

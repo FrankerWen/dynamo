@@ -179,6 +179,7 @@ def _resolve_aic_num_gpu_blocks(raw: dict) -> None:
         fmha_dtype=_aic_quant_mode(raw, "aic_fmha_dtype"),
         kv_cache_dtype=_aic_quant_mode(raw, "aic_kv_cache_dtype"),
         comm_dtype=_aic_quant_mode(raw, "aic_comm_dtype"),
+        database_mode=raw.get("aic_database_mode") or "SILICON",
     )
     # AIC returns a per-rank (per-GPU) block count. Under attention-DP the offline runtime
     # mirrors the live path (lib/llm/src/mocker.rs): each mocker worker owns `dp`

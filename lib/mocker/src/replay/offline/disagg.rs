@@ -37,7 +37,7 @@ use super::runtime_utils::{
 use super::scaling::{LatestFpmBuffer, ReplayScalingPolicy, ReplayScalingSnapshot};
 #[cfg(test)]
 use super::state::DisaggRequestSnapshot;
-use super::state::{DisaggPhase, DisaggRequestState};
+use super::state::{DisaggEndpoint, DisaggPhase, DisaggRequestState};
 use crate::common::handoff::{
     HandoffAction, HandoffActionOutcome, HandoffCompletion, HandoffFact, HandoffId, HandoffOrder,
     IssuedHandoffAction, NormalizedHandoffConformance, NormalizedHandoffEvent,
@@ -84,8 +84,8 @@ pub(crate) enum DisaggTransition {
 #[derive(Debug, Default, Clone, PartialEq)]
 pub(in crate::replay) struct DisaggRuntimeStats {
     request_snapshots: HashMap<Uuid, DisaggRequestSnapshot>,
-    prefill_assignments: HashMap<Uuid, usize>,
-    decode_assignments: HashMap<Uuid, usize>,
+    prefill_assignments: HashMap<Uuid, DisaggEndpoint>,
+    decode_assignments: HashMap<Uuid, DisaggEndpoint>,
     handoff_ms: HashMap<Uuid, f64>,
     prefill_marked_count: usize,
     prefill_router_freed_count: usize,
@@ -407,18 +407,18 @@ impl DisaggFlowState {
     fn finish_prefill_submission(
         &mut self,
         uuid: Uuid,
-        worker_idx: usize,
+        endpoint: DisaggEndpoint,
         action: IssuedHandoffAction,
         lifecycle_events: Vec<SchedulerLifecycleEvent>,
         now_ms: f64,
         collector: &mut TraceCollector,
         stats: &mut DisaggRuntimeStats,
     ) -> Result<()> {
-        self.state_mut(uuid)?.start_prefill(worker_idx);
-        collector.on_prefill_assigned(uuid, worker_idx);
+        self.state_mut(uuid)?.start_prefill(endpoint);
+        collector.on_prefill_assigned(uuid, endpoint.logical_worker_id);
         #[cfg(test)]
         {
-            stats.prefill_assignments.insert(uuid, worker_idx);
+            stats.prefill_assignments.insert(uuid, endpoint);
         }
         self.acknowledge_action(
             uuid,
@@ -449,7 +449,7 @@ impl DisaggFlowState {
     fn finish_destination_reservation(
         &mut self,
         uuid: Uuid,
-        worker_idx: usize,
+        endpoint: DisaggEndpoint,
         action: IssuedHandoffAction,
         stored_hashes: &[u64],
         lifecycle_events: Vec<SchedulerLifecycleEvent>,
@@ -463,11 +463,11 @@ impl DisaggFlowState {
                 .lifecycle
                 .push(NormalizedHandoffEvent::DestinationAccepted);
         }
-        self.state_mut(uuid)?.assign_decode(worker_idx);
-        collector.on_decode_assigned(uuid, worker_idx);
+        self.state_mut(uuid)?.assign_decode(endpoint);
+        collector.on_decode_assigned(uuid, endpoint.logical_worker_id);
         #[cfg(test)]
         {
-            stats.decode_assignments.insert(uuid, worker_idx);
+            stats.decode_assignments.insert(uuid, endpoint);
             stats
                 .transition_log
                 .push(DisaggTransition::DestinationAccepted { uuid });
@@ -1001,32 +1001,20 @@ where
             CoreAdmissionSource::total_requests(&admission),
             "offline disagg replay",
         );
-        let mut prefill_engine = EngineComponent::<Observation>::new(
+        let mut prefill_engine = EngineComponent::<Observation>::new_ranked_with_capture(
             SimulationWorkerStage::Prefill,
             EnginePassMode::Hidden,
-            (0..config.num_prefill_workers)
-                .map(|worker_idx| {
-                    super::state::OfflineWorkerState::new(
-                        worker_idx,
-                        config.prefill_args.clone(),
-                        prefill_capture_raw,
-                    )
-                })
-                .collect(),
+            config.prefill_args.clone(),
+            config.num_prefill_workers,
+            prefill_capture_raw,
         );
         prefill_engine.set_scaling_args(config.prefill_args.clone(), prefill_capture_raw);
-        let mut decode_engine = EngineComponent::<Observation>::new(
+        let mut decode_engine = EngineComponent::<Observation>::new_ranked_with_capture(
             SimulationWorkerStage::Decode,
             EnginePassMode::Visible,
-            (0..config.num_decode_workers)
-                .map(|worker_idx| {
-                    super::state::OfflineWorkerState::new(
-                        worker_idx,
-                        config.decode_args.clone(),
-                        decode_capture_raw,
-                    )
-                })
-                .collect(),
+            config.decode_args.clone(),
+            config.num_decode_workers,
+            decode_capture_raw,
         );
         decode_engine.set_scaling_args(config.decode_args.clone(), decode_capture_raw);
         let prefill_placement =
@@ -1170,12 +1158,23 @@ where
     fn dispatch_prefill(
         &mut self,
         uuid: Uuid,
-        worker_idx: usize,
+        scheduler_id: usize,
         action: IssuedHandoffAction,
     ) -> Result<()> {
+        let (logical_worker_id, dp_rank) = self
+            .prefill_engine
+            .rank_identity(scheduler_id)
+            .ok_or_else(|| {
+                anyhow!("prefill assignment references unknown scheduler {scheduler_id}")
+            })?;
+        let endpoint = DisaggEndpoint {
+            scheduler_id,
+            logical_worker_id,
+            dp_rank,
+        };
         let (request, handoff_id) = self.flow.prepare_prefill_submission(uuid)?;
         let effects = match self.prefill_engine.apply_command(
-            worker_idx,
+            scheduler_id,
             SchedulerCommand::SubmitHandoffPrefill {
                 handoff_id,
                 request,
@@ -1196,7 +1195,7 @@ where
         }
         self.flow.finish_prefill_submission(
             uuid,
-            worker_idx,
+            endpoint,
             action,
             effects.lifecycle_events,
             self.now_ms,
@@ -1209,12 +1208,23 @@ where
     fn reserve_destination(
         &mut self,
         uuid: Uuid,
-        worker_idx: usize,
+        scheduler_id: usize,
         action: IssuedHandoffAction,
     ) -> Result<()> {
+        let (logical_worker_id, dp_rank) = self
+            .decode_engine
+            .rank_identity(scheduler_id)
+            .ok_or_else(|| {
+                anyhow!("decode assignment references unknown scheduler {scheduler_id}")
+            })?;
+        let endpoint = DisaggEndpoint {
+            scheduler_id,
+            logical_worker_id,
+            dp_rank,
+        };
         let (request, handoff_id) = self.flow.prepare_destination_reservation(uuid)?;
         let effects = match self.decode_engine.apply_command(
-            worker_idx,
+            scheduler_id,
             SchedulerCommand::ReserveDestination {
                 handoff_id,
                 request,
@@ -1244,7 +1254,7 @@ where
             .unwrap_or_default();
         self.flow.finish_destination_reservation(
             uuid,
-            worker_idx,
+            endpoint,
             action,
             &stored_hashes,
             effects.lifecycle_events,
@@ -1498,10 +1508,11 @@ where
                 }
             }
             HandoffAction::ActivateDestination { handoff_id } => {
-                let worker_idx = self
+                let endpoint = self
                     .state(uuid)?
-                    .decode_worker_idx()
+                    .decode_endpoint()
                     .ok_or_else(|| anyhow!("destination activation has no worker for {uuid}"))?;
+                let worker_idx = endpoint.scheduler_id;
                 if self.decode_engine.worker_is_busy(worker_idx)? {
                     return Ok(ActionExecution::Deferred {
                         action: issued,
@@ -1540,10 +1551,11 @@ where
                 )?;
             }
             HandoffAction::ReleaseSource { handoff_id } => {
-                let worker_idx = self
+                let endpoint = self
                     .state(uuid)?
-                    .prefill_worker_idx()
+                    .prefill_endpoint()
                     .ok_or_else(|| anyhow!("source release has no worker for {uuid}"))?;
+                let worker_idx = endpoint.scheduler_id;
                 if self.prefill_engine.worker_is_busy(worker_idx)? {
                     return Ok(ActionExecution::Deferred {
                         action: issued,
@@ -1575,11 +1587,12 @@ where
                 )?;
             }
             HandoffAction::CancelSource { handoff_id } => {
-                let Some(worker_idx) = self.state(uuid)?.prefill_worker_idx() else {
+                let Some(endpoint) = self.state(uuid)?.prefill_endpoint() else {
                     self.cancel_prefill_route(uuid)?;
                     self.acknowledge_action(uuid, issued, HandoffActionOutcome::Noop)?;
                     return Ok(ActionExecution::Applied);
                 };
+                let worker_idx = endpoint.scheduler_id;
                 if self.prefill_engine.worker_is_busy(worker_idx)? {
                     return Ok(ActionExecution::Deferred {
                         action: issued,
@@ -1599,11 +1612,12 @@ where
                 self.process_lifecycle_events(effects.lifecycle_events)?;
             }
             HandoffAction::CancelDestination { handoff_id } => {
-                let Some(worker_idx) = self.state(uuid)?.decode_worker_idx() else {
+                let Some(endpoint) = self.state(uuid)?.decode_endpoint() else {
                     self.cancel_decode_route(uuid)?;
                     self.acknowledge_action(uuid, issued, HandoffActionOutcome::Noop)?;
                     return Ok(ActionExecution::Applied);
                 };
+                let worker_idx = endpoint.scheduler_id;
                 if self.decode_engine.worker_is_busy(worker_idx)? {
                     return Ok(ActionExecution::Deferred {
                         action: issued,

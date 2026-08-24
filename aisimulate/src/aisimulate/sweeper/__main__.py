@@ -12,7 +12,7 @@ from collections.abc import Sequence
 import yaml
 from pydantic import ValidationError
 
-from .config import Candidate, SmartSearchConfig
+from .config import Candidate, LoadSweepResult, SmartSearchConfig
 
 
 def load_config_or_parser_error(
@@ -31,9 +31,33 @@ def load_config_or_parser_error(
 
 
 def print_candidates_or_exit(
-    config: SmartSearchConfig, candidates: Sequence[Candidate]
+    config: SmartSearchConfig, candidates: Sequence[Candidate] | LoadSweepResult
 ) -> None:
     """Preserve the legacy CLI result and no-candidate behavior for wrappers."""
+
+    if isinstance(candidates, LoadSweepResult):
+        if not candidates.global_operating_envelope:
+            print(
+                "no feasible candidate found at any load point "
+                "(check backends / SLA / gpu_budget / replay errors)",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+        for point in candidates.load_conditioned_pareto:
+            print(
+                f"load-conditioned pareto "
+                f"{candidates.load_axis}={point.load_value:.12g} "
+                f"({len(point.candidates)} non-dominated):"
+            )
+            for index, candidate in enumerate(point.candidates):
+                print(_pareto_candidate_line(index, candidate))
+        print(
+            "global operating envelope "
+            f"({len(candidates.global_operating_envelope)} non-dominated):"
+        )
+        for index, candidate in enumerate(candidates.global_operating_envelope):
+            print(_pareto_candidate_line(index, candidate))
+        return
 
     if not candidates:
         print(
@@ -45,21 +69,22 @@ def print_candidates_or_exit(
     if config.goal.is_pareto:
         print(f"pareto front ({len(candidates)} non-dominated):")
         for index, candidate in enumerate(candidates):
-            objectives = ", ".join(
-                f"{key}={value:.4g}"
-                for key, value in (candidate.objectives or {}).items()
-            )
-            concurrency = candidate.config.get("concurrency")
-            concrete_load = (
-                f" concurrency={concurrency}" if concurrency is not None else ""
-            )
-            print(
-                f"{index}: {objectives}{concrete_load} "
-                f"used_gpus={candidate.used_gpus}"
-            )
+            print(_pareto_candidate_line(index, candidate))
         return
     for index, candidate in enumerate(candidates):
         print(f"{index}: score={candidate.score} used_gpus={candidate.used_gpus}")
+
+
+def _pareto_candidate_line(index: int, candidate: Candidate) -> str:
+    objectives = ", ".join(
+        f"{key}={value:.4g}" for key, value in (candidate.objectives or {}).items()
+    )
+    concrete_load = "".join(
+        f" {name}={candidate.config[name]}"
+        for name in ("arrival_speedup_ratio", "request_rate", "concurrency")
+        if candidate.config.get(name) is not None
+    )
+    return f"{index}: {objectives}{concrete_load} used_gpus={candidate.used_gpus}"
 
 
 def main() -> None:

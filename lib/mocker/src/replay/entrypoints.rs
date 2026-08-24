@@ -251,7 +251,7 @@ pub fn simulate_loaded_trace_disagg_with_router_mode_and_options_and_scaling_pol
     scaling_policy: Option<Box<dyn super::ReplayScalingPolicy>>,
 ) -> Result<TraceSimulationReport> {
     let config = config.normalized()?;
-    validate_offline_disagg_replay_args(&config, router_mode)?;
+    validate_offline_disagg_replay_args(&config, router_mode, scaling_policy.is_some())?;
     let trace = trace
         .normalize_session_starts()?
         .speed_up_timing(arrival_speedup_ratio)?;
@@ -626,7 +626,7 @@ pub fn simulate_trace_file_disagg_with_router_mode_and_format_and_scaling_policy
     scaling_policy: Option<Box<dyn super::ReplayScalingPolicy>>,
 ) -> Result<TraceSimulationReport> {
     let config = config.normalized()?;
-    validate_offline_disagg_replay_args(&config, router_mode)?;
+    validate_offline_disagg_replay_args(&config, router_mode, scaling_policy.is_some())?;
     if trace_format == TraceFileFormat::AgenticMooncake {
         bail!("agentic_mooncake trace format is not supported for disaggregated replay");
     }
@@ -933,7 +933,7 @@ pub fn simulate_trace_requests_disagg_with_router_mode_and_scaling_policy(
     scaling_policy: Option<Box<dyn super::ReplayScalingPolicy>>,
 ) -> Result<TraceSimulationReport> {
     let config = config.normalized()?;
-    validate_offline_disagg_replay_args(&config, router_mode)?;
+    validate_offline_disagg_replay_args(&config, router_mode, scaling_policy.is_some())?;
     if requests.is_empty() {
         bail!("trace replay requires at least one request");
     }
@@ -1258,7 +1258,12 @@ pub fn simulate_concurrency_file_disagg_with_router_mode_and_format_and_scaling_
     scaling_policy: Option<Box<dyn super::ReplayScalingPolicy>>,
 ) -> Result<TraceSimulationReport> {
     let config = config.normalized()?;
-    validate_offline_disagg_concurrency_args(&config, max_in_flight, router_mode)?;
+    validate_offline_disagg_concurrency_args(
+        &config,
+        max_in_flight,
+        router_mode,
+        scaling_policy.is_some(),
+    )?;
     if trace_format == TraceFileFormat::AgenticMooncake {
         bail!("agentic_mooncake trace format is not supported for disaggregated replay");
     }
@@ -1601,7 +1606,12 @@ pub fn simulate_concurrency_requests_disagg_with_router_mode_and_scaling_policy(
     scaling_policy: Option<Box<dyn super::ReplayScalingPolicy>>,
 ) -> Result<TraceSimulationReport> {
     let config = config.normalized()?;
-    validate_offline_disagg_concurrency_args(&config, max_in_flight, router_mode)?;
+    validate_offline_disagg_concurrency_args(
+        &config,
+        max_in_flight,
+        router_mode,
+        scaling_policy.is_some(),
+    )?;
     if requests.is_empty() {
         bail!("concurrency replay requires at least one request");
     }
@@ -1774,7 +1784,7 @@ pub fn simulate_trace_workload_disagg_with_router_mode_and_options_and_scaling_p
     scaling_policy: Option<Box<dyn super::ReplayScalingPolicy>>,
 ) -> Result<TraceSimulationReport> {
     let config = config.normalized()?;
-    validate_offline_disagg_replay_args(&config, router_mode)?;
+    validate_offline_disagg_replay_args(&config, router_mode, scaling_policy.is_some())?;
     let report = crate::replay::offline::simulate_trace_workload_disagg_with_scaling_policy(
         config,
         router_config,
@@ -2024,7 +2034,12 @@ pub fn simulate_concurrency_workload_disagg_with_router_mode_and_options_and_sca
     scaling_policy: Option<Box<dyn super::ReplayScalingPolicy>>,
 ) -> Result<TraceSimulationReport> {
     let config = config.normalized()?;
-    validate_offline_disagg_concurrency_args(&config, max_in_flight, router_mode)?;
+    validate_offline_disagg_concurrency_args(
+        &config,
+        max_in_flight,
+        router_mode,
+        scaling_policy.is_some(),
+    )?;
     crate::replay::offline::simulate_concurrency_workload_disagg_with_scaling_policy(
         config,
         router_config,
@@ -2413,6 +2428,28 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("first_arrival_timestamp_ms"));
+    }
+
+    #[test]
+    fn offline_disagg_attention_dp_entrypoint_accepts_asymmetric_round_robin() {
+        let mut config = disagg_test_config();
+        config.prefill_args.dp_size = 2;
+        config.decode_args.dp_size = 4;
+
+        let report = simulate_trace_requests_disagg_with_router_mode(
+            config,
+            None,
+            None,
+            online_offload_test_requests(),
+            1.0,
+            ReplayRouterMode::RoundRobin,
+            SlaThresholds::default(),
+        )
+        .unwrap();
+
+        assert_eq!(report.request_counts.completed_requests, 3);
+        assert_eq!(report.request_counts.total_input_tokens, 24);
+        assert_eq!(report.request_counts.total_output_tokens, 3);
     }
 
     #[rstest]

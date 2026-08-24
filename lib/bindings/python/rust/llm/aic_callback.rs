@@ -103,6 +103,8 @@ fn build_rust_engine(
     model_path: &str,
     tp_size: usize,
     backend_version: Option<&str>,
+    database_mode: Option<&str>,
+    analytical_config: Option<&str>,
     moe_tp_size: Option<usize>,
     moe_ep_size: Option<usize>,
     attention_dp_size: Option<usize>,
@@ -150,7 +152,7 @@ fn build_rust_engine(
     // paid once per unique config (speculative config included).
     static CACHE: OnceLock<Mutex<HashMap<String, Arc<AicEngine>>>> = OnceLock::new();
     let key = format!(
-        "{backend_name}|{system}|{backend_version:?}|{model_path}|{tp_size}|{moe_tp_size:?}|{moe_ep_size:?}|{attention_dp_size:?}|{gemm_dtype:?}|{moe_dtype:?}|{fmha_dtype:?}|{kv_cache_dtype:?}|{comm_dtype:?}|{nextn}"
+        "{backend_name}|{system}|{backend_version:?}|{database_mode:?}|{analytical_config:?}|{model_path}|{tp_size}|{moe_tp_size:?}|{moe_ep_size:?}|{attention_dp_size:?}|{gemm_dtype:?}|{moe_dtype:?}|{fmha_dtype:?}|{kv_cache_dtype:?}|{comm_dtype:?}|{nextn}"
     );
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(existing) = cache.lock().unwrap().get(&key) {
@@ -185,6 +187,12 @@ fn build_rust_engine(
         .speculative_decoding(nextn);
     if let Some(value) = backend_version {
         builder = builder.backend_version(value);
+    }
+    if let Some(value) = database_mode {
+        builder = builder.database_mode(value);
+    }
+    if let Some(value) = analytical_config {
+        builder = builder.analytical_config_json(value);
     }
     if let Some(value) = gemm_dtype {
         builder = builder.gemm_quant_mode(value);
@@ -223,6 +231,8 @@ pub(super) fn create_aic_callback(
     model_path: &str,
     tp_size: usize,
     backend_version: Option<&str>,
+    database_mode: Option<&str>,
+    analytical_config: Option<&str>,
     moe_tp_size: Option<usize>,
     moe_ep_size: Option<usize>,
     attention_dp_size: Option<usize>,
@@ -243,6 +253,8 @@ pub(super) fn create_aic_callback(
             model_path,
             tp_size,
             backend_version,
+            database_mode,
+            analytical_config,
             moe_tp_size,
             moe_ep_size,
             attention_dp_size,
@@ -273,6 +285,8 @@ pub(super) fn create_aic_prefill_load_estimator(
     model_path: &str,
     tp_size: usize,
     backend_version: Option<&str>,
+    database_mode: Option<&str>,
+    analytical_config: Option<&str>,
     moe_tp_size: Option<usize>,
     moe_ep_size: Option<usize>,
     attention_dp_size: Option<usize>,
@@ -293,6 +307,8 @@ pub(super) fn create_aic_prefill_load_estimator(
             model_path,
             tp_size,
             backend_version,
+            database_mode,
+            analytical_config,
             moe_tp_size,
             moe_ep_size,
             attention_dp_size,
@@ -334,6 +350,7 @@ pub(super) fn estimate_aic_num_gpu_blocks(
     fmha_dtype: Option<&str>,
     kv_cache_dtype: Option<&str>,
     comm_dtype: Option<&str>,
+    database_mode: Option<&str>,
 ) -> PyResult<usize> {
     let module = py.import("dynamo._internal.aic")?;
     let kwargs = PyDict::new(py);
@@ -355,6 +372,7 @@ pub(super) fn estimate_aic_num_gpu_blocks(
     kwargs.set_item("fmha_dtype", fmha_dtype)?;
     kwargs.set_item("kv_cache_dtype", kv_cache_dtype)?;
     kwargs.set_item("comm_dtype", comm_dtype)?;
+    kwargs.set_item("database_mode", database_mode.unwrap_or("SILICON"))?;
     let blocks = module.call_method("estimate_num_gpu_blocks", (), Some(&kwargs))?;
     blocks.extract()
 }

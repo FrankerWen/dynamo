@@ -115,6 +115,12 @@ def parallel_configs_for(
     max_num_tokens: int = DEFAULT_MAX_NUM_TOKENS,
     max_batch_size: int = DEFAULT_MAX_BATCH_SIZE,
     memory_fraction: float = DEFAULT_MEMORY_FRACTION,
+    database_mode: str = "SILICON",
+    gemm_dtype: str | None = None,
+    moe_dtype: str | None = None,
+    fmha_dtype: str | None = None,
+    kv_cache_dtype: str | None = None,
+    comm_dtype: str | None = None,
 ) -> list[ReplicaParallelConfig] | list[DisaggParallelConfig]:
     """Resolve the model/hardware, then enumerate the parallel configs that fit
     the GPU budget and can hold a ``max_seq_len``-token sequence.
@@ -176,6 +182,12 @@ def parallel_configs_for(
         max_num_tokens=max_num_tokens,
         max_batch_size=max_batch_size,
         memory_fraction=memory_fraction,
+        database_mode=database_mode,
+        gemm_dtype=gemm_dtype,
+        moe_dtype=moe_dtype,
+        fmha_dtype=fmha_dtype,
+        kv_cache_dtype=kv_cache_dtype,
+        comm_dtype=comm_dtype,
     )
     if deployment_mode == "agg":
         kept = [c for c in configs if c.shape in feasible]

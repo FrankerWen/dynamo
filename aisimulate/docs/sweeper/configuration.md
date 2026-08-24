@@ -20,6 +20,10 @@ search_space:
   gpu_budget: 32
   deployment_mode: [disagg, agg]
   backend: [vllm, sglang]
+  pd_transfer:
+    kv_bytes_per_token: 131072
+    bandwidth_gb_s: 64.0
+    timing_mode: full_prompt
 
 adapters:
   example.policy:
@@ -45,6 +49,29 @@ The adapter value is a search space, not one concrete runtime configuration. Its
 the whole mapping, contributes optimizer dimensions, and later materializes one concrete adapter
 configuration for each candidate.
 
+## Outer Trace Load Scan
+
+An open-loop trace can decouple its request-feature distribution from arrival pressure:
+
+```yaml
+workload:
+  trace_path: /data/replay/traffic.jsonl
+  trace_format: mooncake
+
+load_sweep:
+  axis: arrival_speedup_ratio
+  values: [0.5, 1.0, 2.0, 4.0]
+
+goal:
+  target: pareto
+  pareto_objectives: [throughput_per_gpu, throughput_per_user]
+```
+
+The only supported outer axis is currently `arrival_speedup_ratio`. Values are explicit positive
+points, not a continuous optimizer range. Sweeper runs a fresh deployment study at every point and
+constructs both load-conditioned Pareto fronts and a cross-load operating envelope. See
+[Traffic](traffic.md) for the execution semantics.
+
 ## Backend Fields
 
 | Field | Default | Purpose |
@@ -59,6 +86,7 @@ configuration for each candidate.
 | `parallel_configs` | `[]` | optional pinned parallel configurations |
 | `startup_time` | `None` | optional simulated worker startup time |
 | `aic_nextn` | `None` | optional speculative-decoding depth |
+| `pd_transfer` | `None` | optional pinned per-request P-to-D KV transfer model for disaggregated candidates |
 
 Each engine role also has lists for `max_num_batched_tokens` and `max_num_seqs`, plus pinned block
 size, GPU-memory-utilization, and prefix-caching fields. A one-item list pins a searched field.
@@ -78,6 +106,30 @@ search_space:
 
 A disaggregated entry contains `prefill` and `decode` shapes. Every pinned shape must be legal,
 KV-feasible, and supported by at least one selected backend.
+
+For offline disaggregated replay, prefill and decode can use different `attention_dp` values when
+the runner uses fixed round-robin placement. This restricted attention-DP mode does not accept
+Planner scaling or Router adapter hooks.
+
+## P-to-D KV Transfer Timing
+
+`pd_transfer` enables the existing scalar handoff timing model for every disaggregated candidate.
+All three values are pinned workload/deployment assumptions rather than optimizer decisions:
+
+```yaml
+search_space:
+  deployment_mode: [disagg]
+  pd_transfer:
+    kv_bytes_per_token: 131072
+    bandwidth_gb_s: 64.0
+    timing_mode: full_prompt
+```
+
+The charged delay is `tokens * kv_bytes_per_token / (bandwidth_gb_s * 1e9) * 1000` milliseconds.
+`full_prompt` charges every prompt token. `destination_missing` charges only the destination's
+missing prompt footprint. Each request receives the full configured effective bandwidth; this
+model does not simulate shared-link contention, NIXL topology, or per-GPU transfers. Omit
+`pd_transfer` to disable P-to-D transfer delay explicitly.
 
 ## Provider Selection
 
@@ -103,5 +155,6 @@ AI Simulate variable takes precedence.
 
 ## Removed KVBM Fields
 
-Sweeper rejects the old KVBM block-count, transfer-bandwidth, offload-batch-size, and cache-hit
-fields. Native G2 replaces KVBM, so these fields have no adapter migration.
+Sweeper rejects the old flat KVBM block-count, transfer-bandwidth, offload-batch-size, and cache-hit
+fields. The nested `pd_transfer` model above represents P-to-D request handoff and is separate from
+KVBM tier bandwidths. Native G2 replaces KVBM, so the removed KVBM fields have no adapter migration.

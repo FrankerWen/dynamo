@@ -89,6 +89,7 @@ class DynamoReplayRunner:
         """Execute one trace or synthetic replay with requested Dynamo hooks."""
 
         self.capabilities.require_compatible(spec)
+        self._validate_simple_disagg_attention_dp(spec)
         planner_config, router_mode, router_config = self._resolve_hooks(
             spec.runtime_hooks
         )
@@ -121,6 +122,42 @@ class DynamoReplayRunner:
         The current replay entry points are call-scoped and retain no resources
         between candidates.
         """
+
+    @staticmethod
+    def _validate_simple_disagg_attention_dp(spec: ReplaySpec) -> None:
+        deployment = spec.backend_deployment
+        if deployment.deployment_mode != "disagg":
+            return
+        engine_args = (
+            deployment.prefill_engine_args,
+            deployment.decode_engine_args,
+        )
+        attention_dp_enabled = False
+        for role, payload in zip(("prefill", "decode"), engine_args, strict=True):
+            if payload is None:
+                raise ValueError(
+                    f"ReplaySpec is missing required {role} engine arguments"
+                )
+            raw_dp_size = payload.get(
+                "aic_attention_dp_size", payload.get("dp_size", 1)
+            )
+            dp_size = _int_value(raw_dp_size, f"{role}_attention_dp_size")
+            if dp_size < 1:
+                raise ValueError(f"{role}_attention_dp_size must be at least 1")
+            attention_dp_enabled |= dp_size > 1
+        if not attention_dp_enabled:
+            return
+
+        unsupported_hooks = [
+            hook
+            for hook in spec.runtime_hooks
+            if _PLANNER_HOOK.supports(hook) or _ROUTER_HOOK.supports(hook)
+        ]
+        if unsupported_hooks:
+            raise ValueError(
+                "offline disaggregated attention DP only supports fixed "
+                "round_robin placement without Planner or Router hooks"
+            )
 
     @staticmethod
     def _resolve_hooks(

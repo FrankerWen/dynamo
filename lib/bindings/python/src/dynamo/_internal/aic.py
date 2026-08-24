@@ -38,10 +38,16 @@ def _validate_kv_capacity_backend(backend_name: str) -> None:
         )
 
 
-def resolve_backend_version(backend_name: str, backend_version: str | None) -> str:
+def resolve_backend_version(
+    backend_name: str,
+    backend_version: str | None,
+    database_mode: str | None = None,
+) -> str:
     """Return the pinned backend version used for AIC perf lookups."""
     if backend_version is not None:
         return backend_version
+    if database_mode is not None and database_mode.upper() == "ANALYTICAL":
+        return "estimate"
     return DEFAULT_BACKEND_VERSIONS.get(backend_name, DEFAULT_BACKEND_VERSIONS["vllm"])
 
 
@@ -406,6 +412,7 @@ def estimate_num_gpu_blocks(
     fmha_dtype: str | None = None,
     kv_cache_dtype: str | None = None,
     comm_dtype: str | None = None,
+    database_mode: str = "SILICON",
 ) -> int:
     """Estimate rank-local KV cache blocks for mocker/replay AIC configs.
 
@@ -471,7 +478,9 @@ def estimate_num_gpu_blocks(
             model_path,
             system,
             backend_name,
-            backend_version=resolve_backend_version(backend_name, backend_version),
+            backend_version=resolve_backend_version(
+                backend_name, backend_version, database_mode
+            ),
             scheduler_block_size=block_size,
             max_num_tokens=max_num_batched_tokens,
             max_batch_size=1,
@@ -488,5 +497,6 @@ def estimate_num_gpu_blocks(
             fmha_quant_mode=_resolve_quant_mode_name("fmha", fmha_dtype),
             kvcache_quant_mode=_resolve_quant_mode_name("kvcache", kv_cache_dtype),
             comm_quant_mode=_resolve_quant_mode_name("comm", comm_dtype),
+            database_mode=database_mode,
         )
     )

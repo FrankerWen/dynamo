@@ -314,6 +314,34 @@ def test_suggest_observe_round_trips():
     assert best.final_measurement.metrics["objective"].value == max(scores)
 
 
+def test_checkpoint_observations_warm_start_fresh_study(monkeypatch):
+    monkeypatch.setenv("AISIMULATE_SWEEPER_VIZIER_ALGO", "RANDOM_SEARCH")
+    branch = _branch()
+    source = make_branch_sampler(
+        branch, study_id=f"checkpoint_source_{uuid.uuid4().hex}"
+    )
+    observations = []
+    for suggestion in source.suggest(count=2):
+        metrics = {"objective": float(suggestion.selection["agg_max_num_seqs"])}
+        source.observe(suggestion, metrics)
+        observations.append(
+            source.checkpoint_observation(suggestion, metrics=metrics)
+        )
+
+    restored = make_branch_sampler(
+        branch, study_id=f"checkpoint_restored_{uuid.uuid4().hex}"
+    )
+    restored.restore_observations(observations)
+
+    trials = [trial.materialize() for trial in restored._study.trials()]
+    assert len(trials) == 2
+    assert all(trial.is_completed for trial in trials)
+    assert {
+        trial.final_measurement.metrics["objective"].value for trial in trials
+    } == {observation.metrics["objective"] for observation in observations}
+    assert restored.suggest(count=1)
+
+
 def _branch_with_kv_load() -> BranchSpace:
     b = _branch()
     return BranchSpace(

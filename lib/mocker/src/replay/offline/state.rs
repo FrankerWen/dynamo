@@ -77,6 +77,14 @@ pub(crate) enum DisaggPhase {
     Done,
 }
 
+/// Stable pool-local scheduler identity for one side of a disaggregated handoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DisaggEndpoint {
+    pub(crate) scheduler_id: usize,
+    pub(crate) logical_worker_id: usize,
+    pub(crate) dp_rank: u32,
+}
+
 pub(crate) struct DisaggRequestState {
     original: Option<ReplayRequestPayload>,
     session_id: Option<String>,
@@ -87,8 +95,8 @@ pub(crate) struct DisaggRequestState {
     pub(in crate::replay::offline) coordinator: HandoffCoordinatorCore,
     pub(in crate::replay::offline) counted_in_flight: bool,
     replay_hashes: Option<ReplayRequestHashes>,
-    prefill_worker_idx: Option<usize>,
-    decode_worker_idx: Option<usize>,
+    prefill_endpoint: Option<DisaggEndpoint>,
+    decode_endpoint: Option<DisaggEndpoint>,
     pub(in crate::replay::offline) prefill_routed: bool,
     pub(in crate::replay::offline) destination_routed: bool,
     pub(in crate::replay::offline) pending_prefill_action: Option<IssuedHandoffAction>,
@@ -100,8 +108,8 @@ pub(crate) struct DisaggRequestState {
 pub(crate) struct DisaggRequestSnapshot {
     pub(crate) arrival_ms: f64,
     pub(crate) phase: DisaggPhase,
-    pub(crate) prefill_worker_idx: Option<usize>,
-    pub(crate) decode_worker_idx: Option<usize>,
+    pub(crate) prefill_endpoint: Option<DisaggEndpoint>,
+    pub(crate) decode_endpoint: Option<DisaggEndpoint>,
 }
 
 impl DisaggRequestState {
@@ -128,8 +136,8 @@ impl DisaggRequestState {
             coordinator: HandoffCoordinatorCore::new(handoff_id, order),
             counted_in_flight: true,
             replay_hashes,
-            prefill_worker_idx: None,
-            decode_worker_idx: None,
+            prefill_endpoint: None,
+            decode_endpoint: None,
             prefill_routed: false,
             destination_routed: false,
             pending_prefill_action: None,
@@ -191,25 +199,25 @@ impl DisaggRequestState {
         self.replay_hashes.take()
     }
 
-    pub(crate) fn start_prefill(&mut self, worker_idx: usize) {
+    pub(crate) fn start_prefill(&mut self, endpoint: DisaggEndpoint) {
         self.phase = DisaggPhase::RunningPrefill;
-        self.prefill_worker_idx = Some(worker_idx);
+        self.prefill_endpoint = Some(endpoint);
     }
 
-    pub(crate) fn prefill_worker_idx(&self) -> Option<usize> {
-        self.prefill_worker_idx
+    pub(crate) fn prefill_endpoint(&self) -> Option<DisaggEndpoint> {
+        self.prefill_endpoint
     }
 
     pub(crate) fn await_destination(&mut self) {
         self.phase = DisaggPhase::AwaitingDestination;
     }
 
-    pub(crate) fn assign_decode(&mut self, worker_idx: usize) {
-        self.decode_worker_idx = Some(worker_idx);
+    pub(crate) fn assign_decode(&mut self, endpoint: DisaggEndpoint) {
+        self.decode_endpoint = Some(endpoint);
     }
 
-    pub(crate) fn decode_worker_idx(&self) -> Option<usize> {
-        self.decode_worker_idx
+    pub(crate) fn decode_endpoint(&self) -> Option<DisaggEndpoint> {
+        self.decode_endpoint
     }
 
     pub(crate) fn transfer_pending(&mut self) {
@@ -241,8 +249,8 @@ impl DisaggRequestState {
         DisaggRequestSnapshot {
             arrival_ms: self.arrival_ms,
             phase: self.phase,
-            prefill_worker_idx: self.prefill_worker_idx,
-            decode_worker_idx: self.decode_worker_idx,
+            prefill_endpoint: self.prefill_endpoint,
+            decode_endpoint: self.decode_endpoint,
         }
     }
 }
@@ -265,6 +273,7 @@ pub(crate) struct OfflineWorkerSnapshot {
 }
 
 impl OfflineWorkerState {
+    #[cfg(test)]
     pub(crate) fn new(worker_idx: usize, args: MockEngineArgs, capture_kv_events: bool) -> Self {
         Self::new_with_rank(worker_idx, worker_idx as u64, 0, args, capture_kv_events)
     }

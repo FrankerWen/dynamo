@@ -144,3 +144,41 @@ def test_runner_wrapper_preserves_pareto_objectives_and_concurrency(capsys):
     assert "throughput_per_gpu=12" in output
     assert "throughput_per_user=6" in output
     assert "concurrency=8" in output
+
+
+def test_runner_wrapper_prints_load_conditioned_fronts_and_envelope(capsys):
+    config = sweeper.SmartSearchConfig(
+        search_space={"model_name": "model", "hardware_sku": "h200_sxm"},
+        workload={"trace_path": "/tmp/trace.jsonl"},
+        load_sweep={"values": [0.5, 1.0]},
+        goal={"target": "pareto"},
+    )
+    low = sweeper.Candidate(
+        config={"arrival_speedup_ratio": 0.5},
+        used_gpus=4,
+        score=12.0,
+        metrics={"output_throughput_tok_s": 48.0},
+        objectives={"throughput_per_gpu": 12.0, "throughput_per_user": 8.0},
+    )
+    high = sweeper.Candidate(
+        config={"arrival_speedup_ratio": 1.0},
+        used_gpus=4,
+        score=16.0,
+        metrics={"output_throughput_tok_s": 64.0},
+        objectives={"throughput_per_gpu": 16.0, "throughput_per_user": 6.0},
+    )
+    result = sweeper.LoadSweepResult(
+        load_axis="arrival_speedup_ratio",
+        load_conditioned_pareto=[
+            sweeper.LoadConditionedPareto(load_value=0.5, candidates=[low]),
+            sweeper.LoadConditionedPareto(load_value=1.0, candidates=[high]),
+        ],
+        global_operating_envelope=[high, low],
+    )
+
+    cli.print_candidates_or_exit(config, result)
+
+    output = capsys.readouterr().out
+    assert "load-conditioned pareto arrival_speedup_ratio=0.5" in output
+    assert "global operating envelope (2 non-dominated)" in output
+    assert "arrival_speedup_ratio=1.0" in output

@@ -1,0 +1,1314 @@
+# Simple Sweeper disaggregated attention-DP support
+#
+# Scope: asymmetric P/D attention-DP, independent round-robin placement,
+# fixed worker counts, no Planner/Router hooks, and scalar per-request P-to-D delay.
+# Generated against the current /workspace/dynosim_aic_sweep/dynamo working baseline.
+
+--- a/aisimulate/src/aisimulate/sweeper/__init__.py
++++ b/aisimulate/src/aisimulate/sweeper/__init__.py
+@@ -23,6 +23,7 @@
+     LoadSweepResult,
+     OptimizationGoal,
+     OptimizationTarget,
++    PdTransferConfig,
+     SearchSpace,
+     SLATarget,
+     SmartSearchConfig,
+@@ -121,6 +122,7 @@
+     "OptimizationGoal",
+     "OptimizationTarget",
+     "ParallelShape",
++    "PdTransferConfig",
+     "ProviderResolutionError",
+     "ReplayReport",
+     "ReplaySpec",
+--- a/aisimulate/src/aisimulate/sweeper/config.py
++++ b/aisimulate/src/aisimulate/sweeper/config.py
+@@ -396,6 +396,16 @@
+ }
+ 
+ 
++class PdTransferConfig(BaseModel):
++    """Pinned per-request P-to-D KV transfer timing model."""
++
++    model_config = ConfigDict(extra="forbid")
++
++    kv_bytes_per_token: int = Field(gt=0)
++    bandwidth_gb_s: float = Field(gt=0)
++    timing_mode: Literal["full_prompt", "destination_missing"] = "full_prompt"
++
++
+ class SearchSpace(BaseModel):
+     """Dynamo-independent backend inputs to one search run.
+ 
+@@ -429,6 +439,7 @@
+     aic_fmha_dtype: str | None = None
+     aic_kv_cache_dtype: str | None = None
+     aic_comm_dtype: str | None = None
++    pd_transfer: PdTransferConfig | None = None
+ 
+     # prefill engine (disagg branch): scheduler batching capacity
+     prefill_max_num_batched_tokens: list[int] = [8192, 16384, 32768]
+@@ -494,6 +505,14 @@
+         return self
+ 
+     @model_validator(mode="after")
++    def _validate_pd_transfer(self) -> SearchSpace:
++        if self.pd_transfer is not None and "disagg" not in self.deployment_mode:
++            raise ValueError(
++                "pd_transfer is only valid when deployment_mode includes 'disagg'"
++            )
++        return self
++
++    @model_validator(mode="after")
+     def _validate_parallel_configs(self) -> SearchSpace:
+         """A pinned ``parallel_configs`` (non-empty) must match a single deployment
+         mode and have the right shape: an agg entry is a flat shape dict (needs
+--- a/aisimulate/src/aisimulate/sweeper/sample.py
++++ b/aisimulate/src/aisimulate/sweeper/sample.py
+@@ -102,6 +102,13 @@
+     )
+ 
+     sample.update(_unroll_parallel(mode, parallel_config))
++    if mode == "disagg":
++        sample["pd_transfer"] = (
++            search_space.pd_transfer.model_dump(mode="json")
++            if search_space.pd_transfer is not None
++            else None
++        )
++
+     # engine knobs for the active branch only
+     if mode == "agg":
+         searched, pinned = _AGG_SEARCHED, _AGG_PINNED
+--- a/aisimulate/src/aisimulate/sweeper/deploy.py
++++ b/aisimulate/src/aisimulate/sweeper/deploy.py
+@@ -60,6 +60,13 @@
+             payload[field] = str(sample[field])
+     if sample.get("startup_time") is not None:
+         payload["startup_time"] = float(sample["startup_time"])
++    pd_transfer = sample.get("pd_transfer")
++    if role != "agg" and pd_transfer is not None:
++        if not isinstance(pd_transfer, dict):
++            raise TypeError("pd_transfer must be a mapping")
++        payload["kv_bytes_per_token"] = int(pd_transfer["kv_bytes_per_token"])
++        payload["kv_transfer_bandwidth"] = float(pd_transfer["bandwidth_gb_s"])
++        payload["kv_transfer_timing_mode"] = str(pd_transfer["timing_mode"])
+     return payload
+ 
+ 
+--- a/aisimulate/tests/sweeper/test_config.py
++++ b/aisimulate/tests/sweeper/test_config.py
+@@ -11,6 +11,7 @@
+     AicDatabaseMode,
+     LoadSweepConfig,
+     OptimizationGoal,
++    PdTransferConfig,
+     SearchSpace,
+     SLATarget,
+     SweepConfig,
+@@ -94,12 +95,47 @@
+     assert config.sweep.parallel_evals == 16
+     assert config.search_space.database_mode is AicDatabaseMode.SILICON
+     assert config.search_space.analytical_config is None
++    assert config.search_space.pd_transfer is None
+     dumped = config.search_space.model_dump()
+     assert (
+         not {"planner_scaling_policy", "router_mode", "num_g2_blocks"} & dumped.keys()
+     )
+ 
+ 
++def test_pd_transfer_is_explicit_positive_disagg_configuration():
++    search_space = SearchSpace(
++        **_search_space(
++            deployment_mode=["disagg"],
++            pd_transfer={
++                "kv_bytes_per_token": 131_072,
++                "bandwidth_gb_s": 64.0,
++                "timing_mode": "destination_missing",
++            },
++        )
++    )
++
++    assert search_space.pd_transfer == PdTransferConfig(
++        kv_bytes_per_token=131_072,
++        bandwidth_gb_s=64.0,
++        timing_mode="destination_missing",
++    )
++
++    with pytest.raises(ValidationError, match="bandwidth_gb_s"):
++        SearchSpace(
++            **_search_space(
++                deployment_mode=["disagg"],
++                pd_transfer={"kv_bytes_per_token": 1, "bandwidth_gb_s": 0},
++            )
++        )
++    with pytest.raises(ValidationError, match="only valid.*disagg"):
++        SearchSpace(
++            **_search_space(
++                deployment_mode=["agg"],
++                pd_transfer={"kv_bytes_per_token": 1, "bandwidth_gb_s": 1},
++            )
++        )
++
++
+ def test_analytical_policy_is_validated_and_normalized():
+     config = SmartSearchConfig(
+         search_space=_search_space(
+--- a/aisimulate/tests/sweeper/test_sample.py
++++ b/aisimulate/tests/sweeper/test_sample.py
+@@ -113,6 +113,33 @@
+     assert "agg_max_num_seqs" not in sample
+ 
+ 
++def test_disagg_unroll_preserves_pinned_pd_transfer_identity():
++    selection = _agg_selection(
++        deployment_mode="disagg",
++        prefill_max_num_batched_tokens=16384,
++        prefill_max_num_seqs=4,
++        decode_max_num_batched_tokens=8192,
++        decode_max_num_seqs=512,
++    )
++    sample = unroll_sample(
++        search_space=_space(
++            deployment_mode=["disagg"],
++            pd_transfer={
++                "kv_bytes_per_token": 131_072,
++                "bandwidth_gb_s": 64.0,
++            },
++        ),
++        selection=selection,
++        parallel_config=DISAGG_CONFIG,
++    )
++
++    assert sample["pd_transfer"] == {
++        "kv_bytes_per_token": 131_072,
++        "bandwidth_gb_s": 64.0,
++        "timing_mode": "full_prompt",
++    }
++
++
+ def test_unroll_folds_only_backend_pinned_values():
+     sample = unroll_sample(
+         search_space=_space(
+--- a/aisimulate/tests/sweeper/test_deploy.py
++++ b/aisimulate/tests/sweeper/test_deploy.py
+@@ -121,6 +121,43 @@
+     assert deployment.decode_engine_args["engine_type"] == "sglang"
+ 
+ 
++def test_disagg_backend_deployment_injects_scalar_pd_transfer_on_both_pools():
++    parallel = DisaggParallelConfig(
++        prefill=ReplicaParallelConfig(ParallelShape(tp=1, dp=2, moe_tp=1, moe_ep=2), 1),
++        decode=ReplicaParallelConfig(ParallelShape(tp=1, dp=4, moe_tp=1, moe_ep=4), 1),
++    )
++    selection = _agg_selection(
++        deployment_mode="disagg",
++        backend="sglang",
++        prefill_max_num_batched_tokens=32768,
++        prefill_max_num_seqs=4,
++        decode_max_num_batched_tokens=8192,
++        decode_max_num_seqs=1024,
++    )
++    sample = unroll_sample(
++        search_space=_space(
++            deployment_mode=["disagg"],
++            pd_transfer={
++                "kv_bytes_per_token": 1_000_000,
++                "bandwidth_gb_s": 1.0,
++                "timing_mode": "full_prompt",
++            },
++        ),
++        selection=selection,
++        parallel_config=parallel,
++    )
++
++    deployment = build_backend_deployment(sample, backend_version=BACKEND_VERSION)
++
++    expected = {
++        "kv_bytes_per_token": 1_000_000,
++        "kv_transfer_bandwidth": 1.0,
++        "kv_transfer_timing_mode": "full_prompt",
++    }
++    assert {key: deployment.prefill_engine_args[key] for key in expected} == expected
++    assert {key: deployment.decode_engine_args[key] for key in expected} == expected
++
++
+ def test_dense_shape_omits_moe_sizes():
+     dense = ReplicaParallelConfig(
+         ParallelShape(tp=2, dp=1, moe_tp=1, moe_ep=1), replicas=1
+--- a/aisimulate/docs/sweeper/configuration.md
++++ b/aisimulate/docs/sweeper/configuration.md
+@@ -20,6 +20,10 @@
+   gpu_budget: 32
+   deployment_mode: [disagg, agg]
+   backend: [vllm, sglang]
++  pd_transfer:
++    kv_bytes_per_token: 131072
++    bandwidth_gb_s: 64.0
++    timing_mode: full_prompt
+ 
+ adapters:
+   example.policy:
+@@ -82,6 +86,7 @@
+ | `parallel_configs` | `[]` | optional pinned parallel configurations |
+ | `startup_time` | `None` | optional simulated worker startup time |
+ | `aic_nextn` | `None` | optional speculative-decoding depth |
++| `pd_transfer` | `None` | optional pinned per-request P-to-D KV transfer model for disaggregated candidates |
+ 
+ Each engine role also has lists for `max_num_batched_tokens` and `max_num_seqs`, plus pinned block
+ size, GPU-memory-utilization, and prefix-caching fields. A one-item list pins a searched field.
+@@ -102,6 +107,30 @@
+ A disaggregated entry contains `prefill` and `decode` shapes. Every pinned shape must be legal,
+ KV-feasible, and supported by at least one selected backend.
+ 
++For offline disaggregated replay, prefill and decode can use different `attention_dp` values when
++the runner uses fixed round-robin placement. This restricted attention-DP mode does not accept
++Planner scaling or Router adapter hooks.
++
++## P-to-D KV Transfer Timing
++
++`pd_transfer` enables the existing scalar handoff timing model for every disaggregated candidate.
++All three values are pinned workload/deployment assumptions rather than optimizer decisions:
++
++```yaml
++search_space:
++  deployment_mode: [disagg]
++  pd_transfer:
++    kv_bytes_per_token: 131072
++    bandwidth_gb_s: 64.0
++    timing_mode: full_prompt
++```
++
++The charged delay is `tokens * kv_bytes_per_token / (bandwidth_gb_s * 1e9) * 1000` milliseconds.
++`full_prompt` charges every prompt token. `destination_missing` charges only the destination's
++missing prompt footprint. Each request receives the full configured effective bandwidth; this
++model does not simulate shared-link contention, NIXL topology, or per-GPU transfers. Omit
++`pd_transfer` to disable P-to-D transfer delay explicitly.
++
+ ## Provider Selection
+ 
+ Adapter names are provider entry-point names. A provider can be installed through the
+@@ -126,6 +155,6 @@
+ 
+ ## Removed KVBM Fields
+ 
+-Sweeper rejects the old KVBM block-count, transfer-bandwidth, offload-batch-size, and cache-hit
+-fields. Native G2 replaces KVBM, so these fields have no adapter migration.
+-
++Sweeper rejects the old flat KVBM block-count, transfer-bandwidth, offload-batch-size, and cache-hit
++fields. The nested `pd_transfer` model above represents P-to-D request handoff and is separate from
++KVBM tier bandwidths. Native G2 replaces KVBM, so the removed KVBM fields have no adapter migration.
+--- a/docs/fern/pages/developer-guide/knowledge-base/modular-components/ai-simulate-experimental/sweeper-experimental/configuration.md
++++ b/docs/fern/pages/developer-guide/knowledge-base/modular-components/ai-simulate-experimental/sweeper-experimental/configuration.md
+@@ -25,6 +25,10 @@
+   gpu_budget: 32
+   deployment_mode: [disagg, agg]
+   backend: [vllm, sglang]
++  pd_transfer:
++    kv_bytes_per_token: 131072
++    bandwidth_gb_s: 64.0
++    timing_mode: full_prompt
+ 
+ adapters:
+   example.policy:
+@@ -87,6 +91,7 @@
+ | `parallel_configs` | `[]` | optional pinned parallel configurations |
+ | `startup_time` | `None` | optional simulated worker startup time |
+ | `aic_nextn` | `None` | optional speculative-decoding depth |
++| `pd_transfer` | `None` | optional pinned per-request P-to-D KV transfer model for disaggregated candidates |
+ 
+ Each engine role also has lists for `max_num_batched_tokens` and `max_num_seqs`, plus pinned block
+ size, GPU-memory-utilization, and prefix-caching fields. A one-item list pins a searched field.
+@@ -107,6 +112,30 @@
+ A disaggregated entry contains `prefill` and `decode` shapes. Every pinned shape must be legal,
+ KV-feasible, and supported by at least one selected backend.
+ 
++For offline disaggregated replay, prefill and decode can use different `attention_dp` values when
++the runner uses fixed round-robin placement. This restricted attention-DP mode does not accept
++Planner scaling or Router adapter hooks.
++
++## P-to-D KV Transfer Timing
++
++`pd_transfer` enables the existing scalar handoff timing model for every disaggregated candidate.
++All three values are pinned workload/deployment assumptions rather than optimizer decisions:
++
++```yaml
++search_space:
++  deployment_mode: [disagg]
++  pd_transfer:
++    kv_bytes_per_token: 131072
++    bandwidth_gb_s: 64.0
++    timing_mode: full_prompt
++```
++
++The charged delay is `tokens * kv_bytes_per_token / (bandwidth_gb_s * 1e9) * 1000` milliseconds.
++`full_prompt` charges every prompt token. `destination_missing` charges only the destination's
++missing prompt footprint. Each request receives the full configured effective bandwidth; this
++model does not simulate shared-link contention, NIXL topology, or per-GPU transfers. Omit
++`pd_transfer` to disable P-to-D transfer delay explicitly.
++
+ ## Provider Selection
+ 
+ Adapter names are provider entry-point names. A provider can be installed through the
+@@ -131,6 +160,6 @@
+ 
+ ## Removed KVBM Fields
+ 
+-Sweeper rejects the old KVBM block-count, transfer-bandwidth, offload-batch-size, and cache-hit
+-fields. Native G2 replaces KVBM, so these fields have no adapter migration.
+-
++Sweeper rejects the old flat KVBM block-count, transfer-bandwidth, offload-batch-size, and cache-hit
++fields. The nested `pd_transfer` model above represents P-to-D request handoff and is separate from
++KVBM tier bandwidths. Native G2 replaces KVBM, so the removed KVBM fields have no adapter migration.
+diff --git a/components/src/dynamo/replay/simulation.py b/components/src/dynamo/replay/simulation.py
+index 946390d68b..5d85ceb9e0 100644
+--- a/components/src/dynamo/replay/simulation.py
++++ b/components/src/dynamo/replay/simulation.py
+@@ -89,6 +89,7 @@ class DynamoReplayRunner:
+         """Execute one trace or synthetic replay with requested Dynamo hooks."""
+ 
+         self.capabilities.require_compatible(spec)
++        self._validate_simple_disagg_attention_dp(spec)
+         planner_config, router_mode, router_config = self._resolve_hooks(
+             spec.runtime_hooks
+         )
+@@ -122,6 +123,42 @@ class DynamoReplayRunner:
+         between candidates.
+         """
+ 
++    @staticmethod
++    def _validate_simple_disagg_attention_dp(spec: ReplaySpec) -> None:
++        deployment = spec.backend_deployment
++        if deployment.deployment_mode != "disagg":
++            return
++        engine_args = (
++            deployment.prefill_engine_args,
++            deployment.decode_engine_args,
++        )
++        attention_dp_enabled = False
++        for role, payload in zip(("prefill", "decode"), engine_args, strict=True):
++            if payload is None:
++                raise ValueError(
++                    f"ReplaySpec is missing required {role} engine arguments"
++                )
++            raw_dp_size = payload.get(
++                "aic_attention_dp_size", payload.get("dp_size", 1)
++            )
++            dp_size = _int_value(raw_dp_size, f"{role}_attention_dp_size")
++            if dp_size < 1:
++                raise ValueError(f"{role}_attention_dp_size must be at least 1")
++            attention_dp_enabled |= dp_size > 1
++        if not attention_dp_enabled:
++            return
++
++        unsupported_hooks = [
++            hook
++            for hook in spec.runtime_hooks
++            if _PLANNER_HOOK.supports(hook) or _ROUTER_HOOK.supports(hook)
++        ]
++        if unsupported_hooks:
++            raise ValueError(
++                "offline disaggregated attention DP only supports fixed "
++                "round_robin placement without Planner or Router hooks"
++            )
++
+     @staticmethod
+     def _resolve_hooks(
+         hooks: tuple[RuntimeHookSpec, ...],
+diff --git a/components/src/dynamo/replay/tests/test_simulation.py b/components/src/dynamo/replay/tests/test_simulation.py
+index f6aeb2b7ad..8090136fcf 100644
+--- a/components/src/dynamo/replay/tests/test_simulation.py
++++ b/components/src/dynamo/replay/tests/test_simulation.py
+@@ -72,6 +72,30 @@ def _agg_deployment() -> BackendDeploymentSpec:
+     )
+ 
+ 
++def _disagg_attention_dp_deployment() -> BackendDeploymentSpec:
++    return BackendDeploymentSpec(
++        deployment_mode="disagg",
++        backend="sglang",
++        backend_version="0.5.6",
++        prefill_engine_args={
++            "worker_type": "prefill",
++            "aic_attention_dp_size": 2,
++            "kv_bytes_per_token": 1_000_000,
++            "kv_transfer_bandwidth": 1.0,
++            "kv_transfer_timing_mode": "full_prompt",
++        },
++        decode_engine_args={
++            "worker_type": "decode",
++            "aic_attention_dp_size": 4,
++            "kv_bytes_per_token": 1_000_000,
++            "kv_transfer_bandwidth": 1.0,
++            "kv_transfer_timing_mode": "full_prompt",
++        },
++        num_prefill_workers=2,
++        num_decode_workers=4,
++    )
++
++
+ def test_trace_runner_preserves_current_replay_arguments(monkeypatch) -> None:
+     seen = {}
+ 
+@@ -164,15 +188,7 @@ def test_synthetic_disagg_preserves_request_count_and_load(monkeypatch) -> None:
+         "run_synthetic_trace_replay",
+         fake_run_synthetic_trace_replay,
+     )
+-    deployment = BackendDeploymentSpec(
+-        deployment_mode="disagg",
+-        backend="sglang",
+-        backend_version="0.5.6",
+-        prefill_engine_args={"worker_type": "prefill"},
+-        decode_engine_args={"worker_type": "decode"},
+-        num_prefill_workers=2,
+-        num_decode_workers=4,
+-    )
++    deployment = _disagg_attention_dp_deployment()
+     spec = ReplaySpec(
+         backend_deployment=deployment,
+         workload={
+@@ -202,9 +218,51 @@ def test_synthetic_disagg_preserves_request_count_and_load(monkeypatch) -> None:
+     assert seen["arrival_interval_ms"] is None
+     assert seen["num_prefill_workers"] == 2
+     assert seen["num_decode_workers"] == 4
++    assert json.loads(seen["prefill_engine_args"].payload)["aic_attention_dp_size"] == 2
++    assert json.loads(seen["decode_engine_args"].payload)["aic_attention_dp_size"] == 4
+     assert report.metrics == {"output_throughput_tok_s": 99.0}
+ 
+ 
++@pytest.mark.parametrize(
++    "provider,kind,config",
++    [
++        (
++            "dynamo.planner",
++            "scaling_policy",
++            {"planner_config": {"mode": "disagg"}},
++        ),
++        (
++            "dynamo.router",
++            "placement_policy",
++            {"router_mode": "kv_router", "router_config": {}},
++        ),
++    ],
++)
++def test_disagg_attention_dp_rejects_planner_and_router_hooks(
++    provider: str, kind: str, config: dict
++) -> None:
++    spec = ReplaySpec(
++        backend_deployment=_disagg_attention_dp_deployment(),
++        workload={"trace_path": "tiny.jsonl"},
++        goal={"target": "throughput"},
++        adapters={
++            provider: AdapterReplaySpec(
++                runtime_hooks=(
++                    RuntimeHookSpec(
++                        provider=provider,
++                        kind=kind,
++                        api_version=1,
++                        config=config,
++                    ),
++                )
++            )
++        },
++    )
++
++    with pytest.raises(ValueError, match="only supports fixed round_robin"):
++        simulation.DynamoReplayRunnerFactory().create(0).run(spec)
++
++
+ def test_synthetic_request_rate_preserves_open_loop_load(monkeypatch) -> None:
+     seen = {}
+ 
+diff --git a/lib/mocker/src/replay/entrypoints.rs b/lib/mocker/src/replay/entrypoints.rs
+index 485709e054..3c74b6d587 100644
+--- a/lib/mocker/src/replay/entrypoints.rs
++++ b/lib/mocker/src/replay/entrypoints.rs
+@@ -251,7 +251,7 @@ pub fn simulate_loaded_trace_disagg_with_router_mode_and_options_and_scaling_pol
+     scaling_policy: Option<Box<dyn super::ReplayScalingPolicy>>,
+ ) -> Result<TraceSimulationReport> {
+     let config = config.normalized()?;
+-    validate_offline_disagg_replay_args(&config, router_mode)?;
++    validate_offline_disagg_replay_args(&config, router_mode, scaling_policy.is_some())?;
+     let trace = trace
+         .normalize_session_starts()?
+         .speed_up_timing(arrival_speedup_ratio)?;
+@@ -626,7 +626,7 @@ pub fn simulate_trace_file_disagg_with_router_mode_and_format_and_scaling_policy
+     scaling_policy: Option<Box<dyn super::ReplayScalingPolicy>>,
+ ) -> Result<TraceSimulationReport> {
+     let config = config.normalized()?;
+-    validate_offline_disagg_replay_args(&config, router_mode)?;
++    validate_offline_disagg_replay_args(&config, router_mode, scaling_policy.is_some())?;
+     if trace_format == TraceFileFormat::AgenticMooncake {
+         bail!("agentic_mooncake trace format is not supported for disaggregated replay");
+     }
+@@ -933,7 +933,7 @@ pub fn simulate_trace_requests_disagg_with_router_mode_and_scaling_policy(
+     scaling_policy: Option<Box<dyn super::ReplayScalingPolicy>>,
+ ) -> Result<TraceSimulationReport> {
+     let config = config.normalized()?;
+-    validate_offline_disagg_replay_args(&config, router_mode)?;
++    validate_offline_disagg_replay_args(&config, router_mode, scaling_policy.is_some())?;
+     if requests.is_empty() {
+         bail!("trace replay requires at least one request");
+     }
+@@ -1258,7 +1258,12 @@ pub fn simulate_concurrency_file_disagg_with_router_mode_and_format_and_scaling_
+     scaling_policy: Option<Box<dyn super::ReplayScalingPolicy>>,
+ ) -> Result<TraceSimulationReport> {
+     let config = config.normalized()?;
+-    validate_offline_disagg_concurrency_args(&config, max_in_flight, router_mode)?;
++    validate_offline_disagg_concurrency_args(
++        &config,
++        max_in_flight,
++        router_mode,
++        scaling_policy.is_some(),
++    )?;
+     if trace_format == TraceFileFormat::AgenticMooncake {
+         bail!("agentic_mooncake trace format is not supported for disaggregated replay");
+     }
+@@ -1601,7 +1606,12 @@ pub fn simulate_concurrency_requests_disagg_with_router_mode_and_scaling_policy(
+     scaling_policy: Option<Box<dyn super::ReplayScalingPolicy>>,
+ ) -> Result<TraceSimulationReport> {
+     let config = config.normalized()?;
+-    validate_offline_disagg_concurrency_args(&config, max_in_flight, router_mode)?;
++    validate_offline_disagg_concurrency_args(
++        &config,
++        max_in_flight,
++        router_mode,
++        scaling_policy.is_some(),
++    )?;
+     if requests.is_empty() {
+         bail!("concurrency replay requires at least one request");
+     }
+@@ -1774,7 +1784,7 @@ pub fn simulate_trace_workload_disagg_with_router_mode_and_options_and_scaling_p
+     scaling_policy: Option<Box<dyn super::ReplayScalingPolicy>>,
+ ) -> Result<TraceSimulationReport> {
+     let config = config.normalized()?;
+-    validate_offline_disagg_replay_args(&config, router_mode)?;
++    validate_offline_disagg_replay_args(&config, router_mode, scaling_policy.is_some())?;
+     let report = crate::replay::offline::simulate_trace_workload_disagg_with_scaling_policy(
+         config,
+         router_config,
+@@ -2024,7 +2034,12 @@ pub fn simulate_concurrency_workload_disagg_with_router_mode_and_options_and_sca
+     scaling_policy: Option<Box<dyn super::ReplayScalingPolicy>>,
+ ) -> Result<TraceSimulationReport> {
+     let config = config.normalized()?;
+-    validate_offline_disagg_concurrency_args(&config, max_in_flight, router_mode)?;
++    validate_offline_disagg_concurrency_args(
++        &config,
++        max_in_flight,
++        router_mode,
++        scaling_policy.is_some(),
++    )?;
+     crate::replay::offline::simulate_concurrency_workload_disagg_with_scaling_policy(
+         config,
+         router_config,
+@@ -2415,6 +2430,28 @@ mod tests {
+         assert!(error.to_string().contains("first_arrival_timestamp_ms"));
+     }
+ 
++    #[test]
++    fn offline_disagg_attention_dp_entrypoint_accepts_asymmetric_round_robin() {
++        let mut config = disagg_test_config();
++        config.prefill_args.dp_size = 2;
++        config.decode_args.dp_size = 4;
++
++        let report = simulate_trace_requests_disagg_with_router_mode(
++            config,
++            None,
++            None,
++            online_offload_test_requests(),
++            1.0,
++            ReplayRouterMode::RoundRobin,
++            SlaThresholds::default(),
++        )
++        .unwrap();
++
++        assert_eq!(report.request_counts.completed_requests, 3);
++        assert_eq!(report.request_counts.total_input_tokens, 24);
++        assert_eq!(report.request_counts.total_output_tokens, 3);
++    }
++
+     #[rstest]
+     #[case::vllm(EngineType::Vllm)]
+     #[case::trtllm(EngineType::Trtllm)]
+diff --git a/lib/mocker/src/replay/offline/components/engine.rs b/lib/mocker/src/replay/offline/components/engine.rs
+index 7f54b27708..248f15f421 100644
+--- a/lib/mocker/src/replay/offline/components/engine.rs
++++ b/lib/mocker/src/replay/offline/components/engine.rs
+@@ -93,6 +93,7 @@ impl<Observation> EngineComponent<Observation>
+ where
+     Observation: ReplayEngineObservation,
+ {
++    #[cfg(test)]
+     pub(in crate::replay::offline) fn new(
+         stage: SimulationWorkerStage,
+         pass_mode: EnginePassMode,
+@@ -135,6 +136,26 @@ where
+         pass_mode: EnginePassMode,
+         args: MockEngineArgs,
+         num_workers: usize,
++    ) -> Self {
++        Self::new_ranked_with_capture(
++            stage,
++            pass_mode,
++            args,
++            num_workers,
++            Observation::CAPTURE_RAW,
++        )
++    }
++
++    /// Build ranked schedulers with an explicit raw-event capture policy.
++    ///
++    /// Disaggregated compositions may capture KV events on only one pool, so
++    /// they cannot always use the observation type's global default.
++    pub(in crate::replay::offline) fn new_ranked_with_capture(
++        stage: SimulationWorkerStage,
++        pass_mode: EnginePassMode,
++        args: MockEngineArgs,
++        num_workers: usize,
++        capture_raw: bool,
+     ) -> Self {
+         let dp_size = args.dp_size.max(1) as usize;
+         let mut workers = Vec::with_capacity(num_workers.saturating_mul(dp_size));
+@@ -149,7 +170,7 @@ where
+                     worker_id as u64,
+                     dp_rank as u32,
+                     args.clone(),
+-                    Observation::CAPTURE_RAW,
++                    capture_raw,
+                 )));
+                 rank_ids.push(rank_id);
+             }
+@@ -168,7 +189,7 @@ where
+             pending_removal: BTreeSet::new(),
+             pending_startup: BTreeSet::new(),
+             args,
+-            capture_raw: Observation::CAPTURE_RAW,
++            capture_raw,
+             observation: PhantomData,
+         };
+         component.refresh_all_groups();
+diff --git a/lib/mocker/src/replay/offline/disagg.rs b/lib/mocker/src/replay/offline/disagg.rs
+index 719e77f37a..12c392d9da 100644
+--- a/lib/mocker/src/replay/offline/disagg.rs
++++ b/lib/mocker/src/replay/offline/disagg.rs
+@@ -37,7 +37,7 @@ use super::runtime_utils::{
+ use super::scaling::{LatestFpmBuffer, ReplayScalingPolicy, ReplayScalingSnapshot};
+ #[cfg(test)]
+ use super::state::DisaggRequestSnapshot;
+-use super::state::{DisaggPhase, DisaggRequestState};
++use super::state::{DisaggEndpoint, DisaggPhase, DisaggRequestState};
+ use crate::common::handoff::{
+     HandoffAction, HandoffActionOutcome, HandoffCompletion, HandoffFact, HandoffId, HandoffOrder,
+     IssuedHandoffAction, NormalizedHandoffConformance, NormalizedHandoffEvent,
+@@ -84,8 +84,8 @@ pub(crate) enum DisaggTransition {
+ #[derive(Debug, Default, Clone, PartialEq)]
+ pub(in crate::replay) struct DisaggRuntimeStats {
+     request_snapshots: HashMap<Uuid, DisaggRequestSnapshot>,
+-    prefill_assignments: HashMap<Uuid, usize>,
+-    decode_assignments: HashMap<Uuid, usize>,
++    prefill_assignments: HashMap<Uuid, DisaggEndpoint>,
++    decode_assignments: HashMap<Uuid, DisaggEndpoint>,
+     handoff_ms: HashMap<Uuid, f64>,
+     prefill_marked_count: usize,
+     prefill_router_freed_count: usize,
+@@ -407,18 +407,18 @@ impl DisaggFlowState {
+     fn finish_prefill_submission(
+         &mut self,
+         uuid: Uuid,
+-        worker_idx: usize,
++        endpoint: DisaggEndpoint,
+         action: IssuedHandoffAction,
+         lifecycle_events: Vec<SchedulerLifecycleEvent>,
+         now_ms: f64,
+         collector: &mut TraceCollector,
+         stats: &mut DisaggRuntimeStats,
+     ) -> Result<()> {
+-        self.state_mut(uuid)?.start_prefill(worker_idx);
+-        collector.on_prefill_assigned(uuid, worker_idx);
++        self.state_mut(uuid)?.start_prefill(endpoint);
++        collector.on_prefill_assigned(uuid, endpoint.logical_worker_id);
+         #[cfg(test)]
+         {
+-            stats.prefill_assignments.insert(uuid, worker_idx);
++            stats.prefill_assignments.insert(uuid, endpoint);
+         }
+         self.acknowledge_action(
+             uuid,
+@@ -449,7 +449,7 @@ impl DisaggFlowState {
+     fn finish_destination_reservation(
+         &mut self,
+         uuid: Uuid,
+-        worker_idx: usize,
++        endpoint: DisaggEndpoint,
+         action: IssuedHandoffAction,
+         stored_hashes: &[u64],
+         lifecycle_events: Vec<SchedulerLifecycleEvent>,
+@@ -463,11 +463,11 @@ impl DisaggFlowState {
+                 .lifecycle
+                 .push(NormalizedHandoffEvent::DestinationAccepted);
+         }
+-        self.state_mut(uuid)?.assign_decode(worker_idx);
+-        collector.on_decode_assigned(uuid, worker_idx);
++        self.state_mut(uuid)?.assign_decode(endpoint);
++        collector.on_decode_assigned(uuid, endpoint.logical_worker_id);
+         #[cfg(test)]
+         {
+-            stats.decode_assignments.insert(uuid, worker_idx);
++            stats.decode_assignments.insert(uuid, endpoint);
+             stats
+                 .transition_log
+                 .push(DisaggTransition::DestinationAccepted { uuid });
+@@ -1001,32 +1001,20 @@ where
+             CoreAdmissionSource::total_requests(&admission),
+             "offline disagg replay",
+         );
+-        let mut prefill_engine = EngineComponent::<Observation>::new(
++        let mut prefill_engine = EngineComponent::<Observation>::new_ranked_with_capture(
+             SimulationWorkerStage::Prefill,
+             EnginePassMode::Hidden,
+-            (0..config.num_prefill_workers)
+-                .map(|worker_idx| {
+-                    super::state::OfflineWorkerState::new(
+-                        worker_idx,
+-                        config.prefill_args.clone(),
+-                        prefill_capture_raw,
+-                    )
+-                })
+-                .collect(),
++            config.prefill_args.clone(),
++            config.num_prefill_workers,
++            prefill_capture_raw,
+         );
+         prefill_engine.set_scaling_args(config.prefill_args.clone(), prefill_capture_raw);
+-        let mut decode_engine = EngineComponent::<Observation>::new(
++        let mut decode_engine = EngineComponent::<Observation>::new_ranked_with_capture(
+             SimulationWorkerStage::Decode,
+             EnginePassMode::Visible,
+-            (0..config.num_decode_workers)
+-                .map(|worker_idx| {
+-                    super::state::OfflineWorkerState::new(
+-                        worker_idx,
+-                        config.decode_args.clone(),
+-                        decode_capture_raw,
+-                    )
+-                })
+-                .collect(),
++            config.decode_args.clone(),
++            config.num_decode_workers,
++            decode_capture_raw,
+         );
+         decode_engine.set_scaling_args(config.decode_args.clone(), decode_capture_raw);
+         let prefill_placement =
+@@ -1170,12 +1158,23 @@ where
+     fn dispatch_prefill(
+         &mut self,
+         uuid: Uuid,
+-        worker_idx: usize,
++        scheduler_id: usize,
+         action: IssuedHandoffAction,
+     ) -> Result<()> {
++        let (logical_worker_id, dp_rank) = self
++            .prefill_engine
++            .rank_identity(scheduler_id)
++            .ok_or_else(|| {
++                anyhow!("prefill assignment references unknown scheduler {scheduler_id}")
++            })?;
++        let endpoint = DisaggEndpoint {
++            scheduler_id,
++            logical_worker_id,
++            dp_rank,
++        };
+         let (request, handoff_id) = self.flow.prepare_prefill_submission(uuid)?;
+         let effects = match self.prefill_engine.apply_command(
+-            worker_idx,
++            scheduler_id,
+             SchedulerCommand::SubmitHandoffPrefill {
+                 handoff_id,
+                 request,
+@@ -1196,7 +1195,7 @@ where
+         }
+         self.flow.finish_prefill_submission(
+             uuid,
+-            worker_idx,
++            endpoint,
+             action,
+             effects.lifecycle_events,
+             self.now_ms,
+@@ -1209,12 +1208,23 @@ where
+     fn reserve_destination(
+         &mut self,
+         uuid: Uuid,
+-        worker_idx: usize,
++        scheduler_id: usize,
+         action: IssuedHandoffAction,
+     ) -> Result<()> {
++        let (logical_worker_id, dp_rank) = self
++            .decode_engine
++            .rank_identity(scheduler_id)
++            .ok_or_else(|| {
++                anyhow!("decode assignment references unknown scheduler {scheduler_id}")
++            })?;
++        let endpoint = DisaggEndpoint {
++            scheduler_id,
++            logical_worker_id,
++            dp_rank,
++        };
+         let (request, handoff_id) = self.flow.prepare_destination_reservation(uuid)?;
+         let effects = match self.decode_engine.apply_command(
+-            worker_idx,
++            scheduler_id,
+             SchedulerCommand::ReserveDestination {
+                 handoff_id,
+                 request,
+@@ -1244,7 +1254,7 @@ where
+             .unwrap_or_default();
+         self.flow.finish_destination_reservation(
+             uuid,
+-            worker_idx,
++            endpoint,
+             action,
+             &stored_hashes,
+             effects.lifecycle_events,
+@@ -1498,10 +1508,11 @@ where
+                 }
+             }
+             HandoffAction::ActivateDestination { handoff_id } => {
+-                let worker_idx = self
++                let endpoint = self
+                     .state(uuid)?
+-                    .decode_worker_idx()
++                    .decode_endpoint()
+                     .ok_or_else(|| anyhow!("destination activation has no worker for {uuid}"))?;
++                let worker_idx = endpoint.scheduler_id;
+                 if self.decode_engine.worker_is_busy(worker_idx)? {
+                     return Ok(ActionExecution::Deferred {
+                         action: issued,
+@@ -1540,10 +1551,11 @@ where
+                 )?;
+             }
+             HandoffAction::ReleaseSource { handoff_id } => {
+-                let worker_idx = self
++                let endpoint = self
+                     .state(uuid)?
+-                    .prefill_worker_idx()
++                    .prefill_endpoint()
+                     .ok_or_else(|| anyhow!("source release has no worker for {uuid}"))?;
++                let worker_idx = endpoint.scheduler_id;
+                 if self.prefill_engine.worker_is_busy(worker_idx)? {
+                     return Ok(ActionExecution::Deferred {
+                         action: issued,
+@@ -1575,11 +1587,12 @@ where
+                 )?;
+             }
+             HandoffAction::CancelSource { handoff_id } => {
+-                let Some(worker_idx) = self.state(uuid)?.prefill_worker_idx() else {
++                let Some(endpoint) = self.state(uuid)?.prefill_endpoint() else {
+                     self.cancel_prefill_route(uuid)?;
+                     self.acknowledge_action(uuid, issued, HandoffActionOutcome::Noop)?;
+                     return Ok(ActionExecution::Applied);
+                 };
++                let worker_idx = endpoint.scheduler_id;
+                 if self.prefill_engine.worker_is_busy(worker_idx)? {
+                     return Ok(ActionExecution::Deferred {
+                         action: issued,
+@@ -1599,11 +1612,12 @@ where
+                 self.process_lifecycle_events(effects.lifecycle_events)?;
+             }
+             HandoffAction::CancelDestination { handoff_id } => {
+-                let Some(worker_idx) = self.state(uuid)?.decode_worker_idx() else {
++                let Some(endpoint) = self.state(uuid)?.decode_endpoint() else {
+                     self.cancel_decode_route(uuid)?;
+                     self.acknowledge_action(uuid, issued, HandoffActionOutcome::Noop)?;
+                     return Ok(ActionExecution::Applied);
+                 };
++                let worker_idx = endpoint.scheduler_id;
+                 if self.decode_engine.worker_is_busy(worker_idx)? {
+                     return Ok(ActionExecution::Deferred {
+                         action: issued,
+diff --git a/lib/mocker/src/replay/offline/disagg_tests.rs b/lib/mocker/src/replay/offline/disagg_tests.rs
+index 0dcc13f533..852540115e 100644
+--- a/lib/mocker/src/replay/offline/disagg_tests.rs
++++ b/lib/mocker/src/replay/offline/disagg_tests.rs
+@@ -579,16 +579,76 @@ fn test_prefill_and_decode_use_separate_worker_pools(#[case] router_mode: Replay
+         assert!(stats.decode_assignments.contains_key(&uuid));
+         assert_eq!(stats.request_snapshots[&uuid].phase, DisaggPhase::Done);
+         assert_eq!(
+-            stats.request_snapshots[&uuid].prefill_worker_idx,
++            stats.request_snapshots[&uuid].prefill_endpoint,
+             Some(stats.prefill_assignments[&uuid])
+         );
+         assert_eq!(
+-            stats.request_snapshots[&uuid].decode_worker_idx,
++            stats.request_snapshots[&uuid].decode_endpoint,
+             Some(stats.decode_assignments[&uuid])
+         );
+     }
+ }
+ 
++#[rstest::rstest]
++#[case(EngineType::Vllm)]
++#[case(EngineType::Sglang)]
++fn asymmetric_attention_dp_round_robin_preserves_ranked_handoff_identity(
++    #[case] engine_type: EngineType,
++) {
++    let mut config = match engine_type {
++        EngineType::Vllm => disagg_config(),
++        EngineType::Sglang => sglang_disagg_config(),
++        EngineType::Trtllm => unreachable!(),
++    };
++    config.num_prefill_workers = 1;
++    config.num_decode_workers = 1;
++    config.prefill_args.dp_size = 2;
++    config.decode_args.dp_size = 4;
++    config.prefill_args.kv_transfer_bandwidth = Some(1.0);
++    config.prefill_args.kv_bytes_per_token = Some(1_000_000);
++
++    let requests = (0..8)
++        .map(|index| request(index + 1, 64, 2, index as f64 * 1_000.0))
++        .collect();
++    let mut records =
++        run_trace_with_details(&config, requests, None, ReplayRouterMode::RoundRobin).per_request;
++    records.sort_by(|left, right| left.arrival_time_ms.total_cmp(&right.arrival_time_ms));
++
++    assert_eq!(records.len(), 8);
++    for (index, record) in records.iter().enumerate() {
++        let prefill = record
++            .routing_history
++            .iter()
++            .find(|route| route.pool == ReplayRequestPool::Prefill)
++            .expect("request must retain its ranked prefill route");
++        assert_eq!(prefill.logical_worker_id, Some(0));
++        assert_eq!(prefill.scheduler_id, Some(index % 2));
++        assert_eq!(prefill.dp_rank, Some((index % 2) as u32));
++
++        let decode = record
++            .routing_history
++            .iter()
++            .find(|route| route.pool == ReplayRequestPool::Decode)
++            .expect("request must retain its ranked decode route");
++        assert_eq!(decode.logical_worker_id, Some(0));
++        assert_eq!(decode.scheduler_id, Some(index % 4));
++        assert_eq!(decode.dp_rank, Some((index % 4) as u32));
++
++        assert_eq!(record.prefill_worker_idx, Some(0));
++        assert_eq!(record.decode_worker_idx, Some(0));
++        let transfer_started_ms = record
++            .source_held_ms
++            .unwrap()
++            .max(record.destination_reserved_ms.unwrap());
++        let transfer_ms = record.destination_activated_ms.unwrap() - transfer_started_ms;
++        assert!(
++            (transfer_ms - 64.0).abs() < 1e-6,
++            "{engine_type:?} request {index} charged {transfer_ms}ms instead of 64ms"
++        );
++        assert_eq!(record.terminal_status, ReplayTerminalStatus::Completed);
++    }
++}
++
+ #[test]
+ fn source_cleanup_events_restore_prefill_prefix_routing() {
+     let requests = vec![request(1, 128, 2, 0.0), request(2, 128, 2, 100.0)];
+@@ -1461,7 +1521,14 @@ fn pending_destination_booking_survives_scale_down_until_cleanup() {
+             .transition_log
+             .contains(&DisaggTransition::DestinationReserved { uuid: pending })
+     );
+-    assert_eq!(runtime.state(pending).unwrap().decode_worker_idx(), Some(0));
++    assert_eq!(
++        runtime
++            .state(pending)
++            .unwrap()
++            .decode_endpoint()
++            .map(|endpoint| endpoint.scheduler_id),
++        Some(0)
++    );
+     let before = runtime.decode_placement.debug_snapshot(runtime.now_ms());
+     assert!(
+         before
+@@ -1473,7 +1540,14 @@ fn pending_destination_booking_survives_scale_down_until_cleanup() {
+     runtime.apply_scaling(1, 0).unwrap();
+     assert_eq!(runtime.active_decode_count(), 0);
+     assert_eq!(runtime.total_decode_count(), 1);
+-    assert_eq!(runtime.state(pending).unwrap().decode_worker_idx(), Some(0));
++    assert_eq!(
++        runtime
++            .state(pending)
++            .unwrap()
++            .decode_endpoint()
++            .map(|endpoint| endpoint.scheduler_id),
++        Some(0)
++    );
+ 
+     let handoff_id = runtime.state(pending).unwrap().handoff_id;
+     runtime
+@@ -1521,7 +1595,10 @@ fn test_apply_scaling_drains_prefill_router_pending_immediately() {
+         runtime.state(Uuid::from_u128(2)).unwrap().phase,
+         DisaggPhase::RunningPrefill
+     );
+-    assert_eq!(runtime.stats.prefill_assignments[&Uuid::from_u128(2)], 1);
++    assert_eq!(
++        runtime.stats.prefill_assignments[&Uuid::from_u128(2)].scheduler_id,
++        1
++    );
+ }
+ 
+ #[test]
+diff --git a/lib/mocker/src/replay/offline/state.rs b/lib/mocker/src/replay/offline/state.rs
+index 52c59345c2..c184aad991 100644
+--- a/lib/mocker/src/replay/offline/state.rs
++++ b/lib/mocker/src/replay/offline/state.rs
+@@ -77,6 +77,14 @@ pub(crate) enum DisaggPhase {
+     Done,
+ }
+ 
++/// Stable pool-local scheduler identity for one side of a disaggregated handoff.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) struct DisaggEndpoint {
++    pub(crate) scheduler_id: usize,
++    pub(crate) logical_worker_id: usize,
++    pub(crate) dp_rank: u32,
++}
++
+ pub(crate) struct DisaggRequestState {
+     original: Option<ReplayRequestPayload>,
+     session_id: Option<String>,
+@@ -87,8 +95,8 @@ pub(crate) struct DisaggRequestState {
+     pub(in crate::replay::offline) coordinator: HandoffCoordinatorCore,
+     pub(in crate::replay::offline) counted_in_flight: bool,
+     replay_hashes: Option<ReplayRequestHashes>,
+-    prefill_worker_idx: Option<usize>,
+-    decode_worker_idx: Option<usize>,
++    prefill_endpoint: Option<DisaggEndpoint>,
++    decode_endpoint: Option<DisaggEndpoint>,
+     pub(in crate::replay::offline) prefill_routed: bool,
+     pub(in crate::replay::offline) destination_routed: bool,
+     pub(in crate::replay::offline) pending_prefill_action: Option<IssuedHandoffAction>,
+@@ -100,8 +108,8 @@ pub(crate) struct DisaggRequestState {
+ pub(crate) struct DisaggRequestSnapshot {
+     pub(crate) arrival_ms: f64,
+     pub(crate) phase: DisaggPhase,
+-    pub(crate) prefill_worker_idx: Option<usize>,
+-    pub(crate) decode_worker_idx: Option<usize>,
++    pub(crate) prefill_endpoint: Option<DisaggEndpoint>,
++    pub(crate) decode_endpoint: Option<DisaggEndpoint>,
+ }
+ 
+ impl DisaggRequestState {
+@@ -128,8 +136,8 @@ impl DisaggRequestState {
+             coordinator: HandoffCoordinatorCore::new(handoff_id, order),
+             counted_in_flight: true,
+             replay_hashes,
+-            prefill_worker_idx: None,
+-            decode_worker_idx: None,
++            prefill_endpoint: None,
++            decode_endpoint: None,
+             prefill_routed: false,
+             destination_routed: false,
+             pending_prefill_action: None,
+@@ -191,25 +199,25 @@ impl DisaggRequestState {
+         self.replay_hashes.take()
+     }
+ 
+-    pub(crate) fn start_prefill(&mut self, worker_idx: usize) {
++    pub(crate) fn start_prefill(&mut self, endpoint: DisaggEndpoint) {
+         self.phase = DisaggPhase::RunningPrefill;
+-        self.prefill_worker_idx = Some(worker_idx);
++        self.prefill_endpoint = Some(endpoint);
+     }
+ 
+-    pub(crate) fn prefill_worker_idx(&self) -> Option<usize> {
+-        self.prefill_worker_idx
++    pub(crate) fn prefill_endpoint(&self) -> Option<DisaggEndpoint> {
++        self.prefill_endpoint
+     }
+ 
+     pub(crate) fn await_destination(&mut self) {
+         self.phase = DisaggPhase::AwaitingDestination;
+     }
+ 
+-    pub(crate) fn assign_decode(&mut self, worker_idx: usize) {
+-        self.decode_worker_idx = Some(worker_idx);
++    pub(crate) fn assign_decode(&mut self, endpoint: DisaggEndpoint) {
++        self.decode_endpoint = Some(endpoint);
+     }
+ 
+-    pub(crate) fn decode_worker_idx(&self) -> Option<usize> {
+-        self.decode_worker_idx
++    pub(crate) fn decode_endpoint(&self) -> Option<DisaggEndpoint> {
++        self.decode_endpoint
+     }
+ 
+     pub(crate) fn transfer_pending(&mut self) {
+@@ -241,8 +249,8 @@ impl DisaggRequestState {
+         DisaggRequestSnapshot {
+             arrival_ms: self.arrival_ms,
+             phase: self.phase,
+-            prefill_worker_idx: self.prefill_worker_idx,
+-            decode_worker_idx: self.decode_worker_idx,
++            prefill_endpoint: self.prefill_endpoint,
++            decode_endpoint: self.decode_endpoint,
+         }
+     }
+ }
+@@ -265,6 +273,7 @@ pub(crate) struct OfflineWorkerSnapshot {
+ }
+ 
+ impl OfflineWorkerState {
++    #[cfg(test)]
+     pub(crate) fn new(worker_idx: usize, args: MockEngineArgs, capture_kv_events: bool) -> Self {
+         Self::new_with_rank(worker_idx, worker_idx as u64, 0, args, capture_kv_events)
+     }
+diff --git a/lib/mocker/src/replay/validate.rs b/lib/mocker/src/replay/validate.rs
+index cf0f2a0eb5..771a0a5b06 100644
+--- a/lib/mocker/src/replay/validate.rs
++++ b/lib/mocker/src/replay/validate.rs
+@@ -140,7 +140,12 @@ fn validate_online_kv_offload(args: &MockEngineArgs) -> Result<()> {
+     Ok(())
+ }
+ 
+-fn validate_disagg_args(config: &OfflineDisaggReplayConfig, mode: &str) -> Result<()> {
++fn validate_disagg_args(
++    config: &OfflineDisaggReplayConfig,
++    mode: &str,
++    router_mode: ReplayRouterMode,
++    scaling_enabled: bool,
++) -> Result<()> {
+     if config.prefill_args.engine_type == EngineType::Trtllm
+         || config.decode_args.engine_type == EngineType::Trtllm
+     {
+@@ -171,13 +176,12 @@ fn validate_disagg_args(config: &OfflineDisaggReplayConfig, mode: &str) -> Resul
+             config.decode_args.worker_type,
+         );
+     }
+-    if config.prefill_args.dp_size != 1 || config.decode_args.dp_size != 1 {
+-        bail!(
+-            "offline disaggregated replay does not support attention DP; prefill/decode dp_size \
+-             must both be 1 (got prefill_dp_size={}, decode_dp_size={})",
+-            config.prefill_args.dp_size,
+-            config.decode_args.dp_size,
+-        );
++    let attention_dp_enabled = config.prefill_args.dp_size > 1 || config.decode_args.dp_size > 1;
++    if attention_dp_enabled && router_mode != ReplayRouterMode::RoundRobin {
++        bail!("offline disaggregated attention DP only supports router_mode=round_robin");
++    }
++    if attention_dp_enabled && scaling_enabled {
++        bail!("offline disaggregated attention DP does not support scaling_policy");
+     }
+     if config.prefill_args.block_size != config.decode_args.block_size {
+         bail!(
+@@ -192,20 +196,22 @@ fn validate_disagg_args(config: &OfflineDisaggReplayConfig, mode: &str) -> Resul
+ 
+ pub(super) fn validate_offline_disagg_replay_args(
+     config: &OfflineDisaggReplayConfig,
+-    _router_mode: ReplayRouterMode,
++    router_mode: ReplayRouterMode,
++    scaling_enabled: bool,
+ ) -> Result<()> {
+-    validate_disagg_args(config, "trace replay")
++    validate_disagg_args(config, "trace replay", router_mode, scaling_enabled)
+ }
+ 
+ pub(super) fn validate_offline_disagg_concurrency_args(
+     config: &OfflineDisaggReplayConfig,
+     max_in_flight: usize,
+-    _router_mode: ReplayRouterMode,
++    router_mode: ReplayRouterMode,
++    scaling_enabled: bool,
+ ) -> Result<()> {
+     if max_in_flight == 0 {
+         bail!("concurrency replay requires max_in_flight >= 1");
+     }
+-    validate_disagg_args(config, "concurrency replay")
++    validate_disagg_args(config, "concurrency replay", router_mode, scaling_enabled)
+ }
+ 
+ #[cfg(test)]
+@@ -239,8 +245,9 @@ mod tests {
+             config(EngineType::Trtllm, EngineType::Vllm),
+             config(EngineType::Vllm, EngineType::Trtllm),
+         ] {
+-            let error = validate_offline_disagg_replay_args(&config, ReplayRouterMode::RoundRobin)
+-                .unwrap_err();
++            let error =
++                validate_offline_disagg_replay_args(&config, ReplayRouterMode::RoundRobin, false)
++                    .unwrap_err();
+             assert!(error.to_string().contains("does not support TRT-LLM"));
+         }
+     }
+@@ -251,36 +258,59 @@ mod tests {
+             config(EngineType::Vllm, EngineType::Sglang),
+             config(EngineType::Sglang, EngineType::Vllm),
+         ] {
+-            let error = validate_offline_disagg_replay_args(&config, ReplayRouterMode::RoundRobin)
+-                .unwrap_err();
++            let error =
++                validate_offline_disagg_replay_args(&config, ReplayRouterMode::RoundRobin, false)
++                    .unwrap_err();
+             assert!(error.to_string().contains("matching prefill/decode"));
+         }
+     }
+ 
+     #[test]
+-    fn disagg_rejects_attention_dp_with_clear_error() {
++    fn disagg_attention_dp_accepts_fixed_round_robin_topologies() {
+         for (prefill_dp_size, decode_dp_size) in [(2, 1), (1, 2), (2, 4)] {
+             let mut config = config(EngineType::Vllm, EngineType::Vllm);
+             config.prefill_args.dp_size = prefill_dp_size;
+             config.decode_args.dp_size = decode_dp_size;
+-            let expected = format!(
+-                "offline disaggregated replay does not support attention DP; prefill/decode \
+-                 dp_size must both be 1 (got prefill_dp_size={prefill_dp_size}, \
+-                 decode_dp_size={decode_dp_size})"
+-            );
+-
+-            let trace_error =
+-                validate_offline_disagg_replay_args(&config, ReplayRouterMode::RoundRobin)
+-                    .unwrap_err();
+-            assert_eq!(trace_error.to_string(), expected);
+ 
+-            let concurrency_error =
+-                validate_offline_disagg_concurrency_args(&config, 1, ReplayRouterMode::RoundRobin)
+-                    .unwrap_err();
+-            assert_eq!(concurrency_error.to_string(), expected);
++            validate_offline_disagg_replay_args(&config, ReplayRouterMode::RoundRobin, false)
++                .unwrap();
++            validate_offline_disagg_concurrency_args(
++                &config,
++                1,
++                ReplayRouterMode::RoundRobin,
++                false,
++            )
++            .unwrap();
+         }
+     }
+ 
++    #[test]
++    fn disagg_attention_dp_rejects_kv_router_and_scaling() {
++        let mut config = config(EngineType::Vllm, EngineType::Vllm);
++        config.prefill_args.dp_size = 2;
++        config.decode_args.dp_size = 4;
++
++        let router_error =
++            validate_offline_disagg_replay_args(&config, ReplayRouterMode::KvRouter, false)
++                .unwrap_err();
++        assert_eq!(
++            router_error.to_string(),
++            "offline disaggregated attention DP only supports router_mode=round_robin"
++        );
++
++        let scaling_error = validate_offline_disagg_concurrency_args(
++            &config,
++            1,
++            ReplayRouterMode::RoundRobin,
++            true,
++        )
++        .unwrap_err();
++        assert_eq!(
++            scaling_error.to_string(),
++            "offline disaggregated attention DP does not support scaling_policy"
++        );
++    }
++
+     #[test]
+     fn offline_kv_router_accepts_one_worker_with_multiple_dp_ranks() {
+         let mut args = args(EngineType::Vllm, WorkerType::Aggregated);
+

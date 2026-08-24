@@ -140,7 +140,12 @@ fn validate_online_kv_offload(args: &MockEngineArgs) -> Result<()> {
     Ok(())
 }
 
-fn validate_disagg_args(config: &OfflineDisaggReplayConfig, mode: &str) -> Result<()> {
+fn validate_disagg_args(
+    config: &OfflineDisaggReplayConfig,
+    mode: &str,
+    router_mode: ReplayRouterMode,
+    scaling_enabled: bool,
+) -> Result<()> {
     if config.prefill_args.engine_type == EngineType::Trtllm
         || config.decode_args.engine_type == EngineType::Trtllm
     {
@@ -171,13 +176,12 @@ fn validate_disagg_args(config: &OfflineDisaggReplayConfig, mode: &str) -> Resul
             config.decode_args.worker_type,
         );
     }
-    if config.prefill_args.dp_size != 1 || config.decode_args.dp_size != 1 {
-        bail!(
-            "offline disaggregated replay does not support attention DP; prefill/decode dp_size \
-             must both be 1 (got prefill_dp_size={}, decode_dp_size={})",
-            config.prefill_args.dp_size,
-            config.decode_args.dp_size,
-        );
+    let attention_dp_enabled = config.prefill_args.dp_size > 1 || config.decode_args.dp_size > 1;
+    if attention_dp_enabled && router_mode != ReplayRouterMode::RoundRobin {
+        bail!("offline disaggregated attention DP only supports router_mode=round_robin");
+    }
+    if attention_dp_enabled && scaling_enabled {
+        bail!("offline disaggregated attention DP does not support scaling_policy");
     }
     if config.prefill_args.block_size != config.decode_args.block_size {
         bail!(
@@ -192,20 +196,22 @@ fn validate_disagg_args(config: &OfflineDisaggReplayConfig, mode: &str) -> Resul
 
 pub(super) fn validate_offline_disagg_replay_args(
     config: &OfflineDisaggReplayConfig,
-    _router_mode: ReplayRouterMode,
+    router_mode: ReplayRouterMode,
+    scaling_enabled: bool,
 ) -> Result<()> {
-    validate_disagg_args(config, "trace replay")
+    validate_disagg_args(config, "trace replay", router_mode, scaling_enabled)
 }
 
 pub(super) fn validate_offline_disagg_concurrency_args(
     config: &OfflineDisaggReplayConfig,
     max_in_flight: usize,
-    _router_mode: ReplayRouterMode,
+    router_mode: ReplayRouterMode,
+    scaling_enabled: bool,
 ) -> Result<()> {
     if max_in_flight == 0 {
         bail!("concurrency replay requires max_in_flight >= 1");
     }
-    validate_disagg_args(config, "concurrency replay")
+    validate_disagg_args(config, "concurrency replay", router_mode, scaling_enabled)
 }
 
 #[cfg(test)]
@@ -239,8 +245,9 @@ mod tests {
             config(EngineType::Trtllm, EngineType::Vllm),
             config(EngineType::Vllm, EngineType::Trtllm),
         ] {
-            let error = validate_offline_disagg_replay_args(&config, ReplayRouterMode::RoundRobin)
-                .unwrap_err();
+            let error =
+                validate_offline_disagg_replay_args(&config, ReplayRouterMode::RoundRobin, false)
+                    .unwrap_err();
             assert!(error.to_string().contains("does not support TRT-LLM"));
         }
     }
@@ -251,34 +258,57 @@ mod tests {
             config(EngineType::Vllm, EngineType::Sglang),
             config(EngineType::Sglang, EngineType::Vllm),
         ] {
-            let error = validate_offline_disagg_replay_args(&config, ReplayRouterMode::RoundRobin)
-                .unwrap_err();
+            let error =
+                validate_offline_disagg_replay_args(&config, ReplayRouterMode::RoundRobin, false)
+                    .unwrap_err();
             assert!(error.to_string().contains("matching prefill/decode"));
         }
     }
 
     #[test]
-    fn disagg_rejects_attention_dp_with_clear_error() {
+    fn disagg_attention_dp_accepts_fixed_round_robin_topologies() {
         for (prefill_dp_size, decode_dp_size) in [(2, 1), (1, 2), (2, 4)] {
             let mut config = config(EngineType::Vllm, EngineType::Vllm);
             config.prefill_args.dp_size = prefill_dp_size;
             config.decode_args.dp_size = decode_dp_size;
-            let expected = format!(
-                "offline disaggregated replay does not support attention DP; prefill/decode \
-                 dp_size must both be 1 (got prefill_dp_size={prefill_dp_size}, \
-                 decode_dp_size={decode_dp_size})"
-            );
 
-            let trace_error =
-                validate_offline_disagg_replay_args(&config, ReplayRouterMode::RoundRobin)
-                    .unwrap_err();
-            assert_eq!(trace_error.to_string(), expected);
-
-            let concurrency_error =
-                validate_offline_disagg_concurrency_args(&config, 1, ReplayRouterMode::RoundRobin)
-                    .unwrap_err();
-            assert_eq!(concurrency_error.to_string(), expected);
+            validate_offline_disagg_replay_args(&config, ReplayRouterMode::RoundRobin, false)
+                .unwrap();
+            validate_offline_disagg_concurrency_args(
+                &config,
+                1,
+                ReplayRouterMode::RoundRobin,
+                false,
+            )
+            .unwrap();
         }
+    }
+
+    #[test]
+    fn disagg_attention_dp_rejects_kv_router_and_scaling() {
+        let mut config = config(EngineType::Vllm, EngineType::Vllm);
+        config.prefill_args.dp_size = 2;
+        config.decode_args.dp_size = 4;
+
+        let router_error =
+            validate_offline_disagg_replay_args(&config, ReplayRouterMode::KvRouter, false)
+                .unwrap_err();
+        assert_eq!(
+            router_error.to_string(),
+            "offline disaggregated attention DP only supports router_mode=round_robin"
+        );
+
+        let scaling_error = validate_offline_disagg_concurrency_args(
+            &config,
+            1,
+            ReplayRouterMode::RoundRobin,
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(
+            scaling_error.to_string(),
+            "offline disaggregated attention DP does not support scaling_policy"
+        );
     }
 
     #[test]

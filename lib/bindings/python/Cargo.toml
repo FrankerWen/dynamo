@@ -60,7 +60,7 @@ request-trace-s3 = ["dynamo-llm/request-trace-s3"]
 # own interpreter is used; AicEngineBuilder::build() crosses into Python once at
 # startup while AicEngine::{prefill,decode}_latency_ms() are pure Rust (no GIL)
 # on the predict hot path.
-aiconfigurator-core = { version = "=0.11.0-dev20260728", optional = true }
+aiconfigurator-core = { path = "../../../../aiconfigurator_analytical_1_1/aic-core/rust/aiconfigurator-core", optional = true }
 dynamo-runtime = { path = "../../runtime" }
 dynamo-mocker = { path = "../../mocker" }
 dynamo-parsers = { version = "7.0.1" }

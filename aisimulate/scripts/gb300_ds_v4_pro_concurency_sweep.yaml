@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Fixed-concurrency inner Sweeper template. The companion Python script replaces
+# workload.concurrency for each outer load point before starting an independent study.
+search_space:
+  deployment_mode: [disagg, agg]
+  model_name: deepseek-ai/DeepSeek-V4-Pro
+  hardware_sku: gb300
+  gpu_budget: 72
+  backend: [vllm]
+adapters:
+  dynamo.router:
+    search_space:
+      mode: [round_robin]
+workload:
+  isl: 8192
+  osl: 1024
+  concurrency: 1          # outer script replaces this value
+  num_request_ratio: 1    # request count equals the concrete concurrency
+goal:
+  # Available goals include throughput, latency, goodput, and pareto.
+  # target: goodput_per_gpu
+  # SLA is required for goodput objectives.
+
+  target: pareto
+  pareto_objectives: [throughput_per_gpu, throughput_per_user]
+  # Replay records SLA/goodput diagnostics; these two Pareto objectives are not
+  # themselves SLA filters.
+  sla:
+    ttft_ms: 5000     # 首字延迟 SLA (ms)
+    itl_ms: 50        # Token 间延迟 SLA (ms)
+sweep:
+  max_rounds: 10
+  parallel_evals: 8
+  candidates_per_round: 8
+
+# Run the outer scan from the Dynamo repository root:
+#   python aisimulate/scripts/run_gb300_ds_v4_pro_concurrency_sweep.py \
+#     --max-total-parallel-evals 32 --resume
+# --resume reuses complete concurrency points and resumes incomplete points from
+# their last committed inner round.
+#
+# The outer load points are:
+#   [1, 8, 32, 64, 256, 512, 1024, 4096, 8192]

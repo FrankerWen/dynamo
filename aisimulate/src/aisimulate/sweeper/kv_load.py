@@ -40,6 +40,12 @@ def _per_rank_capacity_tokens(
     max_batch_size: int,
     memory_fraction: float,
     nextn: int,
+    database_mode: str,
+    gemm_dtype: str | None,
+    moe_dtype: str | None,
+    fmha_dtype: str | None,
+    kv_cache_dtype: str | None,
+    comm_dtype: str | None,
 ) -> int:
     tokens = estimate_kv_tokens(
         shape,
@@ -51,6 +57,12 @@ def _per_rank_capacity_tokens(
         max_batch_size=max_batch_size,
         memory_fraction=memory_fraction,
         nextn=nextn,
+        database_mode=database_mode,
+        gemm_dtype=gemm_dtype,
+        moe_dtype=moe_dtype,
+        fmha_dtype=fmha_dtype,
+        kv_cache_dtype=kv_cache_dtype,
+        comm_dtype=comm_dtype,
     )
     if tokens is None:
         raise InfeasibleKVCapacity(
@@ -83,6 +95,12 @@ def _role_capacity_tokens(
         max_batch_size=int(sample[f"{role}_max_num_seqs"]),
         memory_fraction=float(sample[f"{role}_gpu_memory_utilization"]),
         nextn=int(sample.get("aic_nextn") or 0),
+        database_mode=str(sample.get("database_mode", "SILICON")),
+        gemm_dtype=sample.get("aic_gemm_dtype"),
+        moe_dtype=sample.get("aic_moe_dtype"),
+        fmha_dtype=sample.get("aic_fmha_dtype"),
+        kv_cache_dtype=sample.get("aic_kv_cache_dtype"),
+        comm_dtype=sample.get("aic_comm_dtype"),
     )
     # Dynamo's AIC estimator returns per-rank blocks. Offline replay models one
     # engine-wide KV pool, so attention-DP ranks contribute independent capacity;

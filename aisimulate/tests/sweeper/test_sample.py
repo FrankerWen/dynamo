@@ -113,6 +113,33 @@ def test_disagg_unroll_preserves_both_roles():
     assert "agg_max_num_seqs" not in sample
 
 
+def test_disagg_unroll_preserves_pinned_pd_transfer_identity():
+    selection = _agg_selection(
+        deployment_mode="disagg",
+        prefill_max_num_batched_tokens=16384,
+        prefill_max_num_seqs=4,
+        decode_max_num_batched_tokens=8192,
+        decode_max_num_seqs=512,
+    )
+    sample = unroll_sample(
+        search_space=_space(
+            deployment_mode=["disagg"],
+            pd_transfer={
+                "kv_bytes_per_token": 131_072,
+                "bandwidth_gb_s": 64.0,
+            },
+        ),
+        selection=selection,
+        parallel_config=DISAGG_CONFIG,
+    )
+
+    assert sample["pd_transfer"] == {
+        "kv_bytes_per_token": 131_072,
+        "bandwidth_gb_s": 64.0,
+        "timing_mode": "full_prompt",
+    }
+
+
 def test_unroll_folds_only_backend_pinned_values():
     sample = unroll_sample(
         search_space=_space(
@@ -138,6 +165,42 @@ def test_unroll_folds_only_backend_pinned_values():
     assert sample["agg_gpu_memory_utilization"] == 0.8
     assert sample["agg_enable_prefix_caching"] is False
     assert not any(key.startswith(("planner_", "router_")) for key in sample)
+
+
+def test_unroll_preserves_analytical_identity():
+    sample = unroll_sample(
+        search_space=_space(
+            database_mode="ANALYTICAL",
+            analytical_config={"level": "high", "attention_algorithm": "fa3"},
+            aic_gemm_dtype="fp8_block",
+            aic_moe_dtype="nvfp4",
+            aic_fmha_dtype="bfloat16",
+            aic_kv_cache_dtype="fp8",
+            aic_comm_dtype="half",
+        ),
+        selection=_agg_selection(),
+        parallel_config=AGG_CONFIG,
+    )
+
+    assert sample["database_mode"] == "ANALYTICAL"
+    assert sample["analytical_config"]["level"] == "high"
+    assert sample["analytical_config"]["attention_algorithm"] == "fa3"
+    assert {
+        field: sample[field]
+        for field in (
+            "aic_gemm_dtype",
+            "aic_moe_dtype",
+            "aic_fmha_dtype",
+            "aic_kv_cache_dtype",
+            "aic_comm_dtype",
+        )
+    } == {
+        "aic_gemm_dtype": "fp8_block",
+        "aic_moe_dtype": "nvfp4",
+        "aic_fmha_dtype": "bfloat16",
+        "aic_kv_cache_dtype": "fp8",
+        "aic_comm_dtype": "half",
+    }
 
 
 @pytest.mark.parametrize(

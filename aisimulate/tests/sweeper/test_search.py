@@ -8,7 +8,15 @@ from pathlib import Path
 import pytest
 
 import aisimulate.sweeper.search as search_mod
-from aisimulate.sweeper.config import OptimizationGoal, SmartSearchConfig
+from aisimulate.sweeper.checkpoint import (
+    SamplerObservation,
+    SweepRoundCheckpoint,
+)
+from aisimulate.sweeper.config import (
+    LoadSweepResult,
+    OptimizationGoal,
+    SmartSearchConfig,
+)
 from aisimulate.sweeper.kv_load import KVLoadResolution
 from aisimulate.sweeper.parallel_enum import ParallelShape, ReplicaParallelConfig
 from aisimulate.sweeper.replay import (
@@ -92,6 +100,45 @@ class _FakeSampler:
 
     def observe_infeasible(self, suggestion, reason):
         self.scored.append(("infeasible", reason))
+
+
+class _CheckpointSampler(_FakeSampler):
+    """Deterministic sampler with serializable ask/tell history."""
+
+    def __init__(self, branch, study_id, objectives=None):
+        super().__init__(branch, study_id, objectives)
+        self.next_index = 0
+
+    def suggest(self, count):
+        suggestions = []
+        for _ in range(count):
+            index = self.next_index
+            self.next_index += 1
+            selection = _selection(256 * (index + 1))
+            suggestions.append(
+                Suggestion(
+                    selection=selection,
+                    parallel_config=self.branch.parallel_configs[0],
+                    handle={"index": index},
+                )
+            )
+        return suggestions
+
+    def checkpoint_observation(
+        self,
+        suggestion,
+        *,
+        metrics=None,
+        infeasible_reason=None,
+    ):
+        return SamplerObservation(
+            parameters=dict(suggestion.handle),
+            metrics=metrics,
+            infeasible_reason=infeasible_reason,
+        )
+
+    def restore_observations(self, observations):
+        self.next_index = len(observations)
 
 
 class _FakeRunner:
@@ -179,6 +226,36 @@ def test_ranks_feasible_best_first_and_passes_replay_specs(monkeypatch):
     assert factory.worker_ids == [0]
     assert all(isinstance(spec, ReplaySpec) for spec in factory.runner.specs)
     assert factory.runner.closed
+
+
+def test_analytical_mode_is_forwarded_to_backend_version_resolution(monkeypatch):
+    branch = _branch(_pc())
+    monkeypatch.setattr(
+        search_mod,
+        "enumerate_branches",
+        lambda config, *, max_seq_len=None, runner_capabilities=None: [branch],
+    )
+    calls = []
+
+    def _resolve(hardware, backend, *, database_mode):
+        calls.append((hardware, backend, database_mode))
+        return "estimate"
+
+    monkeypatch.setattr(search_mod, "resolve_backend_version", _resolve)
+    raw_config = _config().model_dump(mode="python")
+    raw_config["search_space"]["database_mode"] = "ANALYTICAL"
+    config = SmartSearchConfig.model_validate(raw_config)
+
+    candidates = _run_sweep(
+        config,
+        runner_factory=_FakeRunnerFactory(),
+        sampler_factory=_FakeSampler,
+        show_progress=False,
+    )
+
+    assert len(candidates) == 3
+    assert calls == [("gb200", "trtllm", "ANALYTICAL")] * 3
+    assert all(c.config["backend_version"] == "estimate" for c in candidates)
 
 
 def test_parallel_batch_uses_worker_sized_timeout_waves(monkeypatch):
@@ -539,6 +616,80 @@ def test_study_id_is_unique_per_run(monkeypatch):
     assert all(study_id.startswith("sweeper_agg_") for study_id in seen)
 
 
+def test_round_checkpoint_resumes_after_completed_barrier(monkeypatch, tmp_path):
+    branch = _branch(_pc())
+    _stub(monkeypatch, branch)
+    checkpoint_path = tmp_path / "round-checkpoint.json"
+    config = _config(
+        max_rounds=3,
+        candidates_per_round=2,
+        parallel_evals=1,
+    )
+    first_runner = _FakeRunner()
+    first_sweeper = Sweeper(
+        runner_factory=_FakeRunnerFactory(first_runner),
+        sampler_factory=_CheckpointSampler,
+        show_progress=False,
+    )
+
+    def stop_after_first_round(round_number, candidates):
+        assert round_number == 1
+        assert len(candidates) == 2
+        raise RuntimeError("intentional interruption")
+
+    with pytest.raises(RuntimeError, match="intentional interruption"):
+        first_sweeper.run(
+            config,
+            checkpoint_path=checkpoint_path,
+            on_round=stop_after_first_round,
+        )
+
+    interrupted = SweepRoundCheckpoint.model_validate_json(
+        checkpoint_path.read_text(encoding="utf-8")
+    )
+    assert interrupted.branches["agg"].completed_rounds == 1
+    assert len(interrupted.candidates) == 2
+    assert first_runner.calls == 2
+
+    resumed_runner = _FakeRunner()
+    resumed = Sweeper(
+        runner_factory=_FakeRunnerFactory(resumed_runner),
+        sampler_factory=_CheckpointSampler,
+        show_progress=False,
+    ).run(
+        config,
+        checkpoint_path=checkpoint_path,
+        resume_checkpoint=True,
+    )
+
+    completed = SweepRoundCheckpoint.model_validate_json(
+        checkpoint_path.read_text(encoding="utf-8")
+    )
+    assert completed.branches["agg"].completed_rounds == 3
+    assert len(completed.candidates) == 6
+    assert len(resumed) == 6
+    assert resumed_runner.calls == 4
+
+
+def test_round_checkpoint_rejects_config_drift(monkeypatch, tmp_path):
+    branch = _branch(_pc())
+    _stub(monkeypatch, branch)
+    checkpoint_path = tmp_path / "round-checkpoint.json"
+    sweeper = Sweeper(
+        runner_factory=_FakeRunnerFactory(),
+        sampler_factory=_CheckpointSampler,
+        show_progress=False,
+    )
+    sweeper.run(_config(), checkpoint_path=checkpoint_path)
+
+    with pytest.raises(ValueError, match="fingerprint mismatch"):
+        sweeper.run(
+            _config(gpu_budget=16),
+            checkpoint_path=checkpoint_path,
+            resume_checkpoint=True,
+        )
+
+
 def test_candidate_build_error_is_reported_not_raised(monkeypatch, capsys):
     branch = _branch(_pc())
     _stub(monkeypatch, branch)
@@ -807,3 +958,307 @@ def test_pareto_sweep_preserves_kv_load_and_returns_front(monkeypatch):
         set(metrics) == {"throughput_per_gpu", "throughput_per_user"}
         for metrics in seen["sampler"].observed
     )
+
+
+def _fixed_concurrency_config(
+    concurrency: int = 4,
+    *,
+    shared_prefix_ratio: float = 0.0,
+    num_prefix_groups: int = 0,
+    enable_prefix_caching: bool = True,
+) -> SmartSearchConfig:
+    return SmartSearchConfig(
+        search_space={
+            "model_name": "deepseek-ai/DeepSeek-V3",
+            "hardware_sku": "gb200",
+            "backend": ["trtllm"],
+            "deployment_mode": ["agg"],
+            "gpu_budget": 32,
+            "agg_enable_prefix_caching": enable_prefix_caching,
+        },
+        workload={
+            "isl": 1024,
+            "osl": 1024,
+            "concurrency": concurrency,
+            "num_request_ratio": 1,
+            "shared_prefix_ratio": shared_prefix_ratio,
+            "num_prefix_groups": num_prefix_groups,
+        },
+        sweep={"max_rounds": 1, "candidates_per_round": 1, "parallel_evals": 1},
+        goal={"target": "throughput"},
+    )
+
+
+def test_fixed_concurrency_materialization_uses_candidate_kv_capacity(monkeypatch):
+    config = _fixed_concurrency_config(concurrency=4)
+    selection = _selection(512)
+    seen = {}
+
+    monkeypatch.setattr(
+        search_mod, "resolve_backend_version", lambda hardware, backend: "1.3.0rc10"
+    )
+
+    def fake_resolve(sample, *, workload, parallel_config, ratio, backend_version):
+        seen.update(
+            sample=sample,
+            workload=workload,
+            parallel_config=parallel_config,
+            ratio=ratio,
+            backend_version=backend_version,
+        )
+        return KVLoadResolution(
+            ratio=ratio,
+            concurrency=8,
+            concurrency_capacity=8,
+            role_capacity_tokens={"agg": 12_288},
+        )
+
+    monkeypatch.setattr(search_mod, "resolve_kv_load", fake_resolve)
+    prepared, build_result = search_mod._materialize_one(
+        selection,
+        _pc(),
+        config=config,
+        goal=config.goal,
+        providers={},
+        provider_plans={},
+        runner_factory=_FakeRunnerFactory(),
+    )
+
+    assert build_result is None
+    assert prepared is not None
+    assert seen["sample"]["agg_max_num_batched_tokens"] == 8192
+    assert seen["sample"]["agg_max_num_seqs"] == 512
+    assert seen["ratio"] == 1.0
+    assert prepared.sample["concurrency"] == 4
+    assert prepared.sample["kv_load_concurrency_capacity"] == 8
+    assert prepared.sample["agg_kv_capacity_tokens"] == 12_288
+    assert prepared.sample["kv_load_capacity_screen_mode"] == "fixed_unshared"
+    assert "kv_load_ratio" not in prepared.sample
+    assert prepared.replay_spec.concurrency == 4
+
+
+def test_fixed_concurrency_no_kv_budget_is_infeasible(monkeypatch):
+    config = _fixed_concurrency_config(
+        concurrency=4,
+        shared_prefix_ratio=0.5,
+        num_prefix_groups=2,
+    )
+    monkeypatch.setattr(
+        search_mod, "resolve_backend_version", lambda hardware, backend: "1.3.0rc10"
+    )
+
+    def no_kv_budget(*args, **kwargs):
+        raise search_mod.InfeasibleKVCapacity(
+            "no KV budget for selected candidate engine knobs"
+        )
+
+    monkeypatch.setattr(search_mod, "resolve_kv_load", no_kv_budget)
+    prepared, build_result = search_mod._materialize_one(
+        _selection(1024),
+        _pc(),
+        config=config,
+        goal=config.goal,
+        providers={},
+        provider_plans={},
+        runner_factory=_FakeRunnerFactory(),
+    )
+
+    assert prepared is None
+    assert build_result is not None
+    candidate, metrics, outcome, reason = build_result
+    assert candidate is None
+    assert metrics is None
+    assert outcome == "infeasible"
+    assert reason == (
+        "candidate KV capacity infeasible: "
+        "no KV budget for selected candidate engine knobs"
+    )
+
+
+def test_fixed_concurrency_with_shared_prefix_defers_unshared_capacity_gate(
+    monkeypatch,
+):
+    config = _fixed_concurrency_config(
+        concurrency=4,
+        shared_prefix_ratio=0.5,
+        num_prefix_groups=2,
+    )
+    monkeypatch.setattr(
+        search_mod, "resolve_backend_version", lambda hardware, backend: "1.3.0rc10"
+    )
+    monkeypatch.setattr(
+        search_mod,
+        "resolve_kv_load",
+        lambda *args, **kwargs: KVLoadResolution(
+            ratio=1.0,
+            concurrency=3,
+            concurrency_capacity=3,
+            role_capacity_tokens={"agg": 4608},
+        ),
+    )
+
+    prepared, build_result = search_mod._materialize_one(
+        _selection(512),
+        _pc(),
+        config=config,
+        goal=config.goal,
+        providers={},
+        provider_plans={},
+        runner_factory=_FakeRunnerFactory(),
+    )
+
+    assert build_result is None
+    assert prepared is not None
+    assert prepared.sample["concurrency"] == 4
+    assert prepared.sample["kv_load_concurrency_capacity"] == 3
+    assert prepared.sample["kv_load_capacity_screen_mode"] == "fixed_prefix_deferred"
+
+
+def test_fixed_concurrency_prefix_without_cache_still_uses_unshared_gate(monkeypatch):
+    config = _fixed_concurrency_config(
+        concurrency=4,
+        shared_prefix_ratio=0.5,
+        num_prefix_groups=2,
+        enable_prefix_caching=False,
+    )
+    monkeypatch.setattr(
+        search_mod, "resolve_backend_version", lambda hardware, backend: "1.3.0rc10"
+    )
+    monkeypatch.setattr(
+        search_mod,
+        "resolve_kv_load",
+        lambda *args, **kwargs: KVLoadResolution(
+            ratio=1.0,
+            concurrency=3,
+            concurrency_capacity=3,
+            role_capacity_tokens={"agg": 4608},
+        ),
+    )
+
+    prepared, build_result = search_mod._materialize_one(
+        _selection(512),
+        _pc(),
+        config=config,
+        goal=config.goal,
+        providers={},
+        provider_plans={},
+        runner_factory=_FakeRunnerFactory(),
+    )
+
+    assert prepared is None
+    assert build_result is not None
+    assert build_result[2] == "infeasible"
+    assert "fixed concurrency 4 exceeds candidate KV concurrency capacity 3" in (
+        build_result[3]
+    )
+
+
+def test_fixed_concurrency_above_candidate_kv_capacity_is_infeasible(monkeypatch):
+    config = _fixed_concurrency_config(concurrency=4)
+    monkeypatch.setattr(
+        search_mod, "resolve_backend_version", lambda hardware, backend: "1.3.0rc10"
+    )
+    monkeypatch.setattr(
+        search_mod,
+        "resolve_kv_load",
+        lambda *args, **kwargs: KVLoadResolution(
+            ratio=1.0,
+            concurrency=3,
+            concurrency_capacity=3,
+            role_capacity_tokens={"agg": 4608},
+        ),
+    )
+
+    prepared, build_result = search_mod._materialize_one(
+        _selection(512),
+        _pc(),
+        config=config,
+        goal=config.goal,
+        providers={},
+        provider_plans={},
+        runner_factory=_FakeRunnerFactory(),
+    )
+
+    assert prepared is None
+    assert build_result is not None
+    candidate, metrics, outcome, reason = build_result
+    assert candidate is None
+    assert metrics is None
+    assert outcome == "infeasible"
+    assert "fixed concurrency 4 exceeds candidate KV concurrency capacity 3" in reason
+
+
+class _TraceLoadRunner(_FakeRunner):
+    points = {
+        0.5: (80.0, 50.0),
+        1.0: (100.0, 40.0),
+        2.0: (90.0, 30.0),
+    }
+
+    def run(self, spec):
+        self.calls += 1
+        self.specs.append(spec)
+        ratio = float(spec.workload["arrival_speedup_ratio"])
+        throughput, per_user = self.points[ratio]
+        return ReplayReport(
+            metrics={
+                "output_throughput_tok_s": throughput,
+                "mean_output_token_throughput_per_user": per_user,
+                "gpu_hours": 8.0,
+                "duration_ms": 3_600_000.0,
+            }
+        )
+
+
+def test_trace_load_sweep_runs_independent_fronts_and_global_envelope(monkeypatch):
+    branch = _branch(_pc())
+    _stub(monkeypatch, branch)
+    runner = _TraceLoadRunner()
+    config = SmartSearchConfig(
+        search_space={
+            "model_name": "deepseek-ai/DeepSeek-V3",
+            "hardware_sku": "gb200",
+            "backend": ["trtllm"],
+            "deployment_mode": ["agg"],
+            "gpu_budget": 32,
+        },
+        workload={"trace_path": TRACE},
+        load_sweep={
+            "axis": "arrival_speedup_ratio",
+            "values": [0.5, 1.0, 2.0],
+        },
+        sweep={"max_rounds": 1, "candidates_per_round": 1, "parallel_evals": 1},
+        goal={"target": "pareto"},
+    )
+
+    rounds = []
+    result = _run_sweep(
+        config,
+        runner_factory=_FakeRunnerFactory(runner),
+        sampler_factory=_FakeSampler,
+        show_progress=False,
+        on_round=lambda round_no, candidates: rounds.append(
+            (round_no, candidates[0].config["arrival_speedup_ratio"])
+        ),
+    )
+
+    assert isinstance(result, LoadSweepResult)
+    assert result.load_axis == "arrival_speedup_ratio"
+    assert [point.load_value for point in result.load_conditioned_pareto] == [
+        0.5,
+        1.0,
+        2.0,
+    ]
+    assert all(len(point.candidates) == 1 for point in result.load_conditioned_pareto)
+    assert {
+        point.candidates[0].config["arrival_speedup_ratio"]
+        for point in result.load_conditioned_pareto
+    } == {0.5, 1.0, 2.0}
+    assert {
+        candidate.config["arrival_speedup_ratio"]
+        for candidate in result.global_operating_envelope
+    } == {0.5, 1.0}
+    assert [
+        spec.workload["arrival_speedup_ratio"] for spec in runner.specs
+    ] == [0.5, 1.0, 2.0]
+    assert rounds == [(1, 0.5), (2, 1.0), (3, 2.0)]

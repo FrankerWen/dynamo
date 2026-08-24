@@ -46,8 +46,12 @@ def memory_fraction_kind(backend: str) -> str:
     return "of_free" if backend == "trtllm" else "of_total"
 
 
-def resolve_backend_version(hardware_sku: str, backend: str) -> str:
+def resolve_backend_version(
+    hardware_sku: str, backend: str, *, database_mode: str = "SILICON"
+) -> str:
     """Latest perf-DB version for the SKU/backend (required by the native estimate)."""
+    if database_mode.upper() == "ANALYTICAL":
+        return "estimate"
     version = get_latest_database_version(hardware_sku, backend)
     if version is None:
         raise NoPerfDatabase(
@@ -64,10 +68,16 @@ def estimate_kv_tokens(
     hardware_sku: str,
     backend: str,
     backend_version: str,
+    database_mode: str = "SILICON",
     max_num_tokens: int = DEFAULT_MAX_NUM_TOKENS,
     max_batch_size: int = DEFAULT_MAX_BATCH_SIZE,
     memory_fraction: float = DEFAULT_MEMORY_FRACTION,
     nextn: int = 0,
+    gemm_dtype: str | None = None,
+    moe_dtype: str | None = None,
+    fmha_dtype: str | None = None,
+    kv_cache_dtype: str | None = None,
+    comm_dtype: str | None = None,
 ) -> int | None:
     """Per-rank KV-cache capacity (in tokens) for ``shape``, or ``None`` when the
     shape leaves no KV budget (weights + activations already fill VRAM -> OOM).
@@ -80,6 +90,7 @@ def estimate_kv_tokens(
             hardware_sku,
             backend,
             backend_version=backend_version,
+            database_mode=database_mode,
             max_num_tokens=max_num_tokens,
             max_batch_size=max_batch_size,
             memory_fraction_kind=memory_fraction_kind(backend),
@@ -89,6 +100,11 @@ def estimate_kv_tokens(
             attention_dp_size=shape.dp,
             moe_tp_size=shape.moe_tp,
             moe_ep_size=shape.moe_ep,
+            gemm_quant_mode=gemm_dtype,
+            moe_quant_mode=moe_dtype,
+            fmha_quant_mode=fmha_dtype,
+            kvcache_quant_mode=kv_cache_dtype,
+            comm_quant_mode=comm_dtype,
             nextn=nextn,
             allow_naive_fallback=False,
         )
@@ -114,9 +130,15 @@ def feasible_shape_tokens(
     backend: str,
     max_seq_len: int,
     backend_version: str | None = None,
+    database_mode: str = "SILICON",
     max_num_tokens: int = DEFAULT_MAX_NUM_TOKENS,
     max_batch_size: int = DEFAULT_MAX_BATCH_SIZE,
     memory_fraction: float = DEFAULT_MEMORY_FRACTION,
+    gemm_dtype: str | None = None,
+    moe_dtype: str | None = None,
+    fmha_dtype: str | None = None,
+    kv_cache_dtype: str | None = None,
+    comm_dtype: str | None = None,
 ) -> dict[ParallelShape, int]:
     """Map each *feasible* shape to its KV-cache token capacity.
 
@@ -125,7 +147,9 @@ def feasible_shape_tokens(
     per distinct shape, so repeated shapes across replica counts are free.
     """
     if backend_version is None:
-        backend_version = resolve_backend_version(hardware_sku, backend)
+        backend_version = resolve_backend_version(
+            hardware_sku, backend, database_mode=database_mode
+        )
     feasible: dict[ParallelShape, int] = {}
     for shape in dict.fromkeys(shapes):  # dedup, preserve first-seen order
         tokens = estimate_kv_tokens(
@@ -134,9 +158,15 @@ def feasible_shape_tokens(
             hardware_sku=hardware_sku,
             backend=backend,
             backend_version=backend_version,
+            database_mode=database_mode,
             max_num_tokens=max_num_tokens,
             max_batch_size=max_batch_size,
             memory_fraction=memory_fraction,
+            gemm_dtype=gemm_dtype,
+            moe_dtype=moe_dtype,
+            fmha_dtype=fmha_dtype,
+            kv_cache_dtype=kv_cache_dtype,
+            comm_dtype=comm_dtype,
         )
         if tokens is not None and tokens > max_seq_len:
             feasible[shape] = tokens

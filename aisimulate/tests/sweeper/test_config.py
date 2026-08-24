@@ -8,7 +8,10 @@ from pydantic import ValidationError
 
 from aisimulate.sweeper import OptimizationTarget, SmartSearchConfig
 from aisimulate.sweeper.config import (
+    AicDatabaseMode,
+    LoadSweepConfig,
     OptimizationGoal,
+    PdTransferConfig,
     SearchSpace,
     SLATarget,
     SweepConfig,
@@ -90,10 +93,74 @@ def test_defaults_are_backend_only():
     assert config.adapters == {}
     assert config.goal.target is OptimizationTarget.THROUGHPUT
     assert config.sweep.parallel_evals == 16
+    assert config.search_space.database_mode is AicDatabaseMode.SILICON
+    assert config.search_space.analytical_config is None
+    assert config.search_space.pd_transfer is None
     dumped = config.search_space.model_dump()
     assert (
         not {"planner_scaling_policy", "router_mode", "num_g2_blocks"} & dumped.keys()
     )
+
+
+def test_pd_transfer_is_explicit_positive_disagg_configuration():
+    search_space = SearchSpace(
+        **_search_space(
+            deployment_mode=["disagg"],
+            pd_transfer={
+                "kv_bytes_per_token": 131_072,
+                "bandwidth_gb_s": 64.0,
+                "timing_mode": "destination_missing",
+            },
+        )
+    )
+
+    assert search_space.pd_transfer == PdTransferConfig(
+        kv_bytes_per_token=131_072,
+        bandwidth_gb_s=64.0,
+        timing_mode="destination_missing",
+    )
+
+    with pytest.raises(ValidationError, match="bandwidth_gb_s"):
+        SearchSpace(
+            **_search_space(
+                deployment_mode=["disagg"],
+                pd_transfer={"kv_bytes_per_token": 1, "bandwidth_gb_s": 0},
+            )
+        )
+    with pytest.raises(ValidationError, match="only valid.*disagg"):
+        SearchSpace(
+            **_search_space(
+                deployment_mode=["agg"],
+                pd_transfer={"kv_bytes_per_token": 1, "bandwidth_gb_s": 1},
+            )
+        )
+
+
+def test_analytical_policy_is_validated_and_normalized():
+    config = SmartSearchConfig(
+        search_space=_search_space(
+            database_mode="ANALYTICAL",
+            analytical_config={
+                "level": "high",
+                "fp8_gemm_recipe": "deepgemm-hopper",
+                "attention_algorithm": "fa3",
+            },
+        ),
+        workload=_workload(),
+    )
+
+    assert config.search_space.database_mode is AicDatabaseMode.ANALYTICAL
+    assert config.search_space.analytical_config is not None
+    assert config.search_space.analytical_config.level == "high"
+    assert config.search_space.analytical_config.communication_mode == "empirical"
+
+
+def test_analytical_policy_requires_analytical_mode():
+    with pytest.raises(ValidationError, match="only valid when database_mode"):
+        SmartSearchConfig(
+            search_space=_search_space(analytical_config={"level": "low"}),
+            workload=_workload(),
+        )
 
 
 def test_extra_fields_are_forbidden_at_each_boundary():
@@ -287,6 +354,64 @@ def test_trace_closed_loop_cap_and_synthetic_helpers():
     assert rate.resolved_request_count() == 100
 
 
+def test_trace_load_sweep_is_an_outer_pareto_axis():
+    config = SmartSearchConfig(
+        search_space=_search_space(),
+        workload={"trace_path": "/tmp/trace.jsonl"},
+        load_sweep={
+            "axis": "arrival_speedup_ratio",
+            "values": [0.5, 1.0, 2.0],
+        },
+        goal={"target": "pareto"},
+    )
+
+    assert config.workload.arrival_speedup_ratio == 1.0
+    assert config.load_sweep == LoadSweepConfig(
+        axis="arrival_speedup_ratio", values=[0.5, 1.0, 2.0]
+    )
+
+
+@pytest.mark.parametrize(
+    ("workload", "goal", "load_sweep", "message"),
+    [
+        (
+            _workload(),
+            {"target": "pareto"},
+            {"values": [0.5, 1.0]},
+            "requires a trace workload",
+        ),
+        (
+            {"trace_path": "/tmp/trace.jsonl", "replay_concurrency": 8},
+            {"target": "pareto"},
+            {"values": [0.5, 1.0]},
+            "cannot be combined with replay_concurrency",
+        ),
+        (
+            {"trace_path": "/tmp/trace.jsonl"},
+            {"target": "throughput"},
+            {"values": [0.5, 1.0]},
+            "requires goal.target='pareto'",
+        ),
+    ],
+)
+def test_invalid_trace_load_sweep_combinations_are_rejected(
+    workload, goal, load_sweep, message
+):
+    with pytest.raises(ValidationError, match=message):
+        SmartSearchConfig(
+            search_space=_search_space(),
+            workload=workload,
+            goal=goal,
+            load_sweep=load_sweep,
+        )
+
+
+@pytest.mark.parametrize("values", [[], [0.0, 1.0], [1.0, 1.0], [float("inf")]])
+def test_invalid_load_sweep_values_are_rejected(values):
+    with pytest.raises(ValidationError):
+        LoadSweepConfig(values=values)
+
+
 @pytest.mark.parametrize(
     "workload",
     [
@@ -294,6 +419,7 @@ def test_trace_closed_loop_cap_and_synthetic_helpers():
         {"isl": 1, "osl": 1, "concurrency": 1.9, "num_request_ratio": 1},
         {"isl": 1, "osl": 1, "concurrency": 1},
         {"trace_path": "/tmp/trace.jsonl", "replay_concurrency": 0},
+        {"trace_path": "/tmp/trace.jsonl", "arrival_speedup_ratio": 0},
     ],
 )
 def test_invalid_workloads_are_rejected(workload):

@@ -93,6 +93,7 @@ impl<Observation> EngineComponent<Observation>
 where
     Observation: ReplayEngineObservation,
 {
+    #[cfg(test)]
     pub(in crate::replay::offline) fn new(
         stage: SimulationWorkerStage,
         pass_mode: EnginePassMode,
@@ -136,6 +137,26 @@ where
         args: MockEngineArgs,
         num_workers: usize,
     ) -> Self {
+        Self::new_ranked_with_capture(
+            stage,
+            pass_mode,
+            args,
+            num_workers,
+            Observation::CAPTURE_RAW,
+        )
+    }
+
+    /// Build ranked schedulers with an explicit raw-event capture policy.
+    ///
+    /// Disaggregated compositions may capture KV events on only one pool, so
+    /// they cannot always use the observation type's global default.
+    pub(in crate::replay::offline) fn new_ranked_with_capture(
+        stage: SimulationWorkerStage,
+        pass_mode: EnginePassMode,
+        args: MockEngineArgs,
+        num_workers: usize,
+        capture_raw: bool,
+    ) -> Self {
         let dp_size = args.dp_size.max(1) as usize;
         let mut workers = Vec::with_capacity(num_workers.saturating_mul(dp_size));
         let mut worker_groups = Vec::with_capacity(num_workers);
@@ -149,7 +170,7 @@ where
                     worker_id as u64,
                     dp_rank as u32,
                     args.clone(),
-                    Observation::CAPTURE_RAW,
+                    capture_raw,
                 )));
                 rank_ids.push(rank_id);
             }
@@ -168,7 +189,7 @@ where
             pending_removal: BTreeSet::new(),
             pending_startup: BTreeSet::new(),
             args,
-            capture_raw: Observation::CAPTURE_RAW,
+            capture_raw,
             observation: PhantomData,
         };
         component.refresh_all_groups();

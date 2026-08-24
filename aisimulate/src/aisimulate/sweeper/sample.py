@@ -19,6 +19,11 @@ _DEPLOYMENT_PINNED = (
     "context_length",
     "startup_time",
     "aic_nextn",
+    "aic_gemm_dtype",
+    "aic_moe_dtype",
+    "aic_fmha_dtype",
+    "aic_kv_cache_dtype",
+    "aic_comm_dtype",
 )
 
 # engine knobs per branch: searched batching + pinned scalars.
@@ -89,8 +94,20 @@ def unroll_sample(
 
     for key in _DEPLOYMENT_PINNED:
         sample[key] = getattr(search_space, key)
+    sample["database_mode"] = search_space.database_mode.value
+    sample["analytical_config"] = (
+        search_space.analytical_config.model_dump(mode="json")
+        if search_space.analytical_config is not None
+        else {}
+    )
 
     sample.update(_unroll_parallel(mode, parallel_config))
+    if mode == "disagg":
+        sample["pd_transfer"] = (
+            search_space.pd_transfer.model_dump(mode="json")
+            if search_space.pd_transfer is not None
+            else None
+        )
 
     # engine knobs for the active branch only
     if mode == "agg":

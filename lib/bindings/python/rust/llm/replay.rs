@@ -126,6 +126,7 @@ fn resolve_aic_perf_config<'a>(
                     py,
                     config.backend_name(),
                     config.backend_version(),
+                    None,
                 )?,
             })
         })
@@ -283,7 +284,7 @@ impl MockEngineArgs {
 #[pymethods]
 impl MockEngineArgs {
     #[new]
-    #[pyo3(signature = (engine_type="vllm", num_gpu_blocks=None, block_size=0, max_num_seqs=Some(256), max_num_batched_tokens=Some(8192), enable_prefix_caching=true, enable_chunked_prefill=true, speedup_ratio=1.0, decode_speedup_ratio=1.0, dp_size=1, startup_time=None, worker_type="aggregated", planner_profile_data=None, aic_backend=None, aic_system=None, aic_backend_version=None, aic_tp_size=None, aic_model_path=None, aic_moe_tp_size=None, aic_moe_ep_size=None, aic_attention_dp_size=None, aic_nextn=None, aic_nextn_accept_rates=None, aic_mtp_seed=42, aic_gemm_dtype=None, aic_moe_dtype=None, aic_fmha_dtype=None, aic_kv_cache_dtype=None, aic_comm_dtype=None, gpu_memory_utilization=None, mem_fraction_static=None, free_gpu_memory_fraction=None, enable_local_indexer=false, bootstrap_port=None, handoff_session_timeout_ms=300000, kv_bytes_per_token=None, kv_transfer_bandwidth=None, kv_transfer_timing_mode="full_prompt", reasoning=None, response_replay_trace_path=None, zmq_kv_events_port=None, zmq_replay_port=None, preemption_mode="lifo", router_queue_policy=None, sglang=None, trtllm=None, num_g2_blocks=None, num_g3_blocks=None, offload_batch_size=None, bandwidth_g1_to_g2_gbps=None, bandwidth_g2_to_g1_gbps=None, bandwidth_g2_to_g3_gbps=None, bandwidth_g3_to_g2_gbps=None, enable_g4_storage=false, bandwidth_g2_to_g4_gbps=None, bandwidth_g4_to_g2_gbps=None, max_model_len=None, g1_backend=None))]
+    #[pyo3(signature = (engine_type="vllm", num_gpu_blocks=None, block_size=0, max_num_seqs=Some(256), max_num_batched_tokens=Some(8192), enable_prefix_caching=true, enable_chunked_prefill=true, speedup_ratio=1.0, decode_speedup_ratio=1.0, dp_size=1, startup_time=None, worker_type="aggregated", planner_profile_data=None, aic_backend=None, aic_system=None, aic_backend_version=None, aic_database_mode=None, aic_analytical_config=None, aic_tp_size=None, aic_model_path=None, aic_moe_tp_size=None, aic_moe_ep_size=None, aic_attention_dp_size=None, aic_nextn=None, aic_nextn_accept_rates=None, aic_mtp_seed=42, aic_gemm_dtype=None, aic_moe_dtype=None, aic_fmha_dtype=None, aic_kv_cache_dtype=None, aic_comm_dtype=None, gpu_memory_utilization=None, mem_fraction_static=None, free_gpu_memory_fraction=None, enable_local_indexer=false, bootstrap_port=None, handoff_session_timeout_ms=300000, kv_bytes_per_token=None, kv_transfer_bandwidth=None, kv_transfer_timing_mode="full_prompt", reasoning=None, response_replay_trace_path=None, zmq_kv_events_port=None, zmq_replay_port=None, preemption_mode="lifo", router_queue_policy=None, sglang=None, trtllm=None, num_g2_blocks=None, num_g3_blocks=None, offload_batch_size=None, bandwidth_g1_to_g2_gbps=None, bandwidth_g2_to_g1_gbps=None, bandwidth_g2_to_g3_gbps=None, bandwidth_g3_to_g2_gbps=None, enable_g4_storage=false, bandwidth_g2_to_g4_gbps=None, bandwidth_g4_to_g2_gbps=None, max_model_len=None, g1_backend=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         engine_type: &str,
@@ -302,6 +303,8 @@ impl MockEngineArgs {
         aic_backend: Option<String>,
         aic_system: Option<String>,
         aic_backend_version: Option<String>,
+        aic_database_mode: Option<String>,
+        aic_analytical_config: Option<String>,
         aic_tp_size: Option<usize>,
         aic_model_path: Option<String>,
         aic_moe_tp_size: Option<usize>,
@@ -377,6 +380,8 @@ impl MockEngineArgs {
             .aic_backend(aic_backend)
             .aic_system(aic_system)
             .aic_backend_version(aic_backend_version)
+            .aic_database_mode(aic_database_mode)
+            .aic_analytical_config(aic_analytical_config)
             .aic_tp_size(aic_tp_size)
             .aic_model_path(aic_model_path)
             .aic_moe_tp_size(aic_moe_tp_size)
@@ -647,6 +652,26 @@ impl MockEngineArgs {
     }
 
     #[getter]
+    fn aic_database_mode(&self) -> Option<String> {
+        self.inner.aic_database_mode.clone()
+    }
+
+    #[setter]
+    fn set_aic_database_mode(&mut self, value: Option<String>) {
+        self.inner.aic_database_mode = value;
+    }
+
+    #[getter]
+    fn aic_analytical_config(&self) -> Option<String> {
+        self.inner.aic_analytical_config.clone()
+    }
+
+    #[setter]
+    fn set_aic_analytical_config(&mut self, value: Option<String>) {
+        self.inner.aic_analytical_config = value;
+    }
+
+    #[getter]
     fn aic_tp_size(&self) -> Option<usize> {
         self.inner.aic_tp_size
     }
@@ -860,7 +885,7 @@ impl MockEngineArgs {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (bootstrap_port=None, zmq_kv_events_port=None, zmq_replay_port=None, kv_bytes_per_token=None, num_gpu_blocks=None, aic_backend=None, aic_system=None, aic_backend_version=None, aic_tp_size=None, aic_model_path=None, aic_moe_tp_size=None, aic_moe_ep_size=None, aic_attention_dp_size=None, aic_nextn=None, aic_nextn_accept_rates=None, aic_mtp_seed=None, aic_gemm_dtype=None, aic_moe_dtype=None, aic_fmha_dtype=None, aic_kv_cache_dtype=None, aic_comm_dtype=None, gpu_memory_utilization=None, mem_fraction_static=None, free_gpu_memory_fraction=None, enable_prefix_caching=None, worker_type=None))]
+    #[pyo3(signature = (bootstrap_port=None, zmq_kv_events_port=None, zmq_replay_port=None, kv_bytes_per_token=None, num_gpu_blocks=None, aic_backend=None, aic_system=None, aic_backend_version=None, aic_database_mode=None, aic_analytical_config=None, aic_tp_size=None, aic_model_path=None, aic_moe_tp_size=None, aic_moe_ep_size=None, aic_attention_dp_size=None, aic_nextn=None, aic_nextn_accept_rates=None, aic_mtp_seed=None, aic_gemm_dtype=None, aic_moe_dtype=None, aic_fmha_dtype=None, aic_kv_cache_dtype=None, aic_comm_dtype=None, gpu_memory_utilization=None, mem_fraction_static=None, free_gpu_memory_fraction=None, enable_prefix_caching=None, worker_type=None))]
     fn with_overrides(
         &self,
         bootstrap_port: Option<u16>,
@@ -871,6 +896,8 @@ impl MockEngineArgs {
         aic_backend: Option<String>,
         aic_system: Option<String>,
         aic_backend_version: Option<String>,
+        aic_database_mode: Option<String>,
+        aic_analytical_config: Option<String>,
         aic_tp_size: Option<usize>,
         aic_model_path: Option<String>,
         aic_moe_tp_size: Option<usize>,
@@ -916,6 +943,12 @@ impl MockEngineArgs {
         }
         if let Some(version) = aic_backend_version {
             inner.aic_backend_version = Some(version);
+        }
+        if let Some(mode) = aic_database_mode {
+            inner.aic_database_mode = Some(mode);
+        }
+        if let Some(policy) = aic_analytical_config {
+            inner.aic_analytical_config = Some(policy);
         }
         if let Some(tp_size) = aic_tp_size {
             inner.aic_tp_size = Some(tp_size);
@@ -1999,9 +2032,13 @@ fn resolve_aic_backend_version(
     py: Python<'_>,
     backend: &str,
     configured_version: Option<&str>,
+    database_mode: Option<&str>,
 ) -> PyResult<String> {
     py.import("dynamo._internal.aic")?
-        .call_method1("resolve_backend_version", (backend, configured_version))?
+        .call_method1(
+            "resolve_backend_version",
+            (backend, configured_version, database_mode),
+        )?
         .extract()
 }
 
@@ -2021,8 +2058,12 @@ fn materialize_replay_mocker_args(
             .aic_model_path
             .clone()
             .ok_or_else(|| PyException::new_err("--aic-perf-model requires --model-path"))?;
-        let backend_version =
-            resolve_aic_backend_version(py, &backend, args.aic_backend_version.as_deref())?;
+        let backend_version = resolve_aic_backend_version(
+            py,
+            &backend,
+            args.aic_backend_version.as_deref(),
+            args.aic_database_mode.as_deref(),
+        )?;
         args.aic_backend_version = Some(backend_version.clone());
         let backend_version = Some(backend_version);
         let tp_size = args.aic_tp_size.unwrap_or(1);
@@ -2065,6 +2106,7 @@ fn materialize_replay_mocker_args(
                 fmha_dtype.as_deref(),
                 kv_cache_dtype.as_deref(),
                 comm_dtype.as_deref(),
+                args.aic_database_mode.as_deref(),
             )
             .map_err(|error| {
                 PyException::new_err(format!(
@@ -2086,6 +2128,8 @@ fn materialize_replay_mocker_args(
             &model_name,
             tp_size,
             backend_version.as_deref(),
+            args.aic_database_mode.as_deref(),
+            args.aic_analytical_config.as_deref(),
             moe_tp_size,
             moe_ep_size,
             attention_dp_size,
@@ -2244,6 +2288,8 @@ fn load_replay_prefill_load_estimator<'a>(
         aic_perf_config.model_path(),
         aic_perf_config.tp_size(),
         Some(&resolved_aic_perf_config.backend_version),
+        None,
+        None,
         aic_perf_config.moe_tp_size(),
         aic_perf_config.moe_ep_size(),
         aic_perf_config.attention_dp_size(),

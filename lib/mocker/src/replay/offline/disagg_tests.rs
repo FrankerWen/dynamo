@@ -579,13 +579,73 @@ fn test_prefill_and_decode_use_separate_worker_pools(#[case] router_mode: Replay
         assert!(stats.decode_assignments.contains_key(&uuid));
         assert_eq!(stats.request_snapshots[&uuid].phase, DisaggPhase::Done);
         assert_eq!(
-            stats.request_snapshots[&uuid].prefill_worker_idx,
+            stats.request_snapshots[&uuid].prefill_endpoint,
             Some(stats.prefill_assignments[&uuid])
         );
         assert_eq!(
-            stats.request_snapshots[&uuid].decode_worker_idx,
+            stats.request_snapshots[&uuid].decode_endpoint,
             Some(stats.decode_assignments[&uuid])
         );
+    }
+}
+
+#[rstest::rstest]
+#[case(EngineType::Vllm)]
+#[case(EngineType::Sglang)]
+fn asymmetric_attention_dp_round_robin_preserves_ranked_handoff_identity(
+    #[case] engine_type: EngineType,
+) {
+    let mut config = match engine_type {
+        EngineType::Vllm => disagg_config(),
+        EngineType::Sglang => sglang_disagg_config(),
+        EngineType::Trtllm => unreachable!(),
+    };
+    config.num_prefill_workers = 1;
+    config.num_decode_workers = 1;
+    config.prefill_args.dp_size = 2;
+    config.decode_args.dp_size = 4;
+    config.prefill_args.kv_transfer_bandwidth = Some(1.0);
+    config.prefill_args.kv_bytes_per_token = Some(1_000_000);
+
+    let requests = (0..8)
+        .map(|index| request(index + 1, 64, 2, index as f64 * 1_000.0))
+        .collect();
+    let mut records =
+        run_trace_with_details(&config, requests, None, ReplayRouterMode::RoundRobin).per_request;
+    records.sort_by(|left, right| left.arrival_time_ms.total_cmp(&right.arrival_time_ms));
+
+    assert_eq!(records.len(), 8);
+    for (index, record) in records.iter().enumerate() {
+        let prefill = record
+            .routing_history
+            .iter()
+            .find(|route| route.pool == ReplayRequestPool::Prefill)
+            .expect("request must retain its ranked prefill route");
+        assert_eq!(prefill.logical_worker_id, Some(0));
+        assert_eq!(prefill.scheduler_id, Some(index % 2));
+        assert_eq!(prefill.dp_rank, Some((index % 2) as u32));
+
+        let decode = record
+            .routing_history
+            .iter()
+            .find(|route| route.pool == ReplayRequestPool::Decode)
+            .expect("request must retain its ranked decode route");
+        assert_eq!(decode.logical_worker_id, Some(0));
+        assert_eq!(decode.scheduler_id, Some(index % 4));
+        assert_eq!(decode.dp_rank, Some((index % 4) as u32));
+
+        assert_eq!(record.prefill_worker_idx, Some(0));
+        assert_eq!(record.decode_worker_idx, Some(0));
+        let transfer_started_ms = record
+            .source_held_ms
+            .unwrap()
+            .max(record.destination_reserved_ms.unwrap());
+        let transfer_ms = record.destination_activated_ms.unwrap() - transfer_started_ms;
+        assert!(
+            (transfer_ms - 64.0).abs() < 1e-6,
+            "{engine_type:?} request {index} charged {transfer_ms}ms instead of 64ms"
+        );
+        assert_eq!(record.terminal_status, ReplayTerminalStatus::Completed);
     }
 }
 
@@ -1461,7 +1521,14 @@ fn pending_destination_booking_survives_scale_down_until_cleanup() {
             .transition_log
             .contains(&DisaggTransition::DestinationReserved { uuid: pending })
     );
-    assert_eq!(runtime.state(pending).unwrap().decode_worker_idx(), Some(0));
+    assert_eq!(
+        runtime
+            .state(pending)
+            .unwrap()
+            .decode_endpoint()
+            .map(|endpoint| endpoint.scheduler_id),
+        Some(0)
+    );
     let before = runtime.decode_placement.debug_snapshot(runtime.now_ms());
     assert!(
         before
@@ -1473,7 +1540,14 @@ fn pending_destination_booking_survives_scale_down_until_cleanup() {
     runtime.apply_scaling(1, 0).unwrap();
     assert_eq!(runtime.active_decode_count(), 0);
     assert_eq!(runtime.total_decode_count(), 1);
-    assert_eq!(runtime.state(pending).unwrap().decode_worker_idx(), Some(0));
+    assert_eq!(
+        runtime
+            .state(pending)
+            .unwrap()
+            .decode_endpoint()
+            .map(|endpoint| endpoint.scheduler_id),
+        Some(0)
+    );
 
     let handoff_id = runtime.state(pending).unwrap().handoff_id;
     runtime
@@ -1521,7 +1595,10 @@ fn test_apply_scaling_drains_prefill_router_pending_immediately() {
         runtime.state(Uuid::from_u128(2)).unwrap().phase,
         DisaggPhase::RunningPrefill
     );
-    assert_eq!(runtime.stats.prefill_assignments[&Uuid::from_u128(2)], 1);
+    assert_eq!(
+        runtime.stats.prefill_assignments[&Uuid::from_u128(2)].scheduler_id,
+        1
+    );
 }
 
 #[test]

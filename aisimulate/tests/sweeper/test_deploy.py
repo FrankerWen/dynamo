@@ -121,6 +121,43 @@ def test_disagg_backend_deployment_preserves_both_roles():
     assert deployment.decode_engine_args["engine_type"] == "sglang"
 
 
+def test_disagg_backend_deployment_injects_scalar_pd_transfer_on_both_pools():
+    parallel = DisaggParallelConfig(
+        prefill=ReplicaParallelConfig(ParallelShape(tp=1, dp=2, moe_tp=1, moe_ep=2), 1),
+        decode=ReplicaParallelConfig(ParallelShape(tp=1, dp=4, moe_tp=1, moe_ep=4), 1),
+    )
+    selection = _agg_selection(
+        deployment_mode="disagg",
+        backend="sglang",
+        prefill_max_num_batched_tokens=32768,
+        prefill_max_num_seqs=4,
+        decode_max_num_batched_tokens=8192,
+        decode_max_num_seqs=1024,
+    )
+    sample = unroll_sample(
+        search_space=_space(
+            deployment_mode=["disagg"],
+            pd_transfer={
+                "kv_bytes_per_token": 1_000_000,
+                "bandwidth_gb_s": 1.0,
+                "timing_mode": "full_prompt",
+            },
+        ),
+        selection=selection,
+        parallel_config=parallel,
+    )
+
+    deployment = build_backend_deployment(sample, backend_version=BACKEND_VERSION)
+
+    expected = {
+        "kv_bytes_per_token": 1_000_000,
+        "kv_transfer_bandwidth": 1.0,
+        "kv_transfer_timing_mode": "full_prompt",
+    }
+    assert {key: deployment.prefill_engine_args[key] for key in expected} == expected
+    assert {key: deployment.decode_engine_args[key] for key in expected} == expected
+
+
 def test_dense_shape_omits_moe_sizes():
     dense = ReplicaParallelConfig(
         ParallelShape(tp=2, dp=1, moe_tp=1, moe_ep=1), replicas=1
@@ -150,6 +187,34 @@ def test_optional_backend_runtime_values_are_forwarded():
 
     assert engine["startup_time"] == 45.0
     assert engine["aic_nextn"] == 2
+
+
+def test_analytical_contract_uses_canonical_policy_json():
+    engine = _agg_deployment(
+        space=_space(
+            database_mode="ANALYTICAL",
+            analytical_config={"attention_algorithm": "fa3", "level": "high"},
+            aic_gemm_dtype="fp8_block",
+            aic_moe_dtype="nvfp4",
+            aic_fmha_dtype="bfloat16",
+            aic_kv_cache_dtype="fp8",
+            aic_comm_dtype="half",
+        )
+    ).agg_engine_args
+
+    assert engine["aic_database_mode"] == "ANALYTICAL"
+    assert engine["aic_analytical_config"] == (
+        '{"attention_algorithm":"fa3","communication_mode":"empirical",'
+        '"fp8_gemm_recipe":"sglang","level":"high",'
+        '"moe_combine_dtype":"half","moe_dispatch_dtype":"half",'
+        '"sparse_attention_head_quantum":null,"wideep_combine_dtype":"half",'
+        '"wideep_dispatch_dtype":"half"}'
+    )
+    assert engine["aic_gemm_dtype"] == "fp8_block"
+    assert engine["aic_moe_dtype"] == "nvfp4"
+    assert engine["aic_fmha_dtype"] == "bfloat16"
+    assert engine["aic_kv_cache_dtype"] == "fp8"
+    assert engine["aic_comm_dtype"] == "half"
 
 
 def test_backend_deployment_contains_no_dynamo_policy_fields():

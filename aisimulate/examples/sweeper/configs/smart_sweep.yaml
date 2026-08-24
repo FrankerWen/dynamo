@@ -30,6 +30,17 @@ goal:
   # throughput | throughput_per_gpu | throughput_per_user | e2e_latency | goodput | goodput_per_gpu | pareto
   target: goodput_per_gpu
   sla: {ttft_ms: 2000, itl_ms: 30}  # required only for goodput / goodput_per_gpu (or a pareto with a goodput objective)
+
+# --- Trace load scan (replace the scalar goal above with this Pareto goal) ---
+# Keep request lengths/prefixes/order from the trace and scan arrival pressure outside
+# the deployment optimizer. Each value receives an independent study.
+# load_sweep:
+#   axis: arrival_speedup_ratio
+#   values: [0.5, 1.0, 2.0, 4.0]
+# goal:
+#   target: pareto
+#   pareto_objectives: [goodput_per_gpu, throughput_per_user]
+#   sla: {ttft_ms: 2000, itl_ms: 30}
 sweep:
   max_rounds: 40
   parallel_evals: 16

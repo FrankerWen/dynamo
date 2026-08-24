@@ -43,10 +43,14 @@ from aisimulate.sweeper import SmartSearchConfig, Sweeper
 from dynamo.replay.simulation import DynamoReplayRunnerFactory
 
 config = SmartSearchConfig.from_yaml("smart_sweep.yaml")
-candidates = Sweeper(
+result = Sweeper(
     runner_factory=DynamoReplayRunnerFactory(),
 ).run(config)
 ```
+
+A single-workload run returns a candidate list. A trace configuration with top-level
+`load_sweep` returns per-load Pareto fronts and a global operating envelope in a
+`LoadSweepResult`.
 
 The standalone module validates the backend-neutral core schema but intentionally has no implicit
 replay runtime. Adapter-owned search spaces are validated when the selected adapters are resolved

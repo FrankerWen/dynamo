@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .replay import BackendDeploymentSpec
+from .replay import BackendDeploymentSpec, canonical_json
 
 
 def _role_prefix(role: str) -> str:
@@ -39,13 +39,34 @@ def _engine_args_payload(
         "gpu_memory_utilization": float(sample[f"{role}_gpu_memory_utilization"]),
         "enable_prefix_caching": bool(sample[f"{role}_enable_prefix_caching"]),
     }
+    if sample["database_mode"] == "ANALYTICAL":
+        payload["aic_database_mode"] = "ANALYTICAL"
+        payload["aic_analytical_config"] = canonical_json(
+            sample.get("analytical_config", {})
+        )
     if moe_tp * moe_ep > 1:
         payload["aic_moe_tp_size"] = moe_tp
         payload["aic_moe_ep_size"] = moe_ep
     if sample.get("aic_nextn") is not None:
         payload["aic_nextn"] = int(sample["aic_nextn"])
+    for field in (
+        "aic_gemm_dtype",
+        "aic_moe_dtype",
+        "aic_fmha_dtype",
+        "aic_kv_cache_dtype",
+        "aic_comm_dtype",
+    ):
+        if sample.get(field) is not None:
+            payload[field] = str(sample[field])
     if sample.get("startup_time") is not None:
         payload["startup_time"] = float(sample["startup_time"])
+    pd_transfer = sample.get("pd_transfer")
+    if role != "agg" and pd_transfer is not None:
+        if not isinstance(pd_transfer, dict):
+            raise TypeError("pd_transfer must be a mapping")
+        payload["kv_bytes_per_token"] = int(pd_transfer["kv_bytes_per_token"])
+        payload["kv_transfer_bandwidth"] = float(pd_transfer["bandwidth_gb_s"])
+        payload["kv_transfer_timing_mode"] = str(pd_transfer["timing_mode"])
     return payload
 
 

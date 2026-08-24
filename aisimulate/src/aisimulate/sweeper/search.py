@@ -23,6 +23,7 @@ entry-point group.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import multiprocessing as mp
@@ -33,15 +34,31 @@ from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from concurrent.futures.process import BrokenProcessPool
 from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import asdict, dataclass, is_dataclass, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
 from enum import Enum
 from multiprocessing.util import Finalize
 from numbers import Real
+from pathlib import Path
 from typing import Any
 
 from tqdm import tqdm
 
-from .config import Candidate, OptimizationGoal, OptimizationTarget, SmartSearchConfig
+from .checkpoint import (
+    BranchCheckpoint,
+    ReplayCacheEntry,
+    SweepRoundCheckpoint,
+    load_round_checkpoint,
+    utc_now,
+    write_round_checkpoint,
+)
+from .config import (
+    Candidate,
+    LoadConditionedPareto,
+    LoadSweepResult,
+    OptimizationGoal,
+    OptimizationTarget,
+    SmartSearchConfig,
+)
 from .deploy import build_backend_deployment
 from .discovery import resolve_providers
 from .kv_estimate import resolve_backend_version
@@ -65,7 +82,12 @@ from .replay import (
     validate_json_value,
 )
 from .sample import unroll_sample
-from .sampler import BranchSampler, Suggestion, make_branch_sampler
+from .sampler import (
+    BranchSampler,
+    CheckpointableSampler,
+    Suggestion,
+    make_branch_sampler,
+)
 from .score import is_feasible, make_candidate, pareto_front, rank
 from .search_space import BranchSpace, enumerate_branches
 
@@ -321,7 +343,14 @@ def _merge_adapter_spaces(
 def _freeze(value: Any) -> Any:
     """Convert a nested suggestion/context value into a stable hashable key."""
     if is_dataclass(value) and not isinstance(value, type):
-        return ("dataclass", type(value).__qualname__, _freeze(asdict(value)))
+        return (
+            "dataclass",
+            type(value).__qualname__,
+            tuple(
+                (field.name, _freeze(getattr(value, field.name)))
+                for field in fields(value)
+            ),
+        )
     if isinstance(value, Enum):
         return ("enum", type(value).__qualname__, _freeze(value.value))
     if isinstance(value, dict):
@@ -354,9 +383,15 @@ def _freeze(value: Any) -> Any:
     return ("hashable", type(value).__qualname__, value)
 
 
-def _suggestion_cache_key(suggestion: Suggestion, context: Any) -> Any:
-    """A run-local full-sample key; parallel equality alone is not a cache hit."""
-    return (context, _freeze(suggestion.selection), _freeze(suggestion.parallel_config))
+def _stable_digest(value: Any) -> str:
+    return hashlib.sha256(repr(_freeze(value)).encode("utf-8")).hexdigest()
+
+
+def _suggestion_cache_key(suggestion: Suggestion, context: Any) -> str:
+    """A stable full-sample key; parallel equality alone is not a cache hit."""
+    return _stable_digest(
+        (context, suggestion.selection, suggestion.parallel_config)
+    )
 
 
 def _materialize_one(
@@ -376,36 +411,90 @@ def _materialize_one(
             selection=selection,
             parallel_config=parallel_config,
         )
+        version_kwargs: dict[str, str] = {}
+        if config.search_space.database_mode.value != "SILICON":
+            version_kwargs["database_mode"] = config.search_space.database_mode.value
         backend_version = resolve_backend_version(
-            config.search_space.hardware_sku, selection["backend"]
+            config.search_space.hardware_sku,
+            selection["backend"],
+            **version_kwargs,
         )
         # The resolved perf-model version is part of the evaluated contract. Keep it
         # on the candidate so downstream artifact generation cannot independently
         # select a different backend version.
         sample["backend_version"] = backend_version
         concurrency = config.workload.concurrency
+        load_role = "decode" if sample["deployment_mode"] == "disagg" else "agg"
+        kv_resolution = None
         if "kv_load_ratio" in selection:
             ratio = float(selection["kv_load_ratio"])
-            resolution = resolve_kv_load(
+            kv_resolution = resolve_kv_load(
                 sample,
                 workload=config.workload,
                 parallel_config=parallel_config,
                 ratio=ratio,
                 backend_version=backend_version,
             )
-            concurrency = resolution.concurrency
-            sample["kv_load_ratio"] = resolution.ratio
-            sample["kv_load_concurrency_capacity"] = resolution.concurrency_capacity
-            load_role = "decode" if sample["deployment_mode"] == "disagg" else "agg"
-            sample["kv_load_capacity_tokens"] = resolution.role_capacity_tokens[
+            concurrency = kv_resolution.concurrency
+            sample["kv_load_ratio"] = kv_resolution.ratio
+        elif concurrency is not None:
+            # Fixed-length, fixed-concurrency synthetic workloads still need the
+            # candidate-specific AIC KV check. Branch enumeration only sees baseline
+            # batching defaults, while the selected engine knobs can reserve enough
+            # non-KV memory to leave no usable cache at all.
+            kv_resolution = resolve_kv_load(
+                sample,
+                workload=config.workload,
+                parallel_config=parallel_config,
+                ratio=1.0,
+                backend_version=backend_version,
+            )
+            # The resolver deliberately assumes every request owns its full ISL KV.
+            # Synthetic shared-prefix hashes can make that comparison pessimistic,
+            # but only when the load-bearing role actually enables prefix caching.
+            # Keep the candidate-specific no-KV-budget check above and leave the
+            # prefix-aware occupancy decision to replay in that case.
+            has_effective_shared_prefix = (
+                concurrency > 1
+                and float(config.workload.shared_prefix_ratio) > 0.0
+                and int(config.workload.num_prefix_groups) > 0
+                and bool(sample[f"{load_role}_enable_prefix_caching"])
+            )
+            if (
+                not has_effective_shared_prefix
+                and concurrency > kv_resolution.concurrency_capacity
+            ):
+                raise InfeasibleKVCapacity(
+                    f"fixed concurrency {concurrency} exceeds candidate KV concurrency "
+                    f"capacity {kv_resolution.concurrency_capacity} for "
+                    f"isl={config.workload.isl}, osl={config.workload.osl}"
+                )
+            sample["kv_load_capacity_screen_mode"] = (
+                "fixed_prefix_deferred"
+                if has_effective_shared_prefix
+                else "fixed_unshared"
+            )
+
+        if kv_resolution is not None:
+            sample["kv_load_concurrency_capacity"] = (
+                kv_resolution.concurrency_capacity
+            )
+            sample["kv_load_capacity_tokens"] = kv_resolution.role_capacity_tokens[
                 load_role
             ]
-            for role, tokens in resolution.role_capacity_tokens.items():
+            for role, tokens in kv_resolution.role_capacity_tokens.items():
                 sample[f"{role}_kv_capacity_tokens"] = tokens
         if concurrency is not None:
             # Preserve the concrete load on every candidate, including a fixed absolute
             # concurrency and one derived from kv_load_ratio.
             sample["concurrency"] = concurrency
+        if config.workload.is_trace_based:
+            # Trace shape and arrival pressure are intentionally separate. Preserve the
+            # concrete outer load point on every candidate so cross-load envelopes remain
+            # auditable after the per-load studies have completed.
+            sample["arrival_speedup_ratio"] = float(
+                config.workload.arrival_speedup_ratio
+            )
         backend_deployment = build_backend_deployment(
             sample, backend_version=backend_version
         )
@@ -600,8 +689,115 @@ class Sweeper:
         config: SmartSearchConfig,
         *,
         on_round: Callable[[int, list[Candidate]], None] | None = None,
+        checkpoint_path: str | Path | None = None,
+        resume_checkpoint: bool = False,
+    ) -> list[Candidate] | LoadSweepResult:
+        """Run one study or an outer trace-load scan.
+
+        A configured ``load_sweep`` creates one independent optimizer study per
+        arrival-speedup value, then computes the non-dominated envelope over the union
+        of the per-load fronts. Without ``load_sweep``, the legacy list result is
+        returned unchanged. Load-scan ``on_round`` numbers remain monotonic across
+        studies; its candidate list is local to the current fixed load, recorded in
+        each candidate's ``arrival_speedup_ratio``.
+
+        For one fixed-load study, ``checkpoint_path`` atomically records state at
+        every completed round barrier. ``resume_checkpoint=True`` warm-starts a
+        fresh sampler from that state and continues at the next incomplete round.
+        """
+        if resume_checkpoint and checkpoint_path is None:
+            raise ValueError("resume_checkpoint requires checkpoint_path")
+        resolved_checkpoint_path = (
+            Path(checkpoint_path) if checkpoint_path is not None else None
+        )
+        if config.load_sweep is not None and resolved_checkpoint_path is not None:
+            raise ValueError(
+                "round checkpoints apply to one fixed-load study; orchestrate "
+                "load_sweep checkpoints outside Sweeper"
+            )
+        if config.load_sweep is not None:
+            return self._run_load_sweep(config, on_round=on_round)
+        return self._run_single(
+            config,
+            on_round=on_round,
+            checkpoint_path=resolved_checkpoint_path,
+            resume_checkpoint=resume_checkpoint,
+        )
+
+    def _run_load_sweep(
+        self,
+        config: SmartSearchConfig,
+        *,
+        on_round: Callable[[int, list[Candidate]], None] | None,
+    ) -> LoadSweepResult:
+        """Run fixed-load Pareto studies and derive a global operating envelope."""
+        load_sweep = config.load_sweep
+        if load_sweep is None:  # defensive: public ``run`` owns this dispatch
+            raise ValueError("_run_load_sweep requires config.load_sweep")
+
+        conditioned: list[LoadConditionedPareto] = []
+        union: list[Candidate] = []
+        round_offset = 0
+        for value in load_sweep.values:
+            if self._show_progress:
+                tqdm.write(
+                    f"Sweeper load {load_sweep.axis}={value:.12g}: "
+                    "starting independent study"
+                )
+            workload = config.workload.model_copy(
+                update={"arrival_speedup_ratio": value}
+            )
+            point_config = config.model_copy(
+                update={"workload": workload, "load_sweep": None}
+            )
+            local_last_round = 0
+
+            def _on_point_round(
+                round_no: int,
+                candidates: list[Candidate],
+                *,
+                _offset: int = round_offset,
+            ) -> None:
+                nonlocal local_last_round
+                local_last_round = max(local_last_round, round_no)
+                if on_round is not None:
+                    on_round(_offset + round_no, candidates)
+
+            front = self._run_single(
+                point_config,
+                on_round=_on_point_round if on_round is not None else None,
+            )
+            round_offset += local_last_round
+            conditioned.append(
+                LoadConditionedPareto(load_value=value, candidates=front)
+            )
+            union.extend(front)
+
+        # A candidate dominated within its fixed-load study is also dominated in the
+        # cross-load union, so the union of the per-load fronts is sufficient here.
+        envelope = pareto_front(union, config.goal.resolved_pareto_objectives)
+        if self._show_progress:
+            tqdm.write(
+                "Sweeper load scan done: "
+                f"{len(conditioned)} load point(s), "
+                f"{len(union)} load-conditioned Pareto candidate(s), "
+                f"{len(envelope)} global operating-envelope member(s)"
+            )
+        return LoadSweepResult(
+            load_axis=load_sweep.axis,
+            load_conditioned_pareto=conditioned,
+            global_operating_envelope=envelope,
+        )
+
+    def _run_single(
+        self,
+        config: SmartSearchConfig,
+        *,
+        on_round: Callable[[int, list[Candidate]], None] | None = None,
+        checkpoint_path: Path | None = None,
+        resume_checkpoint: bool = False,
     ) -> list[Candidate]:
-        """Run the sweep and return feasible candidates sorted best-first.
+        """Run or resume one fixed-workload study and return sorted candidates.
 
         The configured runner factory is the only replay runtime injection point.
         Providers can be injected directly; otherwise configured providers are
@@ -681,17 +877,100 @@ class Sweeper:
                 "provider_plans": provider_plans,
             }
         )
-        replay_cache: dict[Any, tuple[Candidate, dict[str, float]]] = {}
+        checkpoint_fingerprint = _stable_digest(
+            {
+                "config": config.model_dump(mode="python"),
+                "branches": branches,
+                "provider_plans": provider_plans,
+            }
+        )
+        branch_checkpoints = {
+            branch.deployment_mode: BranchCheckpoint() for branch in branches
+        }
+        replay_cache: dict[str, tuple[Candidate, dict[str, float]]] = {}
+
+        loaded_checkpoint = None
+        if checkpoint_path is not None and resume_checkpoint:
+            loaded_checkpoint = load_round_checkpoint(
+                checkpoint_path,
+                expected_fingerprint=checkpoint_fingerprint,
+            )
+        if loaded_checkpoint is not None:
+            expected_branches = set(branch_checkpoints)
+            if set(loaded_checkpoint.branches) != expected_branches:
+                raise ValueError(
+                    "checkpoint branch set does not match the resolved search branches"
+                )
+            if set(loaded_checkpoint.tally) != set(tally):
+                raise ValueError("checkpoint tally fields do not match Sweeper")
+            for branch_name, state in loaded_checkpoint.branches.items():
+                if state.completed_rounds > sweep.max_rounds:
+                    raise ValueError(
+                        f"checkpoint branch {branch_name!r} completed "
+                        f"{state.completed_rounds} rounds, above configured "
+                        f"max_rounds={sweep.max_rounds}"
+                    )
+            candidates = list(loaded_checkpoint.candidates)
+            replay_cache = {
+                key: (entry.candidate, dict(entry.observe_metrics))
+                for key, entry in loaded_checkpoint.replay_cache.items()
+            }
+            tally = dict(loaded_checkpoint.tally)
+            failure_reasons = dict(loaded_checkpoint.failure_reasons)
+            branch_checkpoints = {
+                name: state.model_copy(deep=True)
+                for name, state in loaded_checkpoint.branches.items()
+            }
+
+        def _persist_checkpoint() -> None:
+            if checkpoint_path is None:
+                return
+            write_round_checkpoint(
+                checkpoint_path,
+                SweepRoundCheckpoint(
+                    fingerprint=checkpoint_fingerprint,
+                    updated_at=utc_now(),
+                    candidates=list(candidates),
+                    replay_cache={
+                        key: ReplayCacheEntry(
+                            candidate=candidate,
+                            observe_metrics=dict(observe_metrics),
+                        )
+                        for key, (candidate, observe_metrics) in replay_cache.items()
+                    },
+                    tally=dict(tally),
+                    failure_reasons=dict(failure_reasons),
+                    branches={
+                        name: state.model_copy(deep=True)
+                        for name, state in branch_checkpoints.items()
+                    },
+                ),
+            )
+
+        if checkpoint_path is not None and loaded_checkpoint is None:
+            _persist_checkpoint()
 
         def _best() -> float | None:
             return max((c.score for c in candidates), default=None)
 
         # Parallel across worker processes when parallel_evals > 1. Spawn keeps
         # runner runtimes isolated and lets each worker reuse one runner instance.
-        use_pool = sweep.parallel_evals > 1 and per_round > 1
+        has_remaining_rounds = any(
+            not state.stalled and state.completed_rounds < sweep.max_rounds
+            for state in branch_checkpoints.values()
+        )
+        use_pool = (
+            has_remaining_rounds
+            and sweep.parallel_evals > 1
+            and per_round > 1
+        )
         max_eval_seconds = sweep.max_eval_seconds
         worker_count = min(sweep.parallel_evals, per_round)
-        sequential_runner = None if use_pool else runner_factory.create(0)
+        sequential_runner = (
+            runner_factory.create(0)
+            if has_remaining_rounds and not use_pool
+            else None
+        )
 
         def _new_pool() -> ProcessPoolExecutor:
             return ProcessPoolExecutor(
@@ -840,7 +1119,11 @@ class Sweeper:
         with (
             _pool_lifecycle(),
             tqdm(
-                total=total, desc="sweeper", unit="eval", disable=not show_progress
+                total=total,
+                initial=len(candidates),
+                desc="sweeper",
+                unit="eval",
+                disable=not show_progress,
             ) as bar,
         ):
 
@@ -856,16 +1139,61 @@ class Sweeper:
                     best=("-" if best is None else f"{best:.4g}"),
                 )
 
-            round_no = 0
+            round_no = sum(
+                state.completed_rounds for state in branch_checkpoints.values()
+            )
             for branch in branches:
-                branch_stalled = False
+                branch_checkpoint = branch_checkpoints[branch.deployment_mode]
+                if (
+                    branch_checkpoint.stalled
+                    or branch_checkpoint.completed_rounds >= sweep.max_rounds
+                ):
+                    continue
                 sampler = sampler_factory(
                     branch,
                     study_id=f"sweeper_{branch.deployment_mode}_{run_nonce}",
                     objectives=sampler_objectives,
                 )
+                checkpoint_sampler = None
+                if checkpoint_path is not None:
+                    if not isinstance(sampler, CheckpointableSampler):
+                        raise TypeError(
+                            "round checkpoints require a checkpointable sampler"
+                        )
+                    checkpoint_sampler = sampler
+                    checkpoint_sampler.restore_observations(
+                        branch_checkpoint.observations
+                    )
+
+                def _observe(
+                    suggestion: Suggestion, metrics: dict[str, float]
+                ) -> None:
+                    sampler.observe(suggestion, metrics)
+                    if checkpoint_sampler is not None:
+                        branch_checkpoint.observations.append(
+                            checkpoint_sampler.checkpoint_observation(
+                                suggestion,
+                                metrics=dict(metrics),
+                            )
+                        )
+
+                def _observe_infeasible(
+                    suggestion: Suggestion, reason: str
+                ) -> None:
+                    sampler.observe_infeasible(suggestion, reason)
+                    if checkpoint_sampler is not None:
+                        branch_checkpoint.observations.append(
+                            checkpoint_sampler.checkpoint_observation(
+                                suggestion,
+                                infeasible_reason=reason,
+                            )
+                        )
+
                 bar.set_description(f"Sweeper {branch.deployment_mode}")
-                for _ in range(sweep.max_rounds):
+                for _ in range(
+                    branch_checkpoint.completed_rounds,
+                    sweep.max_rounds,
+                ):
                     unique_this_round = 0
                     trial_attempts = 0
                     max_trial_attempts = (
@@ -890,14 +1218,14 @@ class Sweeper:
                         # A duplicate trial still receives the cached measurement so f(z) remains
                         # deterministic, but only the first full sample reaches replay.
                         todo: list[tuple[Suggestion, _PreparedCandidate]] = []
-                        primary_by_key: dict[Any, Suggestion] = {}
-                        duplicates_by_key: dict[Any, list[Suggestion]] = {}
+                        primary_by_key: dict[str, Suggestion] = {}
+                        duplicates_by_key: dict[str, list[Suggestion]] = {}
                         for suggestion in suggestions:
                             backend = suggestion.selection["backend"]
                             if backend not in branch.supported_backends.get(
                                 suggestion.parallel_config, frozenset()
                             ):
-                                sampler.observe_infeasible(
+                                _observe_infeasible(
                                     suggestion,
                                     f"backend {backend!r} does not support this parallel config",
                                 )
@@ -908,7 +1236,7 @@ class Sweeper:
                             cached = replay_cache.get(key)
                             if cached is not None:
                                 _, cached_metrics = cached
-                                sampler.observe(suggestion, cached_metrics)
+                                _observe(suggestion, cached_metrics)
                                 tally["cache_hit"] += 1
                                 continue
                             if key in primary_by_key:
@@ -937,9 +1265,9 @@ class Sweeper:
                                 ) = build_result
                                 assert candidate is None and observe_metrics is None
                                 duplicates = duplicates_by_key.get(key, [])
-                                sampler.observe_infeasible(suggestion, reason)
+                                _observe_infeasible(suggestion, reason)
                                 for duplicate in duplicates:
-                                    sampler.observe_infeasible(duplicate, reason)
+                                    _observe_infeasible(duplicate, reason)
                                 if outcome == "failed":
                                     failure_reasons[reason] = (
                                         failure_reasons.get(reason, 0)
@@ -962,9 +1290,9 @@ class Sweeper:
                             key = _suggestion_cache_key(suggestion, cache_context)
                             duplicates = duplicates_by_key.get(key, [])
                             if outcome in ("failed", "infeasible"):
-                                sampler.observe_infeasible(suggestion, reason)
+                                _observe_infeasible(suggestion, reason)
                                 for duplicate in duplicates:
-                                    sampler.observe_infeasible(duplicate, reason)
+                                    _observe_infeasible(duplicate, reason)
                                 if outcome == "failed":
                                     failure_reasons[reason] = (
                                         failure_reasons.get(reason, 0)
@@ -981,18 +1309,22 @@ class Sweeper:
                                     "Sweeper runner contract violation: a feasible outcome "
                                     "must include both a candidate and observation metrics"
                                 )
-                            sampler.observe(suggestion, observe_metrics)
+                            _observe(suggestion, observe_metrics)
                             replay_cache[key] = (candidate, dict(observe_metrics))
                             for duplicate in duplicates:
-                                sampler.observe(duplicate, observe_metrics)
+                                _observe(duplicate, observe_metrics)
                                 tally["cache_hit"] += 1
                             _record(outcome, candidate)
                             unique_this_round += 1
                     round_no += 1
+                    branch_checkpoint.completed_rounds += 1
+                    branch_stalled = unique_this_round < per_round
+                    if branch_stalled:
+                        branch_checkpoint.stalled = True
+                    _persist_checkpoint()
                     if on_round is not None:
                         on_round(round_no, list(candidates))
-                    if unique_this_round < per_round:
-                        branch_stalled = True
+                    if branch_stalled:
                         if show_progress:
                             tqdm.write(
                                 f"Sweeper {branch.deployment_mode} stopped early: projection stalled after "
@@ -1000,8 +1332,6 @@ class Sweeper:
                                 "new replay configuration(s) in the round"
                             )
                         break
-                if branch_stalled:
-                    continue
 
         # Single-objective -> rank best-first by score; pareto -> the non-dominated front.
         result = (

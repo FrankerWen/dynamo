@@ -632,6 +632,8 @@ struct MockEngineArgsSerde {
     aic_backend: OptionalConfigValue<String>,
     aic_system: OptionalConfigValue<String>,
     aic_backend_version: OptionalConfigValue<String>,
+    aic_database_mode: OptionalConfigValue<String>,
+    aic_analytical_config: OptionalConfigValue<String>,
     aic_tp_size: OptionalConfigValue<usize>,
     aic_model_path: OptionalConfigValue<String>,
     aic_moe_tp_size: OptionalConfigValue<usize>,
@@ -794,6 +796,16 @@ pub struct MockEngineArgs {
     #[serde(skip)]
     #[builder(default = "None")]
     pub aic_backend_version: Option<String>,
+
+    /// AIC perf query mode. `None` preserves the SILICON default.
+    #[serde(skip)]
+    #[builder(default = "None")]
+    pub aic_database_mode: Option<String>,
+
+    /// Canonical JSON for AIC's immutable ANALYTICAL KernelSim policy.
+    #[serde(skip)]
+    #[builder(default = "None")]
+    pub aic_analytical_config: Option<String>,
 
     /// Tensor parallel size for AIC latency prediction.
     /// Only affects AIC performance model lookups, not mocker scheduling.
@@ -1029,6 +1041,43 @@ fn mock_engine_args_validation_error(code: &'static str, message: String) -> Val
 }
 
 fn validate_mock_engine_args(args: &MockEngineArgs) -> Result<(), ValidationError> {
+    if let Some(mode) = args.aic_database_mode.as_deref()
+        && !matches!(
+            mode,
+            "SILICON" | "HYBRID" | "EMPIRICAL" | "SOL" | "SOL_FULL" | "ANALYTICAL"
+        )
+    {
+        return Err(mock_engine_args_validation_error(
+            "aic_database_mode_invalid",
+            format!(
+                "aic_database_mode must be one of SILICON, HYBRID, EMPIRICAL, SOL, SOL_FULL, or ANALYTICAL; got {mode:?}"
+            ),
+        ));
+    }
+    if let Some(policy) = args.aic_analytical_config.as_deref() {
+        if args.aic_database_mode.as_deref() != Some("ANALYTICAL") {
+            return Err(mock_engine_args_validation_error(
+                "aic_analytical_config_without_mode",
+                "aic_analytical_config requires aic_database_mode=ANALYTICAL".to_string(),
+            ));
+        }
+        match serde_json::from_str::<serde_json::Value>(policy) {
+            Ok(serde_json::Value::Object(_)) => {}
+            Ok(_) => {
+                return Err(mock_engine_args_validation_error(
+                    "aic_analytical_config_not_object",
+                    "aic_analytical_config must be a JSON object".to_string(),
+                ));
+            }
+            Err(error) => {
+                return Err(mock_engine_args_validation_error(
+                    "aic_analytical_config_invalid_json",
+                    format!("aic_analytical_config must be valid JSON: {error}"),
+                ));
+            }
+        }
+    }
+
     if args.block_size == 0 {
         return Err(mock_engine_args_validation_error(
             "block_size_zero",
@@ -1242,6 +1291,12 @@ impl TryFrom<MockEngineArgsSerde> for MockEngineArgs {
         if let Some(aic_backend_version) = compat.aic_backend_version.into_nullable() {
             builder = builder.aic_backend_version(aic_backend_version);
         }
+        if let Some(aic_database_mode) = compat.aic_database_mode.into_nullable() {
+            builder = builder.aic_database_mode(aic_database_mode);
+        }
+        if let Some(aic_analytical_config) = compat.aic_analytical_config.into_nullable() {
+            builder = builder.aic_analytical_config(aic_analytical_config);
+        }
         if let Some(aic_tp_size) = compat.aic_tp_size.into_nullable() {
             builder = builder.aic_tp_size(aic_tp_size);
         }
@@ -1431,6 +1486,17 @@ impl MockEngineArgs {
     }
 
     fn materialize_defaults(&mut self) {
+        if let Some(mode) = self.aic_database_mode.as_mut() {
+            *mode = mode.trim().to_uppercase();
+        }
+        if let Some(policy) = self.aic_analytical_config.as_mut()
+            && let Ok(serde_json::Value::Object(object)) =
+                serde_json::from_str::<serde_json::Value>(policy)
+        {
+            *policy = serde_json::to_string(&object)
+                .expect("serializing a parsed analytical policy cannot fail");
+        }
+
         match self.engine_type {
             EngineType::Vllm => {
                 if self.block_size == 0 {
@@ -1746,6 +1812,53 @@ mod tests {
         assert_eq!(
             restored.kv_transfer_timing_mode,
             KvTransferTimingMode::FullPrompt
+        );
+    }
+
+    #[test]
+    fn analytical_contract_normalizes_mode_and_policy_json() {
+        let args = MockEngineArgs::builder()
+            .aic_database_mode(Some(" analytical ".to_string()))
+            .aic_analytical_config(Some(
+                r#"{"level":"high","attention_algorithm":"fa3"}"#.to_string(),
+            ))
+            .build()
+            .unwrap()
+            .normalized()
+            .unwrap();
+
+        assert_eq!(args.aic_database_mode.as_deref(), Some("ANALYTICAL"));
+        assert_eq!(
+            args.aic_analytical_config.as_deref(),
+            Some(r#"{"attention_algorithm":"fa3","level":"high"}"#)
+        );
+    }
+
+    #[test]
+    fn analytical_contract_fails_closed_on_invalid_policy() {
+        let without_mode = MockEngineArgs::builder()
+            .aic_analytical_config(Some("{}".to_string()))
+            .build()
+            .unwrap()
+            .normalized()
+            .unwrap_err();
+        assert!(
+            without_mode
+                .to_string()
+                .contains("aic_analytical_config requires aic_database_mode=ANALYTICAL")
+        );
+
+        let non_object = MockEngineArgs::builder()
+            .aic_database_mode(Some("ANALYTICAL".to_string()))
+            .aic_analytical_config(Some("[]".to_string()))
+            .build()
+            .unwrap()
+            .normalized()
+            .unwrap_err();
+        assert!(
+            non_object
+                .to_string()
+                .contains("aic_analytical_config must be a JSON object")
         );
     }
 

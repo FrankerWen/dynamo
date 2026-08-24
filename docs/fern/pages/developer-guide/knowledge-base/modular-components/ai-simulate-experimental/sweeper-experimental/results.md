@@ -55,3 +55,18 @@ print(best.metrics)
 
 Exact repeated suggestions reuse a result from the current `run` call. The cache does not persist
 between calls, even when the same `Sweeper` instance is reused.
+
+## Load-Sweep Output
+
+When the configuration contains `load_sweep`, `Sweeper.run` returns a `LoadSweepResult` instead of
+the legacy candidate list. It contains:
+
+| Field | Meaning |
+|---|---|
+| `load_axis` | currently `arrival_speedup_ratio` |
+| `load_conditioned_pareto` | one fixed-load Pareto front for each configured value |
+| `global_operating_envelope` | non-dominated candidates over the union of those fronts |
+
+Every returned candidate records its concrete `arrival_speedup_ratio` in `Candidate.config`.
+The Dynamo example runner writes this structure under `load_sweep_result` when `--output-json` is
+set. A normal single-workload run keeps the existing top-level `candidates` array.
