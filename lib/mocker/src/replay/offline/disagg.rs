@@ -46,7 +46,9 @@ use crate::common::handoff::{
 #[cfg(test)]
 use crate::common::protocols::ForwardPassSnapshot;
 use crate::common::protocols::{DirectRequest, EngineType, MockEngineArgs, OutputSignal};
-use crate::loadgen::{ReplayRequestHashes, ReplayRequestPayload, WorkloadDriver};
+use crate::loadgen::{
+    AgentxReplayController, ReplayRequestHashes, ReplayRequestPayload, WorkloadDriver,
+};
 #[cfg(test)]
 use crate::replay::ReplayRouterMode;
 use crate::replay::{
@@ -84,6 +86,8 @@ pub(crate) enum DisaggTransition {
 #[derive(Debug, Default, Clone, PartialEq)]
 pub(in crate::replay) struct DisaggRuntimeStats {
     request_snapshots: HashMap<Uuid, DisaggRequestSnapshot>,
+    retained_request_states: usize,
+    retained_handoff_indexes: usize,
     prefill_assignments: HashMap<Uuid, DisaggEndpoint>,
     decode_assignments: HashMap<Uuid, DisaggEndpoint>,
     handoff_ms: HashMap<Uuid, f64>,
@@ -786,7 +790,7 @@ impl DisaggFlowState {
         if let Some(capture) = self.conformance_capture.as_mut() {
             capture.lifecycle.push(NormalizedHandoffEvent::Completed);
         }
-        self.retire_completed_request(uuid)
+        self.retire_completed_request(uuid, _stats)
     }
 
     #[inline(never)]
@@ -852,7 +856,11 @@ impl DisaggFlowState {
     }
 
     #[inline(never)]
-    fn retire_completed_request(&mut self, uuid: Uuid) -> Result<()> {
+    fn retire_completed_request(
+        &mut self,
+        uuid: Uuid,
+        #[cfg_attr(not(test), allow(unused_variables))] stats: &mut DisaggRuntimeStats,
+    ) -> Result<()> {
         let ready = {
             let state = self.state(uuid)?;
             !state.counted_in_flight && state.coordinator.is_complete()
@@ -865,11 +873,22 @@ impl DisaggFlowState {
         }
 
         let handoff_id = self.state(uuid)?.handoff_id;
-        self.state_mut(uuid)?.mark_done();
+        match self.requests_by_handoff.get(&handoff_id) {
+            Some(mapped_uuid) if *mapped_uuid == uuid => {}
+            _ => bail!("offline disagg replay handoff index is inconsistent for {uuid}"),
+        }
+
+        let mut state = self
+            .requests
+            .remove(&uuid)
+            .ok_or_else(|| anyhow!("offline disagg replay request state is missing for {uuid}"))?;
+        state.mark_done();
         let removed = self.requests_by_handoff.remove(&handoff_id);
         if removed != Some(uuid) {
             bail!("offline disagg replay handoff index is inconsistent for {uuid}");
         }
+        #[cfg(test)]
+        stats.request_snapshots.insert(uuid, state.debug_snapshot());
         Ok(())
     }
 }
@@ -961,6 +980,21 @@ impl DisaggRuntimeImpl<PoolRoundRobinPlacement<()>, NoEngineEvents, NoReplayMeta
             |_, topology| Ok(PoolRoundRobinPlacement::new(topology)),
         )
     }
+
+    pub(in crate::replay) fn new_round_robin_agentx(
+        config: &OfflineDisaggReplayConfig,
+        controller: AgentxReplayController,
+    ) -> Result<Self> {
+        Self::new_composed(
+            config,
+            AdmissionQueue::new_agentx(controller),
+            false,
+            false,
+            false,
+            |_, topology| Ok(PoolRoundRobinPlacement::new(topology)),
+            |_, topology| Ok(PoolRoundRobinPlacement::new(topology)),
+        )
+    }
 }
 
 impl<PlacementPolicyImpl, Observation, Metadata>
@@ -1007,7 +1041,7 @@ where
             config.prefill_args.clone(),
             config.num_prefill_workers,
             prefill_capture_raw,
-        );
+        )?;
         prefill_engine.set_scaling_args(config.prefill_args.clone(), prefill_capture_raw);
         let mut decode_engine = EngineComponent::<Observation>::new_ranked_with_capture(
             SimulationWorkerStage::Decode,
@@ -1015,7 +1049,7 @@ where
             config.decode_args.clone(),
             config.num_decode_workers,
             decode_capture_raw,
-        );
+        )?;
         decode_engine.set_scaling_args(config.decode_args.clone(), decode_capture_raw);
         let prefill_placement =
             create_prefill_placement(&config.prefill_args, prefill_engine.active_topology())?;
@@ -1728,7 +1762,7 @@ where
                     .push(DisaggTransition::WorkloadCompleted { uuid });
             }
         }
-        self.flow.retire_completed_request(uuid)
+        self.flow.retire_completed_request(uuid, &mut self.stats)
     }
 
     /// Admit one external request into prefill-side state, collector state, and optional router.
@@ -1762,6 +1796,7 @@ where
             && self.decode_engine.is_drained()
             && self.flow.action_queues.is_empty()
             && self.flow.requests_by_handoff.is_empty()
+            && self.flow.requests.is_empty()
     }
 
     /// Return true once the request workload is complete, even if `WorkerReady`
@@ -1773,6 +1808,7 @@ where
             && self.decode_engine.is_drained()
             && self.flow.action_queues.is_empty()
             && self.flow.requests_by_handoff.is_empty()
+            && self.flow.requests.is_empty()
             && self.only_idle_events_remain()
     }
 
@@ -2039,6 +2075,7 @@ where
                 metadata,
                 session_id,
                 turn_index,
+                agentx_context,
             } = ready;
             let session_metadata = session_id.clone().zip(turn_index);
             let uuid = self.on_external_arrival(
@@ -2050,6 +2087,9 @@ where
             if let Some((session_id, turn_index)) = session_metadata {
                 self.collector
                     .on_session_metadata(uuid, session_id, turn_index);
+            }
+            if let Some(context) = agentx_context {
+                self.collector.on_agentx_context(uuid, context);
             }
             released_any = true;
         }
@@ -2522,18 +2562,17 @@ where
                 .filter(|state| state.counted_in_flight)
                 .count();
             assert_eq!(self.flow.logical_in_flight, counted);
-            for state in self.flow.requests.values() {
+            for (uuid, state) in &self.flow.requests {
                 assert_eq!(
                     state.counted_in_flight,
                     !matches!(state.phase, DisaggPhase::CleanupPending | DisaggPhase::Done)
                 );
+                self.stats
+                    .request_snapshots
+                    .insert(*uuid, state.debug_snapshot());
             }
-            self.stats.request_snapshots = self
-                .flow
-                .requests
-                .iter()
-                .map(|(uuid, state)| (*uuid, state.debug_snapshot()))
-                .collect();
+            self.stats.retained_request_states = self.flow.requests.len();
+            self.stats.retained_handoff_indexes = self.flow.requests_by_handoff.len();
         }
     }
 
@@ -2546,7 +2585,10 @@ where
     /// `worker_count()` counts active + starting-up + draining workers, so this
     /// captures the startup ramp and the scale-down drain tail.
     fn advance_now_ms(&mut self, new_now_ms: f64) {
-        let dt_ms = (new_now_ms - self.now_ms).max(0.0);
+        let dt_ms = self
+            .admission
+            .agentx_profile_overlap_ms(self.now_ms, new_now_ms)
+            .unwrap_or_else(|| (new_now_ms - self.now_ms).max(0.0));
         if dt_ms > 0.0 {
             let prefill_worker_seconds = self.prefill_engine.worker_count() as f64 * dt_ms / 1000.0;
             let decode_worker_seconds = self.decode_engine.worker_count() as f64 * dt_ms / 1000.0;
@@ -2601,7 +2643,7 @@ where
             self.collector.clear_static_worker_count();
         }
         // -- prefill --
-        let delta = self.prefill_engine.apply_target_count(target_prefill);
+        let delta = self.prefill_engine.apply_target_count(target_prefill)?;
         let prefill_delay = self.prefill_engine.startup_time_ms();
         let mut prefill_releases = Vec::new();
         for &id in &delta.added {
@@ -2674,7 +2716,7 @@ where
         }
 
         // -- decode --
-        let delta = self.decode_engine.apply_target_count(target_decode);
+        let delta = self.decode_engine.apply_target_count(target_decode)?;
         let decode_delay = self.decode_engine.startup_time_ms();
         let mut decode_releases = Vec::new();
         for &id in &delta.added {
@@ -2954,6 +2996,37 @@ where
 
         self.progress.finish();
         self.finish_test_stats();
+        if let Some(summary) = self.admission.agentx_summary() {
+            self.collector.set_agentx_summary(summary);
+        }
+        #[cfg(feature = "kvbm-offload")]
+        if self.prefill_engine.offload_requested() || self.decode_engine.offload_requested() {
+            let expected = self
+                .prefill_engine
+                .configured_scheduler_rank_count()
+                .saturating_add(self.decode_engine.configured_scheduler_rank_count());
+            let mut snapshots = self
+                .prefill_engine
+                .offload_resource_snapshots()
+                .into_iter()
+                .map(|(worker_id, dp_rank, snapshot)| {
+                    ("prefill".to_string(), worker_id, dp_rank, snapshot)
+                })
+                .collect::<Vec<_>>();
+            snapshots.extend(
+                self.decode_engine
+                    .offload_resource_snapshots()
+                    .into_iter()
+                    .map(|(worker_id, dp_rank, snapshot)| {
+                        ("decode".to_string(), worker_id, dp_rank, snapshot)
+                    }),
+            );
+            self.collector.set_offload_summary(
+                crate::replay::OffloadResourceSummary::from_engine_snapshots(
+                    true, expected, snapshots,
+                ),
+            );
+        }
         Ok((self.collector, self.stats))
     }
 

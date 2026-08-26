@@ -470,6 +470,13 @@ struct VllmTerminalEffects {
 }
 
 impl VllmCore {
+    #[cfg(feature = "kvbm-offload")]
+    pub(crate) fn offload_resource_snapshot(
+        &self,
+    ) -> Option<crate::kvbm_offload::OffloadEngineSnapshot> {
+        self.kv_manager.offload_resource_snapshot()
+    }
+
     pub(crate) fn new(args: MockEngineArgs) -> Self {
         Self::new_internal(args, 0, 0, None, KvEventPublishers::default())
     }
@@ -989,6 +996,8 @@ impl VllmCore {
         let transfer_timing = self.state.requests.get(&uuid).map(|request| {
             prefill_handoff_transfer_timing(
                 request.sequence.num_input_tokens(),
+                self.args.block_size,
+                self.args.kv_block_footprint_bytes.as_deref(),
                 self.args.kv_transfer_bandwidth,
                 self.args.kv_bytes_per_token,
                 self.args.kv_transfer_timing_mode,
@@ -2214,6 +2223,8 @@ impl VllmCore {
                     self.args.worker_type,
                     true,
                     request.sequence.num_input_tokens(),
+                    self.args.block_size,
+                    self.args.kv_block_footprint_bytes.as_deref(),
                     self.args.kv_transfer_bandwidth,
                     self.args.kv_bytes_per_token,
                 );
@@ -2383,6 +2394,8 @@ impl VllmCore {
                         worker_type,
                         completed,
                         request.sequence.num_input_tokens(),
+                        self.args.block_size,
+                        self.args.kv_block_footprint_bytes.as_deref(),
                         kv_transfer_bandwidth,
                         kv_bytes_per_token,
                     );
@@ -2638,6 +2651,8 @@ impl VllmCore {
                         self.args.worker_type,
                         is_complete,
                         prompt_tokens,
+                        self.args.block_size,
+                        self.args.kv_block_footprint_bytes.as_deref(),
                         self.args.kv_transfer_bandwidth,
                         self.args.kv_bytes_per_token,
                     ),

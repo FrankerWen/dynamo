@@ -14,6 +14,7 @@ from dynamo._internal.aic import (
     _normalize_aic_quant_mode,
     _pad_nextn_accept_rates,
     _resolve_quant_mode,
+    compute_kv_block_footprint_bytes,
     estimate_num_gpu_blocks,
     resolve_backend_version,
 )
@@ -114,6 +115,87 @@ def test_estimate_num_gpu_blocks_maps_vllm_to_total_fraction(monkeypatch):
     assert kw["scheduler_block_size"] == 10
     assert kw["max_num_tokens"] == 128
     assert kw["tp_size"] == 1
+
+
+def test_compute_kv_block_footprint_uses_aic_nonlinear_sequence_curve(
+    monkeypatch,
+):
+    import dynamo._internal.aic as aic_mod
+
+    calls = []
+
+    class FakeModel:
+        @staticmethod
+        def get_kvcache_bytes_per_sequence(seq_len):
+            # Fixed decode state + a window-capped term + compressed entries.
+            return 100 + 10 * min(seq_len, 8) + 2 * (seq_len // 4)
+
+    def get_model(**kwargs):
+        calls.append(kwargs)
+        return FakeModel()
+
+    monkeypatch.setattr(
+        aic_mod,
+        "_load_aiconfigurator",
+        lambda: {
+            "config": types.SimpleNamespace(ModelConfig=lambda **kwargs: kwargs),
+            "get_model": get_model,
+        },
+    )
+
+    footprint = compute_kv_block_footprint_bytes(
+        backend_name="sglang",
+        model_path="deepseek-v4-pro",
+        tp_size=2,
+        block_size=4,
+        max_model_len=12,
+        moe_tp_size=4,
+        moe_ep_size=8,
+        attention_dp_size=2,
+    )
+
+    assert footprint == [142, 42, 2]
+    assert calls == [
+        {
+            "model_path": "deepseek-v4-pro",
+            "model_config": {
+                "tp_size": 2,
+                "moe_tp_size": 4,
+                "moe_ep_size": 8,
+                "attention_dp_size": 2,
+            },
+            "backend_name": "sglang",
+        }
+    ]
+
+
+def test_compute_kv_block_footprint_rejects_non_increasing_aic_curve(
+    monkeypatch,
+):
+    import dynamo._internal.aic as aic_mod
+
+    class FlatModel:
+        @staticmethod
+        def get_kvcache_bytes_per_sequence(_seq_len):
+            return 100
+
+    monkeypatch.setattr(
+        aic_mod,
+        "_load_aiconfigurator",
+        lambda: {
+            "config": types.SimpleNamespace(ModelConfig=lambda **kwargs: kwargs),
+            "get_model": lambda **_kwargs: FlatModel(),
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="non-increasing KV footprint"):
+        compute_kv_block_footprint_bytes(
+            backend_name="sglang",
+            model_path="flat",
+            tp_size=1,
+            block_size=4,
+            max_model_len=8,
+        )
 
 
 def test_estimate_num_gpu_blocks_maps_sglang_to_static_fraction(monkeypatch):

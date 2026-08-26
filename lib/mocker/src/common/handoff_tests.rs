@@ -24,6 +24,7 @@ fn transfer_timing(delay_ms: Option<f64>) -> HandoffTransferTiming {
     HandoffTransferTiming {
         mode: KvTransferTimingMode::FullPrompt,
         full_prompt_tokens: 1,
+        full_prompt_bytes: None,
         kv_bytes_per_token: delay_ms.map(|delay_ms| (delay_ms * 1_000_000.0) as usize),
         bandwidth_gb_s: delay_ms.map(|_| 1.0),
     }
@@ -131,6 +132,7 @@ fn timing_mode_selects_full_or_destination_missing_footprint() {
                 transfer_timing: HandoffTransferTiming {
                     mode,
                     full_prompt_tokens: 8,
+                    full_prompt_bytes: None,
                     kv_bytes_per_token: Some(1_000_000),
                     bandwidth_gb_s: Some(1.0),
                 },
@@ -152,6 +154,36 @@ fn timing_mode_selects_full_or_destination_missing_footprint() {
 }
 
 #[test]
+fn full_prompt_timing_prefers_aic_byte_authority_over_legacy_scalar() {
+    let timing = HandoffTransferTiming {
+        mode: KvTransferTimingMode::FullPrompt,
+        full_prompt_tokens: 8,
+        full_prompt_bytes: Some(3_000_000),
+        kv_bytes_per_token: Some(1_000_000),
+        bandwidth_gb_s: Some(1.0),
+    };
+
+    assert_eq!(timing.full_prompt_delay_ms(), Some(3.0));
+    validate_transfer_timing(timing).unwrap();
+}
+
+#[test]
+fn dynamic_footprint_rejects_destination_missing_without_position_aware_bytes() {
+    let timing = HandoffTransferTiming {
+        mode: KvTransferTimingMode::DestinationMissing,
+        full_prompt_tokens: 8,
+        full_prompt_bytes: Some(3_000_000),
+        kv_bytes_per_token: None,
+        bandwidth_gb_s: Some(1.0),
+    };
+
+    let error = validate_transfer_timing(timing).unwrap_err();
+    assert!(error.to_string().contains(
+        "AIC dynamic block footprints currently support only full-prompt handoff timing"
+    ));
+}
+
+#[test]
 fn full_destination_hit_keeps_zero_delay_transfer_transition() {
     let id = handoff_id();
     let mut coordinator = HandoffCoordinatorCore::new(id, HandoffOrder::SourceFirst);
@@ -163,6 +195,7 @@ fn full_destination_hit_keeps_zero_delay_transfer_transition() {
             transfer_timing: HandoffTransferTiming {
                 mode: KvTransferTimingMode::DestinationMissing,
                 full_prompt_tokens: 8,
+                full_prompt_bytes: None,
                 kv_bytes_per_token: Some(1_000_000),
                 bandwidth_gb_s: Some(1.0),
             },

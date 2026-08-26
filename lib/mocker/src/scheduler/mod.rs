@@ -348,6 +348,16 @@ impl EngineCore {
             Self::Sglang(_) => None,
         }
     }
+
+    #[cfg(feature = "kvbm-offload")]
+    pub(crate) fn offload_resource_snapshot(
+        &self,
+    ) -> Option<crate::kvbm_offload::OffloadEngineSnapshot> {
+        match self {
+            Self::Vllm(core) => core.offload_resource_snapshot(),
+            Self::Sglang(_) => None,
+        }
+    }
 }
 
 pub struct SchedulerCommandEnvelope {
@@ -546,7 +556,8 @@ pub fn init_kvbm_offline(
     Ok(Some(kv_manager.attach_new_offload_engine(engine)))
 }
 
-/// Build an offload engine with its private runtime attached.
+/// Build an offload engine with a live owned runtime or the process-wide
+/// deterministic-offline executor attached.
 ///
 /// kvbm-engine uses background pipeline/session tasks even though the mocker
 /// scheduler is synchronous. Keeping the runtime inside the engine lets each
@@ -556,6 +567,28 @@ fn build_owned_offload_engine(
     config: crate::kvbm_offload::KvbmOffloadConfig,
     drive_mode: crate::kvbm_offload::KvbmDriveMode,
 ) -> anyhow::Result<crate::kvbm_offload::MockOffloadEngine> {
+    if drive_mode == crate::kvbm_offload::KvbmDriveMode::OfflineDeterministic {
+        static OFFLINE_KVBM_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> =
+            std::sync::OnceLock::new();
+        if OFFLINE_KVBM_RUNTIME.get().is_none() {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()?;
+            // A racing initializer may win; dropping this unused runtime is
+            // safe and construction is normally serialized by replay setup.
+            let _ = OFFLINE_KVBM_RUNTIME.set(runtime);
+        }
+        let runtime = OFFLINE_KVBM_RUNTIME
+            .get()
+            .expect("offline KVBM runtime must be initialized");
+        let mut engine = runtime.block_on(
+            crate::kvbm_offload::MockOffloadEngine::new_with_drive_mode(config, drive_mode),
+        )?;
+        engine.attach_runtime_handle(runtime.handle().clone());
+        return Ok(engine);
+    }
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
@@ -1353,12 +1386,10 @@ mod offload_init_tests {
 
     #[test]
     fn init_kvbm_offline_attaches_engine_and_keeps_runtime_alive() {
-        // Sync entry: no ambient tokio runtime. init_kvbm_offline owns
-        // its own runtime and moves it onto the engine via
-        // attach_runtime. After init returns, the engine (and its
-        // runtime) must still be usable — `tick` is a sync call that
-        // internally depends on the worker thread continuing to drain
-        // kvbm-engine's background tasks.
+        // Sync entry: no ambient tokio runtime. init_kvbm_offline attaches the
+        // process-wide deterministic executor. After init returns, the engine
+        // must still be usable — `tick` is a sync call that internally depends
+        // on that executor continuing to drain kvbm-engine background tasks.
         let args = args_with_g2_and_bpt(131_072);
         let mut kv = make_kv_manager();
         let engine = init_kvbm_offline(&args, &mut kv)

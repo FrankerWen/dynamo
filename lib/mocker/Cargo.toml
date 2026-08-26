@@ -51,6 +51,12 @@ rmp-serde = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_path_to_error = { workspace = true }
+sha2 = "0.10"
+tokenizers = { version = "0.21.4", default-features = false, features = [
+  "onig",
+  "esaxx_fast",
+  "rustls-tls",
+] }
 smallvec = { workspace = true }
 tmq = { workspace = true, optional = true }
 tokio = { workspace = true }

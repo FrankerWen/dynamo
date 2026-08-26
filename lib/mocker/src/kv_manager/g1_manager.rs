@@ -517,6 +517,16 @@ impl G1Manager {
     }
 
     #[cfg(feature = "kvbm-offload")]
+    pub(crate) fn offload_resource_snapshot(
+        &self,
+    ) -> Option<crate::kvbm_offload::OffloadEngineSnapshot> {
+        match &self.backend {
+            G1ManagerBackend::Kvbm(manager) => manager.offload_resource_snapshot(),
+            G1ManagerBackend::Native(_) => None,
+        }
+    }
+
+    #[cfg(feature = "kvbm-offload")]
     pub fn tick_offload_engine(&mut self, now_ms: f64) {
         if let G1ManagerBackend::Kvbm(manager) = &mut self.backend {
             manager.tick_offload_engine(now_ms);

@@ -27,6 +27,12 @@ use std::sync::Arc;
 #[derive(Clone, Default, Builder, Dissolve)]
 #[builder(pattern = "owned", default)]
 pub struct TransferOptions {
+    /// Logical sequence-block positions for byte-accounted simulation.
+    /// Physical workers may ignore this metadata; the mock KVBM worker uses
+    /// it to apply an AIC-derived non-linear KV footprint per block.
+    #[builder(default, setter(strip_option, into))]
+    pub block_positions: Option<Arc<[u64]>>,
+
     /// Range of layers to transfer (None = all layers).
     ///
     /// When specified, only the layers in this range will be transferred.
@@ -112,6 +118,7 @@ mod tests {
         assert!(options.layer_range.is_none());
         assert!(options.nixl_write_notification.is_none());
         assert!(options.bounce_buffer.is_none());
+        assert!(options.block_positions.is_none());
     }
 
     #[test]

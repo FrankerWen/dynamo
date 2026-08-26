@@ -20,7 +20,10 @@ use super::scaling::ReplayScalingPolicy;
 use super::single::{SingleReplayMode, SingleRuntime};
 use crate::common::handoff::NormalizedHandoffConformance;
 use crate::common::protocols::{DirectRequest, EngineType, MockEngineArgs, SglangArgs, WorkerType};
-use crate::loadgen::{AgenticTrace, Trace, WorkloadDriver};
+use crate::loadgen::{
+    AgenticTrace, AgentxCompiledCorpus, AgentxReplayConfig, AgentxReplayController, Trace,
+    WorkloadDriver,
+};
 use crate::replay::OfflineDisaggReplayConfig;
 use crate::replay::{
     ReplayPrefillLoadEstimator, ReplayRouterMode, ReplayWorkerArtifacts, SlaThresholds,
@@ -45,6 +48,14 @@ fn use_single_runtime(num_workers: usize, dp_size: u32, router_mode: ReplayRoute
     // dp_size>1 needs one scheduler/KV pool per rank. They still share one
     // discrete-event runtime, but require the rank-aware AggRuntime path.
     num_workers == 1 && dp_size <= 1 && router_mode != ReplayRouterMode::KvRouter
+}
+
+fn offload_evidence_requested(args: &MockEngineArgs) -> bool {
+    args.g2_capacity_bytes.is_some_and(|bytes| bytes > 0)
+        || args.num_g2_blocks.is_some_and(|blocks| blocks > 0)
+        || args.g2_rank_resource_configs.is_some()
+        || args.num_g3_blocks.is_some_and(|blocks| blocks > 0)
+        || args.enable_g4_storage
 }
 
 fn trace_workload_driver(
@@ -101,6 +112,194 @@ fn agentic_workload_driver(
             WorkloadDriver::new_agentic_trace_without_replay_hashes(trace, engine_block_size)
         }
         ReplayRouterMode::KvRouter => trace.into_trace_driver_with_block_size(engine_block_size),
+    }
+}
+
+/// Run exact AgentX session-tree replay against an aggregated topology. The
+/// phased controller is the admission source; no legacy replay-concurrency or
+/// arrival-rate policy is layered on top.
+#[allow(clippy::too_many_arguments)]
+pub fn simulate_agentx_exact_workload(
+    args: MockEngineArgs,
+    router_config: Option<ReplayKvRouterConfig>,
+    prefill_load_estimator: Option<ReplayPrefillLoadEstimator>,
+    corpus: AgentxCompiledCorpus,
+    protocol: AgentxReplayConfig,
+    num_workers: usize,
+    router_mode: ReplayRouterMode,
+    record_per_request: bool,
+    sla: SlaThresholds,
+) -> Result<TraceSimulationReport> {
+    let started_at = Instant::now();
+    let args = args.normalized()?;
+    let scheduler_backend = engine_type_name(args.engine_type).to_string();
+    let aic_lookup_backend = args.aic_backend.clone();
+    let aic_lookup_backend_version = args.aic_backend_version.clone();
+    let aic_system = args.aic_system.clone();
+    let aic_model_path = args.aic_model_path.clone();
+    let aic_systems_path = args.aic_systems_path.clone();
+    let aic_database_snapshot_sha256 = args.aic_database_snapshot_sha256.clone();
+    let controller = AgentxReplayController::new_compiled(
+        corpus,
+        protocol,
+        args.block_size,
+        router_mode == ReplayRouterMode::KvRouter,
+    )?;
+    let prepared = match router_mode {
+        ReplayRouterMode::RoundRobin => PreparedOfflineReplay::AggRoundRobin(
+            RoundRobinAggRuntime::new_round_robin_agentx(&args, controller, num_workers)?
+                .with_per_request_records(record_per_request),
+        ),
+        ReplayRouterMode::KvRouter => PreparedOfflineReplay::AggKv(
+            AggRuntime::new_agentx(
+                &args,
+                router_config,
+                prefill_load_estimator,
+                controller,
+                num_workers,
+                router_mode,
+            )?
+            .with_per_request_records(record_per_request),
+        ),
+    };
+    let collector = prepared.run(None)?;
+    let mut report = finish_with_replay_wall_time(collector, started_at, sla);
+    if let Some(agentx) = report.agentx.as_mut() {
+        agentx.topology = Some("aggregated".to_string());
+        agentx.scheduler_backend = Some(scheduler_backend.clone());
+        agentx.aic_lookup_backend = aic_lookup_backend.clone();
+        agentx.aic_lookup_backend_version = aic_lookup_backend_version;
+        agentx.aic_system = aic_system;
+        agentx.aic_model_path = aic_model_path;
+        agentx.aic_systems_path = aic_systems_path;
+        agentx.aic_database_snapshot_sha256 = aic_database_snapshot_sha256;
+        agentx.sglang_scheduler_faithful = scheduler_backend == "sglang";
+        agentx.backend_fidelity_note = Some(backend_fidelity_note(
+            &scheduler_backend,
+            aic_lookup_backend.as_deref(),
+        ));
+    }
+    Ok(report)
+}
+
+/// Run exact AgentX session-tree replay against a disaggregated topology using
+/// the same admission/controller implementation as aggregated replay.
+#[allow(clippy::too_many_arguments)]
+pub fn simulate_agentx_exact_workload_disagg(
+    config: OfflineDisaggReplayConfig,
+    router_config: Option<ReplayKvRouterConfig>,
+    prefill_load_estimator: Option<ReplayPrefillLoadEstimator>,
+    corpus: AgentxCompiledCorpus,
+    protocol: AgentxReplayConfig,
+    router_mode: ReplayRouterMode,
+    record_per_request: bool,
+    sla: SlaThresholds,
+) -> Result<TraceSimulationReport> {
+    let started_at = Instant::now();
+    let config = config.normalized()?;
+    let prefill_scheduler_backend = engine_type_name(config.prefill_args.engine_type).to_string();
+    let decode_scheduler_backend = engine_type_name(config.decode_args.engine_type).to_string();
+    let aic_lookup_backend = config
+        .prefill_args
+        .aic_backend
+        .clone()
+        .or_else(|| config.decode_args.aic_backend.clone());
+    let aic_lookup_backend_version = config
+        .prefill_args
+        .aic_backend_version
+        .clone()
+        .or_else(|| config.decode_args.aic_backend_version.clone());
+    let aic_system = config
+        .prefill_args
+        .aic_system
+        .clone()
+        .or_else(|| config.decode_args.aic_system.clone());
+    let aic_model_path = config
+        .prefill_args
+        .aic_model_path
+        .clone()
+        .or_else(|| config.decode_args.aic_model_path.clone());
+    let aic_systems_path = config
+        .prefill_args
+        .aic_systems_path
+        .clone()
+        .or_else(|| config.decode_args.aic_systems_path.clone());
+    let aic_database_snapshot_sha256 = config
+        .prefill_args
+        .aic_database_snapshot_sha256
+        .clone()
+        .or_else(|| config.decode_args.aic_database_snapshot_sha256.clone());
+    let controller = AgentxReplayController::new_compiled(
+        corpus,
+        protocol,
+        config.prefill_args.block_size,
+        router_mode == ReplayRouterMode::KvRouter,
+    )?;
+    let prepared = match router_mode {
+        ReplayRouterMode::RoundRobin => PreparedOfflineReplay::DisaggRoundRobin(
+            RoundRobinDisaggRuntime::new_round_robin_agentx(&config, controller)?
+                .with_per_request_records(record_per_request),
+        ),
+        ReplayRouterMode::KvRouter => PreparedOfflineReplay::DisaggKv(
+            DisaggRuntime::new_agentx(
+                &config,
+                router_config,
+                prefill_load_estimator,
+                controller,
+                router_mode,
+            )?
+            .with_per_request_records(record_per_request),
+        ),
+    };
+    let collector = prepared.run(None)?;
+    let mut report = finish_with_replay_wall_time(collector, started_at, sla);
+    if let Some(agentx) = report.agentx.as_mut() {
+        agentx.topology = Some("disaggregated".to_string());
+        agentx.prefill_scheduler_backend = Some(prefill_scheduler_backend.clone());
+        agentx.decode_scheduler_backend = Some(decode_scheduler_backend.clone());
+        agentx.scheduler_backend = (prefill_scheduler_backend == decode_scheduler_backend)
+            .then_some(prefill_scheduler_backend.clone());
+        agentx.aic_lookup_backend = aic_lookup_backend.clone();
+        agentx.aic_lookup_backend_version = aic_lookup_backend_version;
+        agentx.aic_system = aic_system;
+        agentx.aic_model_path = aic_model_path;
+        agentx.aic_systems_path = aic_systems_path;
+        agentx.aic_database_snapshot_sha256 = aic_database_snapshot_sha256;
+        agentx.sglang_scheduler_faithful =
+            prefill_scheduler_backend == "sglang" && decode_scheduler_backend == "sglang";
+        agentx.backend_fidelity_note = Some(backend_fidelity_note(
+            &format!("{prefill_scheduler_backend}/{decode_scheduler_backend}"),
+            aic_lookup_backend.as_deref(),
+        ));
+    }
+    Ok(report)
+}
+
+fn engine_type_name(engine_type: EngineType) -> &'static str {
+    match engine_type {
+        EngineType::Vllm => "vllm",
+        EngineType::Sglang => "sglang",
+        EngineType::Trtllm => "trtllm",
+    }
+}
+
+fn backend_fidelity_note(scheduler_backend: &str, lookup_backend: Option<&str>) -> String {
+    match lookup_backend {
+        Some(lookup)
+            if !scheduler_backend
+                .split('/')
+                .all(|backend| backend == lookup) =>
+        {
+            format!(
+                "scheduler semantics are {scheduler_backend}; {lookup} is service-time lookup only"
+            )
+        }
+        Some(lookup) => {
+            format!("scheduler semantics are {scheduler_backend}; service-time lookup is {lookup}")
+        }
+        None => format!(
+            "scheduler semantics are {scheduler_backend}; service-time lookup uses the configured mock perf model"
+        ),
     }
 }
 
@@ -218,7 +417,10 @@ pub(crate) fn simulate_trace_with_scaling_policy(
     sla: SlaThresholds,
     scaling_policy: Option<Box<dyn ReplayScalingPolicy>>,
 ) -> Result<TraceSimulationReport> {
-    if scaling_policy.is_none() && use_single_runtime(num_workers, args.dp_size, router_mode) {
+    if scaling_policy.is_none()
+        && use_single_runtime(num_workers, args.dp_size, router_mode)
+        && !offload_evidence_requested(&args)
+    {
         simulate_trace_single(
             args,
             requests,
@@ -287,7 +489,10 @@ pub(crate) fn simulate_concurrency_with_scaling_policy(
     sla: SlaThresholds,
     scaling_policy: Option<Box<dyn ReplayScalingPolicy>>,
 ) -> Result<TraceSimulationReport> {
-    if scaling_policy.is_none() && use_single_runtime(num_workers, args.dp_size, router_mode) {
+    if scaling_policy.is_none()
+        && use_single_runtime(num_workers, args.dp_size, router_mode)
+        && !offload_evidence_requested(&args)
+    {
         simulate_concurrency_single(
             args,
             requests,
@@ -412,7 +617,9 @@ pub(crate) fn simulate_agentic_trace_workload(
     record_per_request: bool,
     sla: SlaThresholds,
 ) -> Result<TraceSimulationReport> {
-    if use_single_runtime(num_workers, args.dp_size, router_mode) {
+    if use_single_runtime(num_workers, args.dp_size, router_mode)
+        && !offload_evidence_requested(&args)
+    {
         simulate_agentic_trace_workload_single(args, trace, record_per_request, sla)
     } else {
         simulate_agentic_trace_workload_multi(
@@ -471,7 +678,10 @@ fn simulate_trace_workload_with_delta_mode(
     sla: SlaThresholds,
     scaling_policy: Option<Box<dyn ReplayScalingPolicy>>,
 ) -> Result<TraceSimulationReport> {
-    if scaling_policy.is_none() && use_single_runtime(num_workers, args.dp_size, router_mode) {
+    if scaling_policy.is_none()
+        && use_single_runtime(num_workers, args.dp_size, router_mode)
+        && !offload_evidence_requested(&args)
+    {
         simulate_trace_workload_single(
             args,
             trace,
@@ -603,7 +813,10 @@ fn simulate_concurrency_workload_with_delta_mode(
     sla: SlaThresholds,
     scaling_policy: Option<Box<dyn ReplayScalingPolicy>>,
 ) -> Result<TraceSimulationReport> {
-    if scaling_policy.is_none() && use_single_runtime(num_workers, args.dp_size, router_mode) {
+    if scaling_policy.is_none()
+        && use_single_runtime(num_workers, args.dp_size, router_mode)
+        && !offload_evidence_requested(&args)
+    {
         simulate_concurrency_workload_single(
             args,
             trace,
@@ -1728,17 +1941,20 @@ pub(super) fn run_concurrency_workload_collect(
 mod tests {
     #[cfg(feature = "kvbm-offload")]
     use super::simulate_trace_disagg;
-    use super::{generate_trace_worker_artifacts, simulate_trace, use_single_runtime};
+    use super::{
+        generate_trace_worker_artifacts, simulate_agentx_exact_workload,
+        simulate_agentx_exact_workload_disagg, simulate_trace, use_single_runtime,
+    };
     use crate::common::perf_model::{AicCallback, PerfModel};
-    #[cfg(feature = "kvbm-offload")]
-    use crate::common::protocols::WorkerType;
-    use crate::common::protocols::{DirectRequest, MockEngineArgs};
-    use crate::loadgen::{SessionTrace, Trace, TurnTrace};
-    #[cfg(feature = "kvbm-offload")]
+    use crate::common::protocols::{DirectRequest, MockEngineArgs, WorkerType};
+    use crate::loadgen::{
+        AgentxCompiledCorpus, AgentxReplayConfig, SessionTrace, Trace, TurnTrace,
+        test_agentx_corpus,
+    };
     use crate::replay::OfflineDisaggReplayConfig;
-    #[cfg(feature = "kvbm-offload")]
+    #[cfg(all(feature = "kvbm-offload", feature = "replay-bench"))]
     use crate::replay::{ReplayCaptureOptions, ReplayDeterminism, with_runtime_evidence};
-    use crate::replay::{ReplayRouterMode, SlaThresholds};
+    use crate::replay::{ReplayRouterMode, SlaThresholds, TraceSimulationReport};
     use std::sync::Arc;
     use uuid::Uuid;
 
@@ -1844,12 +2060,19 @@ mod tests {
     fn offload_args(worker_type: WorkerType) -> MockEngineArgs {
         MockEngineArgs::builder()
             .block_size(4)
-            .num_gpu_blocks(4)
+            // Three G1 slots can serve one two-block prompt plus its decode
+            // tail, but cannot retain both distinct prompt prefixes. This
+            // deterministically forces the first prefix through G1 -> G2
+            // before the third request restores it.
+            .num_gpu_blocks(3)
             .max_num_batched_tokens(Some(16))
             .max_num_seqs(Some(2))
+            .max_model_len(Some(12))
             .worker_type(worker_type)
             .num_g2_blocks(Some(8))
-            .kv_bytes_per_token(Some(1))
+            .g2_capacity_bytes(Some(100))
+            .kv_block_footprint_bytes(Some(vec![5, 6, 7]))
+            .kv_footprint_source(Some("aic:forced-g2-transfer-fixture".to_string()))
             .offload_batch_size(Some(1))
             .bandwidth_g1_to_g2_gbps(Some(1.0))
             .bandwidth_g2_to_g1_gbps(Some(1.0))
@@ -1878,7 +2101,10 @@ mod tests {
     }
 
     #[cfg(feature = "kvbm-offload")]
-    fn assert_g2_restore(report: &crate::replay::TraceSimulationReport) {
+    fn assert_g2_restore(
+        report: &crate::replay::TraceSimulationReport,
+        expected_scheduler_ranks: usize,
+    ) {
         let restored = report
             .per_request
             .iter()
@@ -1888,6 +2114,19 @@ mod tests {
             restored.reused_input_tokens, 4,
             "third request should restore one reusable block from G2 after final-block recomputation: {restored:?}"
         );
+        let offload = report
+            .offload
+            .as_ref()
+            .expect("requested KVBM replay must report effective offload evidence");
+        assert!(offload.attached);
+        assert_eq!(offload.capacity_authority, "aic_dynamic_bytes");
+        assert_eq!(offload.attached_scheduler_ranks, expected_scheduler_ranks);
+        assert_eq!(
+            offload.operational_status, "g2_operational_exercised",
+            "offload evidence: {offload:#?}"
+        );
+        assert!(offload.transfers.g1_to_g2.bytes > 0);
+        assert!(offload.transfers.g2_to_g1.bytes > 0);
     }
 
     #[cfg(feature = "kvbm-offload")]
@@ -1908,11 +2147,11 @@ mod tests {
             )
             .unwrap();
             assert_eq!(report.request_counts.completed_requests, 3);
-            assert_g2_restore(&report);
+            assert_g2_restore(&report, 1);
         }
     }
 
-    #[cfg(feature = "kvbm-offload")]
+    #[cfg(all(feature = "kvbm-offload", feature = "replay-bench"))]
     #[test]
     fn aggregated_canonical_evidence_covers_real_kvbm_lifecycle() {
         let mut requests = offload_lifecycle_requests();
@@ -1947,7 +2186,7 @@ mod tests {
         );
         let report = report.unwrap();
         assert_eq!(report.request_counts.completed_requests, 23);
-        assert_g2_restore(&report);
+        assert_g2_restore(&report, 1);
         let kv_ingest = evidence.kv_ingest.unwrap();
         assert_eq!(kv_ingest.batches, 227);
         assert_eq!(kv_ingest.events, 102);
@@ -1987,7 +2226,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(report.request_counts.completed_requests, 3);
-            assert_g2_restore(&report);
+            assert_g2_restore(&report, 2);
         }
     }
 
@@ -2105,5 +2344,135 @@ mod tests {
             1
         );
         assert!(artifacts.output_signals.last().unwrap().signal.completed);
+    }
+
+    fn exact_agentx_fixture() -> (AgentxCompiledCorpus, AgentxReplayConfig) {
+        let corpus = test_agentx_corpus().compile().unwrap();
+        let protocol = AgentxReplayConfig {
+            session_tree_concurrency: 1,
+            trajectory_start_min_ratio: 0.25,
+            trajectory_start_max_ratio: 0.25,
+            warmup_requests_per_lane: 1,
+            profile_duration_s: 0.01,
+            tree_idle_gap_cap_s: 0.002,
+            global_idle_gap_cap_s: 0.001,
+            drain_grace_s: 1.0,
+            benchmark_id: "exact-test".to_string(),
+            ..Default::default()
+        };
+        (corpus, protocol)
+    }
+
+    fn exact_agentx_args(worker_type: WorkerType) -> MockEngineArgs {
+        MockEngineArgs::builder()
+            .block_size(4)
+            .num_gpu_blocks(128)
+            .max_num_batched_tokens(Some(64))
+            .max_num_seqs(Some(8))
+            .worker_type(worker_type)
+            .speedup_ratio(1000.0)
+            .decode_speedup_ratio(1000.0)
+            .build()
+            .unwrap()
+    }
+
+    fn assert_exact_agentx_report(report: &TraceSimulationReport) {
+        let agentx = report
+            .agentx
+            .as_ref()
+            .expect("AgentX evidence must be attached");
+        assert!(agentx.protocol_valid, "{:?}", agentx.invalid_reason);
+        assert!(agentx.profile_completed);
+        assert!(agentx.drain_completed);
+        assert!(!agentx.censored);
+        assert!(agentx.primer.completed > 0);
+        assert!(agentx.warmup.completed > 0);
+        assert!(agentx.profile.completed > 0);
+        assert_eq!(
+            report.request_counts.completed_requests,
+            agentx.profile.completed
+        );
+        assert_eq!(
+            report.request_counts.num_requests,
+            agentx.profile.dispatched
+        );
+        assert!(report.per_request.iter().any(|request| {
+            request
+                .agentx
+                .as_ref()
+                .is_some_and(|context| !context.measurement_eligible)
+        }));
+        let measured = report
+            .per_request
+            .iter()
+            .filter(|request| {
+                request
+                    .agentx
+                    .as_ref()
+                    .is_some_and(|context| context.measurement_eligible)
+            })
+            .collect::<Vec<_>>();
+        let first_start = measured
+            .iter()
+            .map(|request| request.arrival_time_ms)
+            .min_by(f64::total_cmp)
+            .unwrap();
+        let last_end = measured
+            .iter()
+            .map(|request| request.terminal_time_ms)
+            .max_by(f64::total_cmp)
+            .unwrap();
+        assert!(
+            (report.throughput.duration_ms - (last_end - first_start)).abs() < 1e-9,
+            "AgentX throughput must use the measured profile record span"
+        );
+    }
+
+    #[test]
+    fn exact_agentx_aggregate_runs_all_phases_and_filters_measurement() {
+        let (corpus, protocol) = exact_agentx_fixture();
+        let report = simulate_agentx_exact_workload(
+            exact_agentx_args(WorkerType::Aggregated),
+            None,
+            None,
+            corpus,
+            protocol,
+            1,
+            ReplayRouterMode::RoundRobin,
+            true,
+            SlaThresholds::default(),
+        )
+        .unwrap();
+        assert_exact_agentx_report(&report);
+        assert_eq!(
+            report.agentx.as_ref().unwrap().topology.as_deref(),
+            Some("aggregated")
+        );
+    }
+
+    #[test]
+    fn exact_agentx_disagg_reuses_the_same_controller_contract() {
+        let (corpus, protocol) = exact_agentx_fixture();
+        let report = simulate_agentx_exact_workload_disagg(
+            OfflineDisaggReplayConfig {
+                prefill_args: exact_agentx_args(WorkerType::Prefill),
+                decode_args: exact_agentx_args(WorkerType::Decode),
+                num_prefill_workers: 1,
+                num_decode_workers: 1,
+            },
+            None,
+            None,
+            corpus,
+            protocol,
+            ReplayRouterMode::RoundRobin,
+            true,
+            SlaThresholds::default(),
+        )
+        .unwrap();
+        assert_exact_agentx_report(&report);
+        assert_eq!(
+            report.agentx.as_ref().unwrap().topology.as_deref(),
+            Some("disaggregated")
+        );
     }
 }

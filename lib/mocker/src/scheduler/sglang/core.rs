@@ -392,6 +392,8 @@ impl SglangCore {
         let uuid = request.uuid;
         let transfer_timing = prefill_handoff_transfer_timing(
             request.prompt_len(),
+            self.config.block_size,
+            self.config.kv_block_footprint_bytes.as_deref(),
             self.config.kv_transfer_bandwidth,
             self.config.kv_bytes_per_token,
             self.config.kv_transfer_timing_mode,

@@ -571,6 +571,23 @@ pub struct TrtllmArgs {
     pub capacity_scheduler_policy: Option<String>,
 }
 
+/// Physical G2 resources assigned to one offline scheduler rank.
+///
+/// Exact replay may place different `(worker_id, dp_rank)` schedulers on
+/// different physical nodes.  The role-level [`MockEngineArgs`] remains the
+/// immutable scheduler template; this record replaces only the rank-local G2
+/// capacity and the node-scoped directional fabric at worker construction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct G2RankResourceConfig {
+    pub worker_id: usize,
+    pub dp_rank: u32,
+    pub g2_capacity_bytes: usize,
+    pub g2_fabric_id: String,
+    pub bandwidth_g1_to_g2_gbps: f64,
+    pub bandwidth_g2_to_g1_gbps: f64,
+}
+
 /// Keeps omitted JSON fields distinct from explicit `null` so serde can replace
 /// the old hand-written parser without losing input-config semantics.
 #[derive(Debug, Clone, Default)]
@@ -633,6 +650,8 @@ struct MockEngineArgsSerde {
     aic_system: OptionalConfigValue<String>,
     aic_backend_version: OptionalConfigValue<String>,
     aic_database_mode: OptionalConfigValue<String>,
+    aic_systems_path: OptionalConfigValue<String>,
+    aic_database_snapshot_sha256: OptionalConfigValue<String>,
     aic_analytical_config: OptionalConfigValue<String>,
     aic_tp_size: OptionalConfigValue<usize>,
     aic_model_path: OptionalConfigValue<String>,
@@ -654,11 +673,17 @@ struct MockEngineArgsSerde {
     bootstrap_port: OptionalConfigValue<u16>,
     handoff_session_timeout_ms: OptionalConfigValue<u64>,
     kv_bytes_per_token: OptionalConfigValue<usize>,
+    kv_block_footprint_bytes: OptionalConfigValue<Vec<usize>>,
+    kv_footprint_source: OptionalConfigValue<String>,
     kv_transfer_bandwidth: OptionalConfigValue<f64>,
     kv_transfer_timing_mode: OptionalConfigValue<String>,
     num_g2_blocks: OptionalConfigValue<usize>,
+    g2_capacity_bytes: OptionalConfigValue<usize>,
+    g2_fabric_id: OptionalConfigValue<String>,
+    g2_rank_resource_configs: OptionalConfigValue<Vec<G2RankResourceConfig>>,
     num_g3_blocks: OptionalConfigValue<usize>,
     enable_g4_storage: OptionalConfigValue<bool>,
+    g4_capacity_bytes: OptionalConfigValue<usize>,
     offload_batch_size: OptionalConfigValue<usize>,
     bandwidth_g1_to_g2_gbps: OptionalConfigValue<f64>,
     bandwidth_g2_to_g1_gbps: OptionalConfigValue<f64>,
@@ -802,6 +827,20 @@ pub struct MockEngineArgs {
     #[builder(default = "None")]
     pub aic_database_mode: Option<String>,
 
+    /// Single systems root selected from the verified multi-root AIC snapshot
+    /// for this concrete system. The compiled Rust engine cannot consume a
+    /// search-path list and therefore must never guess the first directory.
+    #[serde(skip)]
+    #[builder(default = "None")]
+    pub aic_systems_path: Option<String>,
+
+    /// Content identity of the verified AIC database snapshot. It salts the
+    /// native compiled-engine cache so a database update at the same path can
+    /// never reuse a stale callback.
+    #[serde(skip)]
+    #[builder(default = "None")]
+    pub aic_database_snapshot_sha256: Option<String>,
+
     /// Canonical JSON for AIC's immutable ANALYTICAL KernelSim policy.
     #[serde(skip)]
     #[builder(default = "None")]
@@ -918,6 +957,16 @@ pub struct MockEngineArgs {
     #[builder(default = "None")]
     pub kv_bytes_per_token: Option<usize>,
 
+    /// Rank-local incremental KV bytes for each logical block position.
+    /// When present this AIC-derived profile supersedes the legacy linear
+    /// `kv_bytes_per_token` scalar for offload capacity and transfer timing.
+    #[builder(default = "None")]
+    pub kv_block_footprint_bytes: Option<Vec<usize>>,
+
+    /// Auditable provenance for `kv_block_footprint_bytes`.
+    #[builder(default = "None")]
+    pub kv_footprint_source: Option<String>,
+
     /// KV cache transfer bandwidth in GB/s for disaggregated serving latency simulation.
     /// Default: 64.0 (inter-node InfiniBand). Set to 0 to disable KV transfer delay.
     /// For intra-node NVLink, typical value is ~450.
@@ -938,6 +987,27 @@ pub struct MockEngineArgs {
     #[validate(range(min = 1))]
     pub num_g2_blocks: Option<usize>,
 
+    /// Rank-local physical host-memory budget backing G2. Exact AgentX
+    /// trials use this byte cap together with the AIC block-footprint profile;
+    /// `num_g2_blocks` remains a scheduler slot bound for legacy KVBM APIs.
+    #[builder(default = "None")]
+    #[validate(range(min = 1))]
+    pub g2_capacity_bytes: Option<usize>,
+
+    /// Physical host-memory fabric shared by scheduler ranks. Ranks with the
+    /// same non-empty id contend on one pair of G1<->G2 directional
+    /// processor-sharing queues. `None` preserves the legacy rank-local
+    /// bandwidth model.
+    #[builder(default = "None")]
+    pub g2_fabric_id: Option<String>,
+
+    /// Offline-only physical resource overrides keyed by `(worker_id,
+    /// dp_rank)`.  When present, every constructed scheduler rank must have
+    /// exactly one entry.  This prevents a role-wide G2 capacity or fabric
+    /// from being silently replicated across ranks placed on different nodes.
+    #[builder(default = "None")]
+    pub g2_rank_resource_configs: Option<Vec<G2RankResourceConfig>>,
+
     /// KVBM G3 shared lower-tier block capacity. Positive values require
     /// `num_g2_blocks` and a resolvable KV block byte size; 0 disables G3.
     #[builder(default = "None")]
@@ -948,6 +1018,12 @@ pub struct MockEngineArgs {
     /// and uses object presence operations instead of a `BlockManager<G4>`.
     #[builder(default = "false")]
     pub enable_g4_storage: bool,
+
+    /// Deployment-shared finite G4 byte capacity. Required whenever G4 is
+    /// enabled; the exact mocker uses deterministic LRU eviction at this cap.
+    #[builder(default = "None")]
+    #[validate(range(min = 1))]
+    pub g4_capacity_bytes: Option<usize>,
 
     /// Batch size for the G1→G2 offload pipeline. Offloads are grouped
     /// into batches of this size before being handed to the worker.
@@ -1054,6 +1130,34 @@ fn validate_mock_engine_args(args: &MockEngineArgs) -> Result<(), ValidationErro
             ),
         ));
     }
+    match (
+        args.aic_systems_path.as_deref(),
+        args.aic_database_snapshot_sha256.as_deref(),
+    ) {
+        (Some(path), Some(digest)) => {
+            if path.trim().is_empty() {
+                return Err(mock_engine_args_validation_error(
+                    "aic_systems_path_empty",
+                    "aic_systems_path must be non-empty".to_string(),
+                ));
+            }
+            if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(mock_engine_args_validation_error(
+                    "aic_database_snapshot_sha256_invalid",
+                    "aic_database_snapshot_sha256 must be a 64-character hexadecimal digest"
+                        .to_string(),
+                ));
+            }
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(mock_engine_args_validation_error(
+                "aic_database_identity_incomplete",
+                "aic_systems_path and aic_database_snapshot_sha256 must be configured together"
+                    .to_string(),
+            ));
+        }
+        (None, None) => {}
+    }
     if let Some(policy) = args.aic_analytical_config.as_deref() {
         if args.aic_database_mode.as_deref() != Some("ANALYTICAL") {
             return Err(mock_engine_args_validation_error(
@@ -1103,7 +1207,87 @@ fn validate_mock_engine_args(args: &MockEngineArgs) -> Result<(), ValidationErro
         ));
     }
 
-    if args.num_g3_blocks.is_some() && args.num_g2_blocks.is_none() {
+    if let Some(fabric_id) = args.g2_fabric_id.as_deref() {
+        if fabric_id.trim().is_empty() {
+            return Err(mock_engine_args_validation_error(
+                "empty_g2_fabric_id",
+                "g2_fabric_id must be a non-empty physical resource-domain id".to_string(),
+            ));
+        }
+        if args.num_g2_blocks.is_none() && args.g2_capacity_bytes.is_none() {
+            return Err(mock_engine_args_validation_error(
+                "g2_fabric_without_g2",
+                "g2_fabric_id requires an enabled G2 tier".to_string(),
+            ));
+        }
+    }
+
+    if let Some(configs) = args.g2_rank_resource_configs.as_ref() {
+        if configs.is_empty() {
+            return Err(mock_engine_args_validation_error(
+                "empty_g2_rank_resource_configs",
+                "g2_rank_resource_configs must contain one entry per offline scheduler rank"
+                    .to_string(),
+            ));
+        }
+        if args.g2_capacity_bytes.is_some() || args.g2_fabric_id.is_some() {
+            return Err(mock_engine_args_validation_error(
+                "mixed_role_and_rank_g2_resources",
+                "g2_rank_resource_configs cannot be combined with role-wide g2_capacity_bytes or g2_fabric_id"
+                    .to_string(),
+            ));
+        }
+        let mut identities = std::collections::HashSet::with_capacity(configs.len());
+        for config in configs {
+            if config.g2_capacity_bytes == 0 {
+                return Err(mock_engine_args_validation_error(
+                    "zero_rank_g2_capacity",
+                    format!(
+                        "G2 rank resource ({}, {}) has zero capacity",
+                        config.worker_id, config.dp_rank
+                    ),
+                ));
+            }
+            if config.g2_fabric_id.trim().is_empty() {
+                return Err(mock_engine_args_validation_error(
+                    "empty_rank_g2_fabric_id",
+                    format!(
+                        "G2 rank resource ({}, {}) has an empty fabric id",
+                        config.worker_id, config.dp_rank
+                    ),
+                ));
+            }
+            for (name, value) in [
+                ("bandwidth_g1_to_g2_gbps", config.bandwidth_g1_to_g2_gbps),
+                ("bandwidth_g2_to_g1_gbps", config.bandwidth_g2_to_g1_gbps),
+            ] {
+                if !value.is_finite() || value <= 0.0 {
+                    return Err(mock_engine_args_validation_error(
+                        "invalid_rank_g2_bandwidth",
+                        format!(
+                            "G2 rank resource ({}, {}) requires positive finite {name}, got {value}",
+                            config.worker_id, config.dp_rank
+                        ),
+                    ));
+                }
+            }
+            if !identities.insert((config.worker_id, config.dp_rank)) {
+                return Err(mock_engine_args_validation_error(
+                    "duplicate_rank_g2_resource",
+                    format!(
+                        "duplicate G2 rank resource for ({}, {})",
+                        config.worker_id, config.dp_rank
+                    ),
+                ));
+            }
+        }
+    }
+
+    if args.num_g3_blocks.is_some()
+        && args.num_g2_blocks.is_none()
+        && args.g2_capacity_bytes.is_none()
+        && args.g2_rank_resource_configs.is_none()
+    {
         return Err(mock_engine_args_validation_error(
             "g3_requires_g2",
             "num_g3_blocks requires num_g2_blocks because mocker stages G3 through G2".to_string(),
@@ -1119,12 +1303,75 @@ fn validate_mock_engine_args(args: &MockEngineArgs) -> Result<(), ValidationErro
             ),
         ));
     }
-    if args.enable_g4_storage && args.num_g2_blocks.is_none() {
+    if args.enable_g4_storage
+        && args.num_g2_blocks.is_none()
+        && args.g2_capacity_bytes.is_none()
+        && args.g2_rank_resource_configs.is_none()
+    {
         return Err(mock_engine_args_validation_error(
             "g4_requires_g2",
             "enable_g4_storage requires num_g2_blocks because mocker stages G4 through G2"
                 .to_string(),
         ));
+    }
+    if args.enable_g4_storage && args.g4_capacity_bytes.is_none() {
+        return Err(mock_engine_args_validation_error(
+            "g4_capacity_required",
+            "enable_g4_storage requires finite g4_capacity_bytes".to_string(),
+        ));
+    }
+    if !args.enable_g4_storage && args.g4_capacity_bytes.is_some() {
+        return Err(mock_engine_args_validation_error(
+            "g4_capacity_without_g4",
+            "g4_capacity_bytes requires enable_g4_storage=true".to_string(),
+        ));
+    }
+    match (
+        args.kv_block_footprint_bytes.as_ref(),
+        args.kv_footprint_source.as_ref(),
+    ) {
+        (Some(profile), Some(source)) => {
+            if profile.is_empty() || profile.contains(&0) {
+                return Err(mock_engine_args_validation_error(
+                    "invalid_kv_block_footprint",
+                    "kv_block_footprint_bytes must contain only positive byte sizes".to_string(),
+                ));
+            }
+            if source.trim().is_empty() {
+                return Err(mock_engine_args_validation_error(
+                    "invalid_kv_footprint_source",
+                    "kv_footprint_source must be non-empty".to_string(),
+                ));
+            }
+            if let Some(max_model_len) = args.max_model_len {
+                let required_blocks = max_model_len.div_ceil(args.block_size);
+                if profile.len() < required_blocks {
+                    return Err(mock_engine_args_validation_error(
+                        "short_kv_block_footprint",
+                        format!(
+                            "kv_block_footprint_bytes has {} entries but max_model_len={} and block_size={} require at least {}",
+                            profile.len(),
+                            max_model_len,
+                            args.block_size,
+                            required_blocks
+                        ),
+                    ));
+                }
+            }
+        }
+        (Some(_), None) => {
+            return Err(mock_engine_args_validation_error(
+                "missing_kv_footprint_source",
+                "kv_block_footprint_bytes requires kv_footprint_source".to_string(),
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(mock_engine_args_validation_error(
+                "kv_footprint_source_without_profile",
+                "kv_footprint_source requires kv_block_footprint_bytes".to_string(),
+            ));
+        }
+        (None, None) => {}
     }
 
     if args.aic_nextn.is_some() && args.decode_speedup_ratio != 1.0 {
@@ -1294,6 +1541,14 @@ impl TryFrom<MockEngineArgsSerde> for MockEngineArgs {
         if let Some(aic_database_mode) = compat.aic_database_mode.into_nullable() {
             builder = builder.aic_database_mode(aic_database_mode);
         }
+        if let Some(aic_systems_path) = compat.aic_systems_path.into_nullable() {
+            builder = builder.aic_systems_path(aic_systems_path);
+        }
+        if let Some(aic_database_snapshot_sha256) =
+            compat.aic_database_snapshot_sha256.into_nullable()
+        {
+            builder = builder.aic_database_snapshot_sha256(aic_database_snapshot_sha256);
+        }
         if let Some(aic_analytical_config) = compat.aic_analytical_config.into_nullable() {
             builder = builder.aic_analytical_config(aic_analytical_config);
         }
@@ -1363,6 +1618,12 @@ impl TryFrom<MockEngineArgsSerde> for MockEngineArgs {
         if let Some(kv_bytes_per_token) = compat.kv_bytes_per_token.into_nullable() {
             builder = builder.kv_bytes_per_token(kv_bytes_per_token);
         }
+        if let Some(kv_block_footprint_bytes) = compat.kv_block_footprint_bytes.into_nullable() {
+            builder = builder.kv_block_footprint_bytes(kv_block_footprint_bytes);
+        }
+        if let Some(kv_footprint_source) = compat.kv_footprint_source.into_nullable() {
+            builder = builder.kv_footprint_source(kv_footprint_source);
+        }
         if let Some(kv_transfer_bandwidth) = compat.kv_transfer_bandwidth.into_nullable() {
             builder = builder.kv_transfer_bandwidth(kv_transfer_bandwidth);
         }
@@ -1375,6 +1636,15 @@ impl TryFrom<MockEngineArgsSerde> for MockEngineArgs {
         if let Some(num_g2_blocks) = compat.num_g2_blocks.into_nullable() {
             builder = builder.num_g2_blocks(num_g2_blocks);
         }
+        if let Some(g2_capacity_bytes) = compat.g2_capacity_bytes.into_nullable() {
+            builder = builder.g2_capacity_bytes(g2_capacity_bytes);
+        }
+        if let Some(g2_fabric_id) = compat.g2_fabric_id.into_nullable() {
+            builder = builder.g2_fabric_id(g2_fabric_id);
+        }
+        if let Some(g2_rank_resource_configs) = compat.g2_rank_resource_configs.into_nullable() {
+            builder = builder.g2_rank_resource_configs(g2_rank_resource_configs);
+        }
         if let Some(num_g3_blocks) = compat.num_g3_blocks.into_nullable() {
             builder = builder.num_g3_blocks(num_g3_blocks);
         }
@@ -1383,6 +1653,9 @@ impl TryFrom<MockEngineArgsSerde> for MockEngineArgs {
             .into_non_null("enable_g4_storage")?
         {
             builder = builder.enable_g4_storage(enable_g4_storage);
+        }
+        if let Some(g4_capacity_bytes) = compat.g4_capacity_bytes.into_nullable() {
+            builder = builder.g4_capacity_bytes(g4_capacity_bytes);
         }
         if let Some(offload_batch_size) = compat.offload_batch_size.into_nullable() {
             builder = builder.offload_batch_size(offload_batch_size);
@@ -1489,6 +1762,12 @@ impl MockEngineArgs {
         if let Some(mode) = self.aic_database_mode.as_mut() {
             *mode = mode.trim().to_uppercase();
         }
+        if let Some(path) = self.aic_systems_path.as_mut() {
+            *path = path.trim().to_string();
+        }
+        if let Some(digest) = self.aic_database_snapshot_sha256.as_mut() {
+            *digest = digest.trim().to_lowercase();
+        }
         if let Some(policy) = self.aic_analytical_config.as_mut()
             && let Ok(serde_json::Value::Object(object)) =
                 serde_json::from_str::<serde_json::Value>(policy)
@@ -1526,6 +1805,14 @@ impl MockEngineArgs {
         if self.num_g2_blocks == Some(0) {
             self.num_g2_blocks = None;
         }
+        if let Some(fabric_id) = self.g2_fabric_id.as_mut() {
+            *fabric_id = fabric_id.trim().to_string();
+        }
+        if let Some(configs) = self.g2_rank_resource_configs.as_mut() {
+            for config in configs {
+                config.g2_fabric_id = config.g2_fabric_id.trim().to_string();
+            }
+        }
         if self.num_g3_blocks == Some(0) {
             self.num_g3_blocks = None;
         }
@@ -1537,6 +1824,8 @@ impl MockEngineArgs {
     fn requires_kvbm_g1(&self) -> bool {
         matches!(self.engine_type, EngineType::Vllm | EngineType::Trtllm)
             && (self.num_g2_blocks.is_some_and(|blocks| blocks > 0)
+                || self.g2_capacity_bytes.is_some()
+                || self.g2_rank_resource_configs.is_some()
                 || self.num_g3_blocks.is_some_and(|blocks| blocks > 0)
                 || self.enable_g4_storage)
     }
@@ -1561,6 +1850,54 @@ impl MockEngineArgs {
                 G1Backend::Native
             }
         })
+    }
+
+    /// Materialize the exact G2 resources assigned to one offline scheduler
+    /// rank. Role-wide legacy settings are returned unchanged when no rank map
+    /// is configured.
+    pub(crate) fn for_offline_rank(&self, worker_id: usize, dp_rank: u32) -> anyhow::Result<Self> {
+        let Some(configs) = self.g2_rank_resource_configs.as_ref() else {
+            return Ok(self.clone());
+        };
+        let config = configs
+            .iter()
+            .find(|config| config.worker_id == worker_id && config.dp_rank == dp_rank)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "missing G2 rank resource for offline scheduler ({worker_id}, {dp_rank})"
+                )
+            })?;
+        let mut args = self.clone();
+        args.g2_rank_resource_configs = None;
+        args.g2_capacity_bytes = Some(config.g2_capacity_bytes);
+        args.g2_fabric_id = Some(config.g2_fabric_id.clone());
+        args.bandwidth_g1_to_g2_gbps = Some(config.bandwidth_g1_to_g2_gbps);
+        args.bandwidth_g2_to_g1_gbps = Some(config.bandwidth_g2_to_g1_gbps);
+        let block_bytes = if let Some(profile) = args.kv_block_footprint_bytes.as_ref() {
+            profile.iter().copied().min()
+        } else {
+            args.kv_bytes_per_token
+                .and_then(|bytes| args.block_size.checked_mul(bytes))
+        }
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "G2 rank resource ({worker_id}, {dp_rank}) requires a resolved KV block footprint"
+            )
+        })?;
+        let raw_slots = config.g2_capacity_bytes / block_bytes;
+        if raw_slots == 0 {
+            anyhow::bail!(
+                "G2 rank resource ({worker_id}, {dp_rank}) capacity {} cannot hold one {block_bytes}-byte block",
+                config.g2_capacity_bytes
+            );
+        }
+        #[cfg(feature = "kvbm-offload")]
+        let max_slots = crate::kvbm_offload::config::DEFAULT_MAX_DERIVED_G2_SLOTS;
+        #[cfg(not(feature = "kvbm-offload"))]
+        let max_slots = 2_000_000;
+        let slots = raw_slots.min(max_slots);
+        args.num_g2_blocks = Some(slots);
+        args.normalized()
     }
 
     fn validate_config(&mut self) -> anyhow::Result<()> {
@@ -1756,51 +2093,11 @@ mod tests {
             .normalized()
             .unwrap();
 
-        let mut payload = serde_json::json!({
-            "engine_type": "vllm",
-            "num_gpu_blocks": args.num_gpu_blocks,
-            "block_size": args.block_size,
-            "max_num_seqs": args.max_num_seqs,
-            "max_num_batched_tokens": args.max_num_batched_tokens,
-            "enable_prefix_caching": args.enable_prefix_caching,
-            "enable_chunked_prefill": args.enable_chunked_prefill,
-            "speedup_ratio": args.speedup_ratio,
-            "decode_speedup_ratio": args.decode_speedup_ratio,
-            "dp_size": args.dp_size,
-            "startup_time": args.startup_time,
-            "worker_type": "decode",
-            "planner_profile_data": args.planner_profile_data,
-            "aic_backend": args.aic_backend,
-            "aic_system": args.aic_system,
-            "aic_backend_version": args.aic_backend_version,
-            "aic_tp_size": args.aic_tp_size,
-            "aic_model_path": args.aic_model_path,
-            "enable_local_indexer": args.enable_local_indexer,
-            "bootstrap_port": args.bootstrap_port,
-            "handoff_session_timeout_ms": args.handoff_session_timeout_ms,
-            "kv_bytes_per_token": args.kv_bytes_per_token,
-            "kv_transfer_bandwidth": args.kv_transfer_bandwidth,
-            "kv_transfer_timing_mode": "full_prompt",
-            "num_g2_blocks": args.num_g2_blocks,
-            "num_g3_blocks": args.num_g3_blocks,
-            "enable_g4_storage": args.enable_g4_storage,
-            "offload_batch_size": args.offload_batch_size,
-            "bandwidth_g1_to_g2_gbps": args.bandwidth_g1_to_g2_gbps,
-            "bandwidth_g2_to_g1_gbps": args.bandwidth_g2_to_g1_gbps,
-            "bandwidth_g2_to_g3_gbps": args.bandwidth_g2_to_g3_gbps,
-            "bandwidth_g3_to_g2_gbps": args.bandwidth_g3_to_g2_gbps,
-            "bandwidth_g2_to_g4_gbps": args.bandwidth_g2_to_g4_gbps,
-            "bandwidth_g4_to_g2_gbps": args.bandwidth_g4_to_g2_gbps,
-            "reasoning": args.reasoning,
-            "zmq_kv_events_port": args.zmq_kv_events_port,
-            "zmq_replay_port": args.zmq_replay_port,
-            "preemption_mode": "lifo",
-            "router_queue_policy": args.router_queue_policy.map(|policy| policy.to_string()),
-            "sglang": args.sglang,
-            "has_perf_model": true,
-        });
-        payload["max_model_len"] = serde_json::json!(args.max_model_len);
-        payload["g1_backend"] = serde_json::json!(args.g1_backend);
+        // Exercise the real serializer rather than mirroring every field in a
+        // giant `json!` invocation. Besides reducing macro recursion, this
+        // keeps the round-trip test automatically aligned with new resource
+        // fields such as dynamic KV footprints and finite tier capacities.
+        let payload = serde_json::to_value(&args).unwrap();
 
         let restored = MockEngineArgs::from_json_str(&payload.to_string()).unwrap();
 
@@ -1832,6 +2129,30 @@ mod tests {
             args.aic_analytical_config.as_deref(),
             Some(r#"{"attention_algorithm":"fa3","level":"high"}"#)
         );
+    }
+
+    #[test]
+    fn aic_database_identity_normalizes_and_requires_a_complete_pair() {
+        let args = MockEngineArgs::builder()
+            .aic_systems_path(Some(" /tmp/aic-systems ".to_string()))
+            .aic_database_snapshot_sha256(Some("A".repeat(64)))
+            .build()
+            .unwrap()
+            .normalized()
+            .unwrap();
+        assert_eq!(args.aic_systems_path.as_deref(), Some("/tmp/aic-systems"));
+        assert_eq!(
+            args.aic_database_snapshot_sha256.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+
+        let error = MockEngineArgs::builder()
+            .aic_systems_path(Some("/tmp/aic-systems".to_string()))
+            .build()
+            .unwrap()
+            .normalized()
+            .unwrap_err();
+        assert!(error.to_string().contains("must be configured together"));
     }
 
     #[test]
@@ -2087,6 +2408,7 @@ mod tests {
             MockEngineArgs::builder()
                 .num_g2_blocks(Some(8))
                 .enable_g4_storage(true)
+                .g4_capacity_bytes(Some(8 * 1024 * 1024))
                 .build()
                 .unwrap(),
         ];
@@ -2328,6 +2650,7 @@ mod tests {
         let args = MockEngineArgs::builder()
             .num_g2_blocks(Some(10))
             .enable_g4_storage(true)
+            .g4_capacity_bytes(Some(10 * 1024 * 1024))
             .build()
             .unwrap()
             .normalized()
@@ -2336,6 +2659,72 @@ mod tests {
         assert_eq!(args.num_g2_blocks, Some(10));
         assert!(args.enable_g4_storage);
         assert_eq!(args.kv_bytes_per_token, None);
+    }
+
+    #[test]
+    fn test_rank_scoped_g2_resources_materialize_exact_offline_rank() {
+        let args = MockEngineArgs::from_json_str(
+            &json!({
+                "engine_type": "vllm",
+                "block_size": 16,
+                "kv_block_footprint_bytes": [1024, 2048],
+                "kv_footprint_source": "aic:test",
+                "g2_rank_resource_configs": [
+                    {
+                        "worker_id": 0,
+                        "dp_rank": 0,
+                        "g2_capacity_bytes": 4096,
+                        "g2_fabric_id": "node-0",
+                        "bandwidth_g1_to_g2_gbps": 64.0,
+                        "bandwidth_g2_to_g1_gbps": 32.0
+                    },
+                    {
+                        "worker_id": 0,
+                        "dp_rank": 1,
+                        "g2_capacity_bytes": 8192,
+                        "g2_fabric_id": "node-1",
+                        "bandwidth_g1_to_g2_gbps": 128.0,
+                        "bandwidth_g2_to_g1_gbps": 96.0
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let rank = args.for_offline_rank(0, 1).unwrap();
+        assert_eq!(rank.g2_capacity_bytes, Some(8192));
+        assert_eq!(rank.num_g2_blocks, Some(8));
+        assert_eq!(rank.g2_fabric_id.as_deref(), Some("node-1"));
+        assert_eq!(rank.bandwidth_g1_to_g2_gbps, Some(128.0));
+        assert_eq!(rank.bandwidth_g2_to_g1_gbps, Some(96.0));
+        assert!(rank.g2_rank_resource_configs.is_none());
+        assert!(args.for_offline_rank(1, 0).is_err());
+    }
+
+    #[test]
+    fn test_rank_scoped_g2_resources_reject_role_wide_capacity() {
+        let error = MockEngineArgs::from_json_str(
+            &json!({
+                "g2_capacity_bytes": 4096,
+                "g2_rank_resource_configs": [{
+                    "worker_id": 0,
+                    "dp_rank": 0,
+                    "g2_capacity_bytes": 4096,
+                    "g2_fabric_id": "node-0",
+                    "bandwidth_g1_to_g2_gbps": 64.0,
+                    "bandwidth_g2_to_g1_gbps": 64.0
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be combined with role-wide g2_capacity_bytes")
+        );
     }
 
     #[test]

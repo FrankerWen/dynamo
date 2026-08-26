@@ -40,6 +40,7 @@ use velo::{Event, EventManager};
 use super::KvbmDriveMode;
 use super::bandwidth_sharing_model::{BandwidthSharingModel, TransferId};
 use super::coordinator::SwapInStatus;
+use super::shared_g2::SharedG2Fabric;
 use super::shared_g3::SharedG3Pool;
 use super::shared_g4::SharedG4Store;
 
@@ -79,6 +80,72 @@ impl TransferDirection {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DirectionTransferMetrics {
+    pub transfers: u64,
+    pub completed_transfers: u64,
+    pub blocks: u64,
+    pub bytes: u64,
+    /// End-to-end modeled reservation-to-completion time. Processor-sharing
+    /// starts service immediately, so queue wait is explicitly zero today.
+    pub total_transfer_time_us: u64,
+    pub total_queue_wait_us: u64,
+}
+
+impl DirectionTransferMetrics {
+    fn record(&mut self, blocks: usize, bytes: usize) {
+        self.transfers = self.transfers.saturating_add(1);
+        self.blocks = self.blocks.saturating_add(blocks as u64);
+        self.bytes = self.bytes.saturating_add(bytes as u64);
+    }
+
+    fn record_completion(&mut self, elapsed_ms: f64) {
+        self.completed_transfers = self.completed_transfers.saturating_add(1);
+        self.total_transfer_time_us = self
+            .total_transfer_time_us
+            .saturating_add(ms_to_us(elapsed_ms));
+        // The bandwidth model is processor sharing: admitted transfers begin
+        // receiving service at reservation rather than waiting in a FIFO.
+        self.total_queue_wait_us = self.total_queue_wait_us.saturating_add(0);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OffloadTransferMetrics {
+    pub g1_to_g2: DirectionTransferMetrics,
+    pub g2_to_g1: DirectionTransferMetrics,
+    pub g2_to_g3: DirectionTransferMetrics,
+    pub g3_to_g2: DirectionTransferMetrics,
+    pub g2_to_g4: DirectionTransferMetrics,
+    pub g4_to_g2: DirectionTransferMetrics,
+}
+
+impl OffloadTransferMetrics {
+    fn record(&mut self, direction: TransferDirection, blocks: usize, bytes: usize) {
+        let metrics = match direction {
+            TransferDirection::G1ToG2 => &mut self.g1_to_g2,
+            TransferDirection::G2ToG1 => &mut self.g2_to_g1,
+            TransferDirection::G2ToG3 => &mut self.g2_to_g3,
+            TransferDirection::G3ToG2 => &mut self.g3_to_g2,
+            TransferDirection::G2ToG4 => &mut self.g2_to_g4,
+            TransferDirection::G4ToG2 => &mut self.g4_to_g2,
+        };
+        metrics.record(blocks, bytes);
+    }
+
+    fn record_completion(&mut self, direction: TransferDirection, elapsed_ms: f64) {
+        let metrics = match direction {
+            TransferDirection::G1ToG2 => &mut self.g1_to_g2,
+            TransferDirection::G2ToG1 => &mut self.g2_to_g1,
+            TransferDirection::G2ToG3 => &mut self.g2_to_g3,
+            TransferDirection::G3ToG2 => &mut self.g3_to_g2,
+            TransferDirection::G2ToG4 => &mut self.g2_to_g4,
+            TransferDirection::G4ToG2 => &mut self.g4_to_g2,
+        };
+        metrics.record_completion(elapsed_ms);
+    }
+}
+
 impl TryFrom<(LogicalLayoutHandle, LogicalLayoutHandle)> for TransferDirection {
     type Error = anyhow::Error;
 
@@ -102,17 +169,31 @@ struct PipelineAwaiter {
     owner_id: u64,
     direction: TransferDirection,
     num_blocks: usize,
+    started_at_ms: f64,
+    metrics: Arc<Mutex<OffloadTransferMetrics>>,
+}
+
+struct SwapInAwaiter {
+    owner_id: u64,
+    num_blocks: usize,
+    status: watch::Sender<SwapInStatus>,
+    started_at_ms: f64,
+    metrics: Arc<Mutex<OffloadTransferMetrics>>,
 }
 
 pub(crate) struct CompletionAction {
     id: TransferId,
     pipeline: Option<PipelineAwaiter>,
-    swap_in_status: Option<watch::Sender<SwapInStatus>>,
+    swap_in: Option<SwapInAwaiter>,
+    completed_at_ms: f64,
 }
 
 impl CompletionAction {
     pub(crate) fn owner_id(&self) -> Option<u64> {
-        self.pipeline.as_ref().map(|pipeline| pipeline.owner_id)
+        self.pipeline
+            .as_ref()
+            .map(|pipeline| pipeline.owner_id)
+            .or_else(|| self.swap_in.as_ref().map(|swap_in| swap_in.owner_id))
     }
 
     pub(crate) fn completed_transfer(&self) -> CompletedTransfer {
@@ -123,6 +204,13 @@ impl CompletionAction {
                     pipeline.direction,
                     pipeline.num_blocks,
                     true,
+                )
+            } else if let Some(swap_in) = self.swap_in.as_ref() {
+                (
+                    Some(swap_in.owner_id),
+                    TransferDirection::G2ToG1,
+                    swap_in.num_blocks,
+                    false,
                 )
             } else {
                 (None, TransferDirection::G2ToG1, 0, false)
@@ -139,13 +227,31 @@ impl CompletionAction {
     pub(crate) fn fire(self) -> CompletedTransfer {
         let completed = self.completed_transfer();
         if let Some(pipeline) = self.pipeline {
+            pipeline
+                .metrics
+                .lock()
+                .expect("offload transfer metrics mutex poisoned")
+                .record_completion(
+                    pipeline.direction,
+                    (self.completed_at_ms - pipeline.started_at_ms).max(0.0),
+                );
             // Ignore trigger errors — the velo event system may be shut down
             // during cleanup.
             let _ = pipeline.event.trigger();
         }
-        if let Some(status) = self.swap_in_status {
-            let block_count = status.borrow().block_count;
-            status.send_replace(SwapInStatus::completed(block_count));
+        if let Some(swap_in) = self.swap_in {
+            swap_in
+                .metrics
+                .lock()
+                .expect("offload transfer metrics mutex poisoned")
+                .record_completion(
+                    TransferDirection::G2ToG1,
+                    (self.completed_at_ms - swap_in.started_at_ms).max(0.0),
+                );
+            let block_count = swap_in.status.borrow().block_count;
+            swap_in
+                .status
+                .send_replace(SwapInStatus::completed(block_count));
         }
         completed
     }
@@ -168,7 +274,7 @@ pub(crate) struct TransferState {
     /// separate from `awaiters` because swap-in does not feed a velo
     /// notification back into a kvbm-engine pipeline; the scheduler
     /// owns lifecycle directly.
-    swap_in_status: HashMap<TransferId, watch::Sender<SwapInStatus>>,
+    swap_in_status: HashMap<TransferId, SwapInAwaiter>,
 }
 
 #[cfg(test)]
@@ -336,6 +442,41 @@ impl TransferState {
         self.offload_bw.earliest_finish_with_id()
     }
 
+    pub(crate) fn owner_offload_active_count(&self, owner_id: u64) -> usize {
+        self.awaiters
+            .iter()
+            .filter(|(id, awaiter)| {
+                awaiter.owner_id == owner_id
+                    && awaiter.direction.is_offload()
+                    && self.offload_bw.is_active(**id)
+            })
+            .count()
+    }
+
+    pub(crate) fn owner_earliest_offload_finish_with_id(
+        &self,
+        owner_id: u64,
+    ) -> Option<(TransferId, f64)> {
+        self.awaiters
+            .iter()
+            .filter(|(id, awaiter)| {
+                awaiter.owner_id == owner_id
+                    && awaiter.direction.is_offload()
+                    && self.offload_bw.is_active(**id)
+            })
+            .filter_map(|(id, _)| {
+                self.offload_bw
+                    .deadline_for(*id)
+                    .map(|deadline| (*id, deadline))
+            })
+            .min_by(|left, right| {
+                left.1
+                    .partial_cmp(&right.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| left.0.cmp(&right.0))
+            })
+    }
+
     pub(crate) fn earliest_onboard_finish(&self) -> Option<f64> {
         self.onboard_bw.earliest_finish()
     }
@@ -380,12 +521,13 @@ impl TransferState {
                     "kvbm-offload: mock transfer complete"
                 );
             }
-            let swap_in_status = self.swap_in_status.remove(&id);
-            if pipeline.is_some() || swap_in_status.is_some() {
+            let swap_in = self.swap_in_status.remove(&id);
+            if pipeline.is_some() || swap_in.is_some() {
                 actions.push(CompletionAction {
                     id,
                     pipeline,
-                    swap_in_status,
+                    swap_in,
+                    completed_at_ms: now_ms,
                 });
             }
         }
@@ -447,8 +589,13 @@ pub struct MockWorker {
     reservation_count_tx: watch::Sender<u64>,
     /// Bytes per block — used to derive transfer size from block-id counts.
     block_bytes: usize,
+    /// Optional AIC-derived byte size indexed by logical block position.
+    /// This supersedes `block_bytes` when transfer metadata carries positions.
+    block_footprint_bytes: Option<Arc<[usize]>>,
+    transfer_metrics: Arc<Mutex<OffloadTransferMetrics>>,
     g1_handle: Option<LayoutHandle>,
     g2_handle: Option<LayoutHandle>,
+    shared_g2: Option<Arc<SharedG2Fabric>>,
     shared_g3: Option<Arc<SharedG3Pool>>,
     shared_g4: Option<Arc<SharedG4Store>>,
     #[cfg(test)]
@@ -487,12 +634,66 @@ impl MockWorker {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_drive_mode(
         block_bytes: usize,
         offload_gbps: f64,
         onboard_gbps: f64,
         g1_handle: Option<LayoutHandle>,
         g2_handle: Option<LayoutHandle>,
+        shared_g3: Option<Arc<SharedG3Pool>>,
+        shared_g4: Option<Arc<SharedG4Store>>,
+        drive_mode: KvbmDriveMode,
+    ) -> Self {
+        Self::new_with_footprint(
+            block_bytes,
+            None,
+            offload_gbps,
+            onboard_gbps,
+            g1_handle,
+            g2_handle,
+            shared_g3,
+            shared_g4,
+            drive_mode,
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_footprint(
+        block_bytes: usize,
+        block_footprint_bytes: Option<Arc<[usize]>>,
+        offload_gbps: f64,
+        onboard_gbps: f64,
+        g1_handle: Option<LayoutHandle>,
+        g2_handle: Option<LayoutHandle>,
+        shared_g3: Option<Arc<SharedG3Pool>>,
+        shared_g4: Option<Arc<SharedG4Store>>,
+        drive_mode: KvbmDriveMode,
+    ) -> Self {
+        Self::new_with_footprint_and_fabric(
+            block_bytes,
+            block_footprint_bytes,
+            offload_gbps,
+            onboard_gbps,
+            g1_handle,
+            g2_handle,
+            None,
+            shared_g3,
+            shared_g4,
+            drive_mode,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_footprint_and_fabric(
+        block_bytes: usize,
+        block_footprint_bytes: Option<Arc<[usize]>>,
+        offload_gbps: f64,
+        onboard_gbps: f64,
+        g1_handle: Option<LayoutHandle>,
+        g2_handle: Option<LayoutHandle>,
+        shared_g2: Option<Arc<SharedG2Fabric>>,
         shared_g3: Option<Arc<SharedG3Pool>>,
         shared_g4: Option<Arc<SharedG4Store>>,
         drive_mode: KvbmDriveMode,
@@ -505,8 +706,11 @@ impl MockWorker {
             event_manager: EventManager::local(),
             reservation_count_tx: watch::channel(0).0,
             block_bytes,
+            block_footprint_bytes,
+            transfer_metrics: Arc::new(Mutex::new(OffloadTransferMetrics::default())),
             g1_handle,
             g2_handle,
+            shared_g2,
             shared_g3,
             shared_g4,
             #[cfg(test)]
@@ -514,6 +718,53 @@ impl MockWorker {
             #[cfg(test)]
             injected_staging_failure: Mutex::new(None),
         }
+    }
+
+    fn transfer_bytes(&self, num_blocks: usize, positions: Option<&[u64]>) -> Result<usize> {
+        let Some(profile) = self.block_footprint_bytes.as_ref() else {
+            return Ok(num_blocks.saturating_mul(self.block_bytes));
+        };
+        let positions = positions.ok_or_else(|| {
+            anyhow!("AIC dynamic KV footprint requires logical block positions for every transfer")
+        })?;
+        if positions.len() != num_blocks {
+            bail!(
+                "KV transfer position count {} does not match block count {}",
+                positions.len(),
+                num_blocks
+            );
+        }
+        positions.iter().try_fold(0usize, |total, position| {
+            let bytes = profile.get(*position as usize).copied().ok_or_else(|| {
+                anyhow!(
+                    "AIC KV footprint profile has no entry for logical block position {}",
+                    position
+                )
+            })?;
+            total
+                .checked_add(bytes)
+                .ok_or_else(|| anyhow!("KV transfer byte count overflow"))
+        })
+    }
+
+    fn block_bytes_at(&self, position: u64) -> Result<usize> {
+        match self.block_footprint_bytes.as_ref() {
+            Some(profile) => profile.get(position as usize).copied().ok_or_else(|| {
+                anyhow!(
+                    "AIC KV footprint profile has no entry for logical block position {}",
+                    position
+                )
+            }),
+            None if self.block_bytes > 0 => Ok(self.block_bytes),
+            None => bail!("KV block byte size is unresolved"),
+        }
+    }
+
+    pub(crate) fn transfer_metrics(&self) -> OffloadTransferMetrics {
+        *self
+            .transfer_metrics
+            .lock()
+            .expect("offload transfer metrics mutex poisoned")
     }
 
     #[cfg(test)]
@@ -575,7 +826,11 @@ impl MockWorker {
         if self.drive_mode == KvbmDriveMode::OfflineDeterministic {
             return self.drain_completions_summary_ordered(now_ms, |_| {}, |_| {}, |_| {});
         }
-        let local = self.drain_local_completions_with(now_ms, |_| {}).total;
+        let local = self
+            .shared_g2
+            .as_ref()
+            .map(|fabric| fabric.drain_completions(now_ms, self.owner_id).counts)
+            .unwrap_or_else(|| self.drain_local_completions_with(now_ms, |_| {}).total);
         let shared_g3 = self
             .shared_g3
             .as_ref()
@@ -596,13 +851,18 @@ impl MockWorker {
     pub(crate) fn drain_completions_summary_ordered(
         &self,
         now_ms: f64,
-        after_local_completion: impl FnMut(CompletedTransfer),
+        mut after_local_completion: impl FnMut(CompletedTransfer),
         after_shared_g3_completion: impl FnMut(CompletedTransfer),
         after_shared_g4_completion: impl FnMut(CompletedTransfer),
     ) -> DrainSummary {
-        let local = self
-            .drain_local_completions_with(now_ms, after_local_completion)
-            .total;
+        let local = if let Some(fabric) = self.shared_g2.as_ref() {
+            fabric
+                .drain_completions_ordered(now_ms, self.owner_id, &mut after_local_completion)
+                .counts
+        } else {
+            self.drain_local_completions_with(now_ms, after_local_completion)
+                .total
+        };
         let shared_g3 = self
             .shared_g3
             .as_ref()
@@ -651,14 +911,31 @@ impl MockWorker {
         &self,
         now_ms: f64,
         num_blocks: usize,
+        positions: Option<&[u64]>,
         status: watch::Sender<SwapInStatus>,
     ) -> TransferId {
-        let bytes = num_blocks.saturating_mul(self.block_bytes);
-        let mut state = self.state.lock().expect("TransferState mutex poisoned");
-        if self.drive_mode == KvbmDriveMode::Live {
+        let bytes = self
+            .transfer_bytes(num_blocks, positions)
+            .expect("validated AIC KV footprint must cover every swap-in block");
+        let (state_arc, already_drained) = if let Some(fabric) = self.shared_g2.as_ref() {
+            if self.drive_mode == KvbmDriveMode::OfflineDeterministic {
+                fabric.defer_completions_ordered(now_ms);
+            } else {
+                fabric.drain_completions_to_pending(now_ms);
+            }
+            (fabric.transfer_state(), true)
+        } else {
+            (self.state.clone(), false)
+        };
+        let mut state = state_arc.lock().expect("TransferState mutex poisoned");
+        if !already_drained && self.drive_mode == KvbmDriveMode::Live {
             state.drain_completions(now_ms, "worker");
         }
         let id = state.onboard_bw.start_transfer(now_ms, bytes);
+        self.transfer_metrics
+            .lock()
+            .expect("offload transfer metrics mutex poisoned")
+            .record(TransferDirection::G2ToG1, num_blocks, bytes);
         let next_deadline_ms = state.onboard_bw.earliest_finish();
         tracing::debug!(
             now_ms,
@@ -670,7 +947,16 @@ impl MockWorker {
             next_deadline_ms = ?next_deadline_ms,
             "kvbm-offload: reserve mock swap-in transfer"
         );
-        state.swap_in_status.insert(id, status);
+        state.swap_in_status.insert(
+            id,
+            SwapInAwaiter {
+                owner_id: self.owner_id,
+                num_blocks,
+                status,
+                started_at_ms: now_ms,
+                metrics: self.transfer_metrics.clone(),
+            },
+        );
         id
     }
 
@@ -678,8 +964,17 @@ impl MockWorker {
     /// both are idle. Used by the scheduler's stall-advance.
     pub fn earliest_finish(&self) -> Option<f64> {
         let state = self.state.lock().expect("TransferState mutex poisoned");
-        let local = state.earliest_finish();
+        let rank_local = state.earliest_finish();
         drop(state);
+        let local = self
+            .shared_g2
+            .as_ref()
+            .and_then(|fabric| fabric.earliest_finish())
+            .or(rank_local);
+        let pending_g2_deadline = self
+            .shared_g2
+            .as_ref()
+            .and_then(|fabric| fabric.pending_owner_deadline(self.owner_id));
         let pending_g3_deadline = self
             .shared_g3
             .as_ref()
@@ -690,6 +985,7 @@ impl MockWorker {
             .and_then(|g4| g4.pending_owner_deadline(self.owner_id));
         local
             .into_iter()
+            .chain(pending_g2_deadline)
             .chain(self.shared_g3.as_ref().and_then(|g3| g3.earliest_finish()))
             .chain(self.shared_g4.as_ref().and_then(|g4| g4.earliest_finish()))
             .chain(pending_g3_deadline)
@@ -698,11 +994,17 @@ impl MockWorker {
     }
 
     pub(crate) fn earliest_local_offload_finish_with_id(&self) -> Option<(TransferId, f64)> {
+        if let Some(fabric) = self.shared_g2.as_ref() {
+            return fabric.earliest_offload_finish_with_id(self.owner_id);
+        }
         let state = self.state.lock().expect("TransferState mutex poisoned");
         state.earliest_offload_finish_with_id()
     }
 
     pub(crate) fn local_offload_active_count(&self) -> usize {
+        if let Some(fabric) = self.shared_g2.as_ref() {
+            return fabric.offload_active_count(self.owner_id);
+        }
         let state = self.state.lock().expect("TransferState mutex poisoned");
         state.offload_bw.active_count()
     }
@@ -727,10 +1029,20 @@ impl MockWorker {
     /// themselves.
     pub fn earliest_foreground_finish(&self) -> Option<f64> {
         let state = self.state.lock().expect("TransferState mutex poisoned");
-        let local = state.earliest_finish();
+        let rank_local = state.earliest_finish();
         drop(state);
+        let local = self
+            .shared_g2
+            .as_ref()
+            .and_then(|fabric| fabric.earliest_foreground_finish())
+            .or(rank_local);
         local
             .into_iter()
+            .chain(
+                self.shared_g2
+                    .as_ref()
+                    .and_then(|fabric| fabric.pending_owner_deadline(self.owner_id)),
+            )
             .chain(
                 self.shared_g3
                     .as_ref()
@@ -752,8 +1064,9 @@ impl MockWorker {
         direction: TransferDirection,
         now_ms: f64,
         num_blocks: usize,
+        positions: Option<&[u64]>,
     ) -> Result<TransferCompleteNotification> {
-        self.reserve_transfer_with(direction, now_ms, num_blocks, |_| {})
+        self.reserve_transfer_with(direction, now_ms, num_blocks, positions, |_| {})
             .map(|(_id, notification)| notification)
     }
 
@@ -762,9 +1075,10 @@ impl MockWorker {
         direction: TransferDirection,
         now_ms: f64,
         num_blocks: usize,
+        positions: Option<&[u64]>,
         on_reserved: impl FnOnce(TransferId),
     ) -> Result<(TransferId, TransferCompleteNotification)> {
-        let bytes = num_blocks.saturating_mul(self.block_bytes);
+        let bytes = self.transfer_bytes(num_blocks, positions)?;
         let (state_arc, scope, already_drained) =
             if direction.is_g3() {
                 let shared_g3 = self.shared_g3.as_ref().ok_or_else(|| {
@@ -786,6 +1100,13 @@ impl MockWorker {
                     shared_g4.drain_completions_to_pending(now_ms);
                 }
                 (shared_g4.transfer_state(), "shared-g4", true)
+            } else if let Some(shared_g2) = self.shared_g2.as_ref() {
+                if self.drive_mode == KvbmDriveMode::OfflineDeterministic {
+                    shared_g2.defer_completions_ordered(now_ms);
+                } else {
+                    shared_g2.drain_completions_to_pending(now_ms);
+                }
+                (shared_g2.transfer_state(), "shared-g2", true)
             } else {
                 (self.state.clone(), "worker", false)
             };
@@ -801,6 +1122,10 @@ impl MockWorker {
             let id = state.onboard_bw.start_transfer(now_ms, bytes);
             (id, state.onboard_bw.earliest_finish())
         };
+        self.transfer_metrics
+            .lock()
+            .expect("offload transfer metrics mutex poisoned")
+            .record(direction, num_blocks, bytes);
         tracing::debug!(
             now_ms,
             scope,
@@ -831,6 +1156,8 @@ impl MockWorker {
                 owner_id: self.owner_id,
                 direction,
                 num_blocks,
+                started_at_ms: now_ms,
+                metrics: self.transfer_metrics.clone(),
             },
         );
         on_reserved(id);
@@ -846,7 +1173,7 @@ impl WorkerTransfers for MockWorker {
         dst: LogicalLayoutHandle,
         src_block_ids: Arc<[BlockId]>,
         _dst_block_ids: Arc<[BlockId]>,
-        _options: TransferOptions,
+        options: TransferOptions,
     ) -> Result<TransferCompleteNotification> {
         let direction = TransferDirection::try_from((src, dst))?;
         #[cfg(test)]
@@ -872,7 +1199,12 @@ impl WorkerTransfers for MockWorker {
             None => {}
         }
         let now_ms = self.now_ms();
-        self.reserve_transfer(direction, now_ms, src_block_ids.len())
+        self.reserve_transfer(
+            direction,
+            now_ms,
+            src_block_ids.len(),
+            options.block_positions.as_deref(),
+        )
     }
 
     fn execute_remote_onboard(
@@ -986,15 +1318,28 @@ impl ObjectBlockOps for MockWorker {
             tracing::warn!("kvbm-offload: put_blocks called without shared G4 store");
             return Box::pin(async move { keys.into_iter().map(Err).collect() });
         };
-        let block_bytes = self.block_bytes;
+        let positions = keys.iter().map(SequenceHash::position).collect::<Vec<_>>();
+        let sizes_bytes = match positions
+            .iter()
+            .map(|position| self.block_bytes_at(*position))
+            .collect::<Result<Vec<_>>>()
+        {
+            Ok(sizes) => sizes,
+            Err(error) => {
+                tracing::warn!(error = %error, "kvbm-offload: unresolved G4 object sizes");
+                return Box::pin(async move { keys.into_iter().map(Err).collect() });
+            }
+        };
         let publish_keys = keys.clone();
+        let publish_sizes = sizes_bytes.clone();
         let publish_store = shared_g4.clone();
         let notification = match self.reserve_transfer_with(
             TransferDirection::G2ToG4,
             self.now_ms(),
             keys.len(),
+            Some(&positions),
             move |transfer_id| {
-                publish_store.register_pending_put(transfer_id, publish_keys, block_bytes);
+                publish_store.register_pending_put(transfer_id, publish_keys, publish_sizes);
             },
         ) {
             Ok((_transfer_id, notification)) => notification,
@@ -1008,15 +1353,10 @@ impl ObjectBlockOps for MockWorker {
         };
         Box::pin(async move {
             match notification.await {
-                Ok(()) => {
-                    // Idempotent fallback: shared G4 publishes objects when
-                    // any worker drains the shared completion, but keeping the
-                    // owner future publish makes late polling harmless.
-                    for key in &keys {
-                        shared_g4.insert_object(*key, block_bytes);
-                    }
-                    keys.into_iter().map(Ok).collect()
-                }
+                // SharedG4Store publishes the pending objects before firing
+                // the completion event. Publishing again here would turn one
+                // physical admission into two metric events and perturb LRU.
+                Ok(()) => keys.into_iter().map(Ok).collect(),
                 Err(error) => {
                     tracing::warn!(
                         error = %error,
@@ -1058,17 +1398,26 @@ impl ObjectBlockOps for MockWorker {
         if present_count == 0 {
             return Box::pin(async move { keys.into_iter().map(Err).collect() });
         }
-        let notification =
-            match self.reserve_transfer(TransferDirection::G4ToG2, self.now_ms(), present_count) {
-                Ok(notification) => notification,
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        "kvbm-offload: failed to reserve mock G4→G2 object get"
-                    );
-                    return Box::pin(async move { keys.into_iter().map(Err).collect() });
-                }
-            };
+        let present_positions = keys
+            .iter()
+            .zip(&present)
+            .filter_map(|(key, found)| found.then_some(key.position()))
+            .collect::<Vec<_>>();
+        let notification = match self.reserve_transfer(
+            TransferDirection::G4ToG2,
+            self.now_ms(),
+            present_count,
+            Some(&present_positions),
+        ) {
+            Ok(notification) => notification,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "kvbm-offload: failed to reserve mock G4→G2 object get"
+                );
+                return Box::pin(async move { keys.into_iter().map(Err).collect() });
+            }
+        };
         Box::pin(async move {
             match notification.await {
                 Ok(()) => keys
@@ -1110,6 +1459,7 @@ impl ObjectBlockOps for MockWorker {
 mod tests {
     use super::super::config::KvbmOffloadConfig;
     use super::super::coordinator::SwapInTerminal;
+    use super::super::shared_g2::{SharedG2Fabric, shared_g2_test_guard};
     use super::super::shared_g3::shared_g3_test_guard;
     use super::super::shared_g4::{SharedG4Store, shared_g4_test_guard};
     use super::*;
@@ -1119,6 +1469,45 @@ mod tests {
     fn make_worker() -> MockWorker {
         // 1 GB/s bandwidth on both links, 1 MB per block.
         MockWorker::new(1_000_000, 1.0, 1.0, None, None, None, None)
+    }
+
+    fn shared_g2_two_workers() -> (MockWorker, MockWorker) {
+        let config = KvbmOffloadConfig {
+            g2_fabric_id: Some("worker-test-node-0".to_string()),
+            bandwidth_g1_to_g2_gbps: 1.0,
+            bandwidth_g2_to_g1_gbps: 1.0,
+            ..Default::default()
+        };
+        let fabric =
+            SharedG2Fabric::get_or_create_with_mode(&config, KvbmDriveMode::OfflineDeterministic)
+                .unwrap()
+                .expect("shared G2 fabric enabled");
+        (
+            MockWorker::new_with_footprint_and_fabric(
+                1_000_000,
+                None,
+                1.0,
+                1.0,
+                None,
+                None,
+                Some(fabric.clone()),
+                None,
+                None,
+                KvbmDriveMode::OfflineDeterministic,
+            ),
+            MockWorker::new_with_footprint_and_fabric(
+                1_000_000,
+                None,
+                1.0,
+                1.0,
+                None,
+                None,
+                Some(fabric),
+                None,
+                None,
+                KvbmDriveMode::OfflineDeterministic,
+            ),
+        )
     }
 
     fn shared_g3_two_workers() -> (MockWorker, MockWorker) {
@@ -1151,6 +1540,7 @@ mod tests {
     fn shared_g4_worker() -> (MockWorker, Arc<SharedG4Store>) {
         let config = KvbmOffloadConfig {
             enable_g4_storage: true,
+            g4_capacity_bytes: Some(64_000_000),
             block_size_bytes: Some(1_000_000),
             bandwidth_g2_to_g4_gbps: 1.0,
             bandwidth_g4_to_g2_gbps: 1.0,
@@ -1176,6 +1566,7 @@ mod tests {
     fn shared_g4_two_workers() -> (MockWorker, MockWorker, Arc<SharedG4Store>) {
         let config = KvbmOffloadConfig {
             enable_g4_storage: true,
+            g4_capacity_bytes: Some(64_000_000),
             block_size_bytes: Some(1_000_000),
             bandwidth_g2_to_g4_gbps: 1.0,
             bandwidth_g4_to_g2_gbps: 1.0,
@@ -1237,6 +1628,156 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_g2_fabric_contends_across_ranks_and_fires_only_at_owner_boundary() {
+        let _guard = shared_g2_test_guard().await;
+        let (worker_a, worker_b) = shared_g2_two_workers();
+        let ids: Arc<[BlockId]> = Arc::from(vec![0usize]);
+        worker_a.set_now_ms(0.0);
+        worker_b.set_now_ms(0.0);
+        let notification_a = worker_a
+            .execute_local_transfer(
+                LogicalLayoutHandle::G1,
+                LogicalLayoutHandle::G2,
+                ids.clone(),
+                ids.clone(),
+                TransferOptions::default(),
+            )
+            .unwrap();
+        let notification_b = worker_b
+            .execute_local_transfer(
+                LogicalLayoutHandle::G1,
+                LogicalLayoutHandle::G2,
+                ids.clone(),
+                ids,
+                TransferOptions::default(),
+            )
+            .unwrap();
+
+        // Two 1 MB transfers sharing one 1 GB/s fabric each finish at 2 ms.
+        let mut notification_a = Box::pin(notification_a.into_future());
+        let mut notification_b = Box::pin(notification_b.into_future());
+        assert_eq!(
+            worker_a
+                .drain_completions_summary(1.999)
+                .local
+                .offload_transfers,
+            0
+        );
+        assert!(matches!(
+            futures::poll!(&mut notification_a),
+            std::task::Poll::Pending
+        ));
+        assert!(matches!(
+            futures::poll!(&mut notification_b),
+            std::task::Poll::Pending
+        ));
+
+        // Advancing A detaches both due completions, but offline ownership
+        // keeps B's notification pending until B reaches its own boundary.
+        assert_eq!(
+            worker_a
+                .drain_completions_summary(2.0)
+                .local
+                .offload_transfers,
+            1
+        );
+        assert!(matches!(
+            futures::poll!(&mut notification_a),
+            std::task::Poll::Ready(Ok(()))
+        ));
+        assert!(matches!(
+            futures::poll!(&mut notification_b),
+            std::task::Poll::Pending
+        ));
+        assert_eq!(
+            worker_b
+                .drain_completions_summary(2.0)
+                .local
+                .offload_transfers,
+            1
+        );
+        assert!(matches!(
+            futures::poll!(&mut notification_b),
+            std::task::Poll::Ready(Ok(()))
+        ));
+        for worker in [&worker_a, &worker_b] {
+            let metrics = worker.transfer_metrics().g1_to_g2;
+            assert_eq!(metrics.transfers, 1);
+            assert_eq!(metrics.completed_transfers, 1);
+            assert_eq!(metrics.total_transfer_time_us, 2_000);
+            assert_eq!(metrics.total_queue_wait_us, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_worker_dynamic_footprint_charges_each_logical_position() {
+        let worker = MockWorker::new_with_footprint(
+            0,
+            Some(Arc::from(vec![1_000_000usize, 3_000_000usize])),
+            1.0,
+            1.0,
+            None,
+            None,
+            None,
+            None,
+            KvbmDriveMode::Live,
+        );
+        worker.set_now_ms(0.0);
+        let ids: Arc<[BlockId]> = Arc::from(vec![0usize, 1usize]);
+        let options = TransferOptions::builder()
+            .block_positions(Arc::from(vec![0u64, 1u64]))
+            .build()
+            .expect("position metadata should build");
+        let notification = worker
+            .execute_local_transfer(
+                LogicalLayoutHandle::G1,
+                LogicalLayoutHandle::G2,
+                ids.clone(),
+                ids,
+                options,
+            )
+            .expect("dynamic transfer should reserve");
+
+        worker.drain_completions(3.999);
+        assert!(notification.could_yield());
+        worker.drain_completions(4.0);
+        notification
+            .await
+            .expect("four MB at one GB/s should finish at four ms");
+    }
+
+    #[test]
+    fn mock_worker_dynamic_footprint_fails_closed_without_positions() {
+        let worker = MockWorker::new_with_footprint(
+            0,
+            Some(Arc::from(vec![1_000_000usize])),
+            1.0,
+            1.0,
+            None,
+            None,
+            None,
+            None,
+            KvbmDriveMode::Live,
+        );
+        let ids: Arc<[BlockId]> = Arc::from(vec![0usize]);
+        let error = match worker.execute_local_transfer(
+            LogicalLayoutHandle::G1,
+            LogicalLayoutHandle::G2,
+            ids.clone(),
+            ids,
+            TransferOptions::default(),
+        ) {
+            Ok(_) => panic!("missing positions must not fall back to a scalar"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("requires logical block positions")
+        );
+    }
+
+    #[tokio::test]
     async fn mock_worker_two_concurrent_transfers_complete_at_2x() {
         // PS regression at the Worker layer: two G1→G2 transfers at t=0
         // should both complete at t = 2 * single_transfer_duration.
@@ -1288,10 +1829,10 @@ mod tests {
             KvbmDriveMode::OfflineDeterministic,
         );
         let (long_id, _long) = worker
-            .reserve_transfer_with(TransferDirection::G1ToG2, 0.0, 2, |_| {})
+            .reserve_transfer_with(TransferDirection::G1ToG2, 0.0, 2, None, |_| {})
             .expect("long transfer reservation");
         let (short_id, _short) = worker
-            .reserve_transfer_with(TransferDirection::G1ToG2, 0.0, 1, |_| {})
+            .reserve_transfer_with(TransferDirection::G1ToG2, 0.0, 1, None, |_| {})
             .expect("short transfer reservation");
         let mut observed = Vec::new();
 
@@ -1553,6 +2094,7 @@ mod tests {
         let _guard = shared_g4_test_guard().await;
         let config = KvbmOffloadConfig {
             enable_g4_storage: true,
+            g4_capacity_bytes: Some(64_000_000),
             block_size_bytes: Some(1_000_000),
             bandwidth_g2_to_g4_gbps: 1.0,
             bandwidth_g4_to_g2_gbps: 1.0,
@@ -1652,7 +2194,7 @@ mod tests {
         // Reserve one swap-in (onboard model) and one offload (offload model)
         // at the same virtual time, so both counters are at their initial value.
         let (status, _) = watch::channel(SwapInStatus::pending(1));
-        let swap_id = worker.reserve_swap_in(0.0, 1, status);
+        let swap_id = worker.reserve_swap_in(0.0, 1, None, status);
         let ids: Arc<[BlockId]> = Arc::from(vec![0usize]);
         let _offload = worker
             .execute_local_transfer(
@@ -1684,7 +2226,7 @@ mod tests {
         let worker = make_worker();
         worker.set_now_ms(0.0);
         let (status, status_rx) = watch::channel(SwapInStatus::pending(1));
-        let _id = worker.reserve_swap_in(0.0, 1, status);
+        let _id = worker.reserve_swap_in(0.0, 1, None, status);
         assert_eq!(status_rx.borrow().terminal, SwapInTerminal::Pending);
         worker.drain_completions(0.5);
         assert!(

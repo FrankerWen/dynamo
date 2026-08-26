@@ -12,7 +12,7 @@ use super::KvRouterPlacement;
 use crate::common::protocols::{DirectRequest, MockEngineArgs};
 #[cfg(test)]
 use crate::loadgen::ReplayRequestPayload;
-use crate::loadgen::WorkloadDriver;
+use crate::loadgen::{AgentxReplayController, WorkloadDriver};
 #[cfg(test)]
 use crate::replay::offline::components::OfflineRouterSnapshot;
 use crate::replay::offline::components::{
@@ -286,6 +286,27 @@ where
             router_config,
             prefill_load_estimator,
             AdmissionQueue::<Metadata>::new_workload(driver, mode),
+            router_mode,
+        )
+    }
+
+    /// Create the KV-configurable disaggregated runtime from the same exact
+    /// AgentX admission controller used by aggregate replay.
+    pub(in crate::replay) fn new_agentx(
+        config: &OfflineDisaggReplayConfig,
+        router_config: Option<KvRouterConfig>,
+        prefill_load_estimator: Option<ReplayPrefillLoadEstimator>,
+        controller: AgentxReplayController,
+        router_mode: ReplayRouterMode,
+    ) -> Result<Self>
+    where
+        PlacementPolicyImpl: ConfiguredPoolPlacement<Observation::Batch, Metadata>,
+    {
+        Self::new_with_source(
+            config,
+            router_config,
+            prefill_load_estimator,
+            AdmissionQueue::<Metadata>::new_agentx(controller),
             router_mode,
         )
     }

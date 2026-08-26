@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+mod agentx;
 mod arrival;
 mod driver;
 mod trace;
@@ -9,6 +10,16 @@ mod types;
 use rand::Rng;
 use rand::rngs::StdRng;
 
+pub(crate) use agentx::AgentxReplayController;
+#[cfg(test)]
+pub(crate) use agentx::test_agentx_corpus;
+pub use agentx::{
+    AGENTX_EXACT_SCHEMA_VERSION, AgentxBranch, AgentxBranchKind, AgentxCacheBustMode,
+    AgentxCompileEvidence, AgentxCompiledCorpus, AgentxDependency, AgentxDependencyKind,
+    AgentxEvent, AgentxEventCounts, AgentxEventKind, AgentxExactCorpus, AgentxExactTreeRecord,
+    AgentxPhase, AgentxPhaseRequestCounts, AgentxReplayConfig, AgentxReplaySummary, AgentxRequest,
+    AgentxRequestContext, AgentxStream,
+};
 pub use driver::WorkloadDriver;
 pub use trace::validate_trace_files;
 pub(crate) use types::ReplayRequestPayload;

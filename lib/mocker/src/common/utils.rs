@@ -8,6 +8,8 @@ use crate::common::protocols::{KvTransferTimingMode, MockEngineArgs, WorkerType}
 
 pub fn prefill_handoff_transfer_timing(
     num_input_tokens: usize,
+    block_size: usize,
+    kv_block_footprint_bytes: Option<&[usize]>,
     kv_transfer_bandwidth: Option<f64>,
     kv_bytes_per_token: Option<usize>,
     mode: KvTransferTimingMode,
@@ -15,9 +17,40 @@ pub fn prefill_handoff_transfer_timing(
     HandoffTransferTiming {
         mode,
         full_prompt_tokens: num_input_tokens,
+        full_prompt_bytes: full_prompt_kv_bytes(
+            num_input_tokens,
+            block_size,
+            kv_block_footprint_bytes,
+            kv_bytes_per_token,
+        ),
         kv_bytes_per_token,
         bandwidth_gb_s: kv_transfer_bandwidth,
     }
+}
+
+/// Resolve the KV bytes represented by a prompt.
+///
+/// Dynamic AIC footprints are indexed by logical block position and are the
+/// byte authority whenever present. The scheduler and KVBM reserve whole
+/// logical blocks, so a partial final prompt block is charged as one block as
+/// well. The scalar path is retained only for legacy non-exact callers.
+pub fn full_prompt_kv_bytes(
+    num_input_tokens: usize,
+    block_size: usize,
+    kv_block_footprint_bytes: Option<&[usize]>,
+    kv_bytes_per_token: Option<usize>,
+) -> Option<usize> {
+    if let Some(profile) = kv_block_footprint_bytes {
+        if block_size == 0 {
+            return None;
+        }
+        let required_blocks = num_input_tokens.div_ceil(block_size);
+        let blocks = profile.get(..required_blocks)?;
+        return blocks
+            .iter()
+            .try_fold(0usize, |total, bytes| total.checked_add(*bytes));
+    }
+    kv_bytes_per_token.and_then(|bytes_per_token| num_input_tokens.checked_mul(bytes_per_token))
 }
 
 /// Compute the modeled handoff delay after a prefill worker emits its terminal token.
@@ -30,6 +63,8 @@ pub fn compute_prefill_handoff_delay_ms(
     worker_type: WorkerType,
     completed: bool,
     num_input_tokens: usize,
+    block_size: usize,
+    kv_block_footprint_bytes: Option<&[usize]>,
     kv_transfer_bandwidth: Option<f64>,
     kv_bytes_per_token: Option<usize>,
 ) -> Option<f64> {
@@ -38,6 +73,8 @@ pub fn compute_prefill_handoff_delay_ms(
     }
     let timing = prefill_handoff_transfer_timing(
         num_input_tokens,
+        block_size,
+        kv_block_footprint_bytes,
         kv_transfer_bandwidth,
         kv_bytes_per_token,
         KvTransferTimingMode::FullPrompt,
@@ -67,6 +104,8 @@ pub fn compute_kv_transfer_delay(
         args.worker_type,
         true,
         num_input_tokens,
+        args.block_size,
+        args.kv_block_footprint_bytes.as_deref(),
         args.kv_transfer_bandwidth,
         args.kv_bytes_per_token,
     )
@@ -128,6 +167,8 @@ mod tests {
             WorkerType::Prefill,
             true,
             128,
+            16,
+            None,
             Some(1.0),
             Some(1_000_000),
         )
@@ -139,6 +180,8 @@ mod tests {
                 WorkerType::Prefill,
                 false,
                 128,
+                16,
+                None,
                 Some(1.0),
                 Some(1_000_000),
             )
@@ -149,10 +192,28 @@ mod tests {
                 WorkerType::Decode,
                 true,
                 128,
+                16,
+                None,
                 Some(1.0),
                 Some(1_000_000),
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn dynamic_full_prompt_bytes_charge_whole_logical_blocks() {
+        let profile = [100usize, 200, 300];
+        assert_eq!(full_prompt_kv_bytes(0, 16, Some(&profile), None), Some(0));
+        assert_eq!(full_prompt_kv_bytes(1, 16, Some(&profile), None), Some(100));
+        assert_eq!(
+            full_prompt_kv_bytes(16, 16, Some(&profile), None),
+            Some(100)
+        );
+        assert_eq!(
+            full_prompt_kv_bytes(17, 16, Some(&profile), None),
+            Some(300)
+        );
+        assert_eq!(full_prompt_kv_bytes(49, 16, Some(&profile), None), None);
     }
 }

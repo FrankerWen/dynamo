@@ -104,6 +104,8 @@ fn build_rust_engine(
     tp_size: usize,
     backend_version: Option<&str>,
     database_mode: Option<&str>,
+    systems_path: Option<&str>,
+    database_snapshot_sha256: Option<&str>,
     analytical_config: Option<&str>,
     moe_tp_size: Option<usize>,
     moe_ep_size: Option<usize>,
@@ -152,7 +154,7 @@ fn build_rust_engine(
     // paid once per unique config (speculative config included).
     static CACHE: OnceLock<Mutex<HashMap<String, Arc<AicEngine>>>> = OnceLock::new();
     let key = format!(
-        "{backend_name}|{system}|{backend_version:?}|{database_mode:?}|{analytical_config:?}|{model_path}|{tp_size}|{moe_tp_size:?}|{moe_ep_size:?}|{attention_dp_size:?}|{gemm_dtype:?}|{moe_dtype:?}|{fmha_dtype:?}|{kv_cache_dtype:?}|{comm_dtype:?}|{nextn}"
+        "{backend_name}|{system}|{backend_version:?}|{database_mode:?}|{systems_path:?}|{database_snapshot_sha256:?}|{analytical_config:?}|{model_path}|{tp_size}|{moe_tp_size:?}|{moe_ep_size:?}|{attention_dp_size:?}|{gemm_dtype:?}|{moe_dtype:?}|{fmha_dtype:?}|{kv_cache_dtype:?}|{comm_dtype:?}|{nextn}"
     );
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(existing) = cache.lock().unwrap().get(&key) {
@@ -190,6 +192,9 @@ fn build_rust_engine(
     }
     if let Some(value) = database_mode {
         builder = builder.database_mode(value);
+    }
+    if let Some(value) = systems_path {
+        builder = builder.systems_path(value);
     }
     if let Some(value) = analytical_config {
         builder = builder.analytical_config_json(value);
@@ -232,6 +237,8 @@ pub(super) fn create_aic_callback(
     tp_size: usize,
     backend_version: Option<&str>,
     database_mode: Option<&str>,
+    systems_path: Option<&str>,
+    database_snapshot_sha256: Option<&str>,
     analytical_config: Option<&str>,
     moe_tp_size: Option<usize>,
     moe_ep_size: Option<usize>,
@@ -254,6 +261,8 @@ pub(super) fn create_aic_callback(
             tp_size,
             backend_version,
             database_mode,
+            systems_path,
+            database_snapshot_sha256,
             analytical_config,
             moe_tp_size,
             moe_ep_size,
@@ -286,6 +295,8 @@ pub(super) fn create_aic_prefill_load_estimator(
     tp_size: usize,
     backend_version: Option<&str>,
     database_mode: Option<&str>,
+    systems_path: Option<&str>,
+    database_snapshot_sha256: Option<&str>,
     analytical_config: Option<&str>,
     moe_tp_size: Option<usize>,
     moe_ep_size: Option<usize>,
@@ -308,6 +319,8 @@ pub(super) fn create_aic_prefill_load_estimator(
             tp_size,
             backend_version,
             database_mode,
+            systems_path,
+            database_snapshot_sha256,
             analytical_config,
             moe_tp_size,
             moe_ep_size,

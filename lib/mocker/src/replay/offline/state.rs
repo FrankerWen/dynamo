@@ -276,6 +276,7 @@ impl OfflineWorkerState {
     #[cfg(test)]
     pub(crate) fn new(worker_idx: usize, args: MockEngineArgs, capture_kv_events: bool) -> Self {
         Self::new_with_rank(worker_idx, worker_idx as u64, 0, args, capture_kv_events)
+            .expect("test worker construction must succeed")
     }
 
     pub(crate) fn new_with_rank(
@@ -284,7 +285,7 @@ impl OfflineWorkerState {
         dp_rank: u32,
         args: MockEngineArgs,
         capture_kv_events: bool,
-    ) -> Self {
+    ) -> Result<Self> {
         let core = match args.engine_type {
             crate::common::protocols::EngineType::Vllm
             | crate::common::protocols::EngineType::Trtllm => {
@@ -297,11 +298,11 @@ impl OfflineWorkerState {
                     capture_kv_events,
                 );
                 #[cfg(feature = "kvbm-offload")]
-                if let Err(e) = core.init_offload_offline() {
-                    tracing::error!(
-                        "kvbm-offload offline init failed for worker {worker_idx}: {e}"
-                    );
-                }
+                core.init_offload_offline().map_err(|error| {
+                    anyhow!(
+                        "kvbm-offload offline attach failed for worker {worker_idx} (worker_id={worker_id}, dp_rank={dp_rank}): {error}"
+                    )
+                })?;
                 EngineCore::Vllm(core)
             }
             crate::common::protocols::EngineType::Sglang => {
@@ -315,17 +316,24 @@ impl OfflineWorkerState {
             }
         };
 
-        Self {
+        Ok(Self {
             core,
             worker_id,
             dp_rank,
             busy: false,
             in_flight: 0,
-        }
+        })
     }
 
     pub(crate) fn rank_identity(&self) -> (u64, u32) {
         (self.worker_id, self.dp_rank)
+    }
+
+    #[cfg(feature = "kvbm-offload")]
+    pub(crate) fn offload_resource_snapshot(
+        &self,
+    ) -> Option<crate::kvbm_offload::OffloadEngineSnapshot> {
+        self.core.offload_resource_snapshot()
     }
 
     pub(crate) fn in_flight(&self) -> usize {
@@ -488,6 +496,8 @@ mod tests {
 
     use super::{AggRequestState, DisaggRequestState, OfflineWorkerState};
     use crate::common::handoff::{HandoffId, HandoffOrder};
+    #[cfg(feature = "kvbm-offload")]
+    use crate::common::protocols::G1Backend;
     use crate::common::protocols::{DirectRequest, EngineType, MockEngineArgs, WorkerType};
     use crate::loadgen::{ReplayRequestPayload, SessionTrace, Trace, TurnTrace, WorkloadDriver};
     use crate::replay::offline::extensions::kv_events::KvCacheEventData;
@@ -573,7 +583,7 @@ mod tests {
                 builder = builder.sglang(Some(Default::default()));
             }
             let mut worker =
-                OfflineWorkerState::new_with_rank(3, 7, 3, builder.build().unwrap(), true);
+                OfflineWorkerState::new_with_rank(3, 7, 3, builder.build().unwrap(), true).unwrap();
             worker.receive_request(request(900 + engine_type as u128, 8));
 
             let mut now_ms = 0.0;
@@ -590,6 +600,32 @@ mod tests {
             assert!(events.iter().all(|event| event.worker_id == 7));
             assert!(events.iter().all(|event| event.event.dp_rank == 3));
         }
+    }
+
+    #[cfg(feature = "kvbm-offload")]
+    #[test]
+    fn ranked_worker_fails_closed_when_kvbm_offload_attach_fails() {
+        let args = MockEngineArgs::builder()
+            .engine_type(EngineType::Vllm)
+            .worker_type(WorkerType::Aggregated)
+            .g1_backend(G1Backend::Kvbm)
+            .block_size(4)
+            .num_gpu_blocks(64)
+            .max_num_batched_tokens(Some(64))
+            .max_num_seqs(Some(4))
+            .num_g2_blocks(Some(8))
+            .g2_capacity_bytes(Some(1_000_000))
+            .build()
+            .unwrap();
+
+        let error = match OfflineWorkerState::new_with_rank(0, 0, 0, args, false) {
+            Ok(_) => panic!("invalid G2 byte config must fail before replay"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("offline attach failed"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

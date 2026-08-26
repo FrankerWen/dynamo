@@ -65,6 +65,9 @@ pub enum TraceFileFormat {
     /// dependencies. Each row dispatches after `wait_for` completions plus its
     /// authored delay/tool wait.
     AgenticMooncake,
+    /// Exact AgentX session-tree JSONL. This format is consumed only by the
+    /// dedicated phased closed-loop AgentX replay entrypoint.
+    AgentxExactV1,
     AppliedComputeAgentic,
     Dynamo,
 }
@@ -75,6 +78,7 @@ impl TraceFileFormat {
             Self::Mooncake => "mooncake",
             Self::MooncakeDelta => "mooncake-delta",
             Self::AgenticMooncake => "agentic_mooncake",
+            Self::AgentxExactV1 => "agentx_exact_v1",
             Self::AppliedComputeAgentic => "applied_compute_agentic",
             Self::Dynamo => "dynamo",
         }
@@ -217,6 +221,7 @@ pub(crate) enum ReplayRequestPayload {
         input_length: usize,
         hash_ids: Vec<u32>,
         trace_block_size: usize,
+        prefix_tokens: Vec<u32>,
     },
 }
 
@@ -237,13 +242,35 @@ impl ReplayRequestPayload {
             input_length,
             hash_ids,
             trace_block_size,
+            prefix_tokens: Vec::new(),
+        }
+    }
+
+    pub(super) fn deferred_with_prefix(
+        request_metadata: DirectRequest,
+        input_length: usize,
+        hash_ids: Vec<u32>,
+        trace_block_size: usize,
+        prefix_tokens: Vec<u32>,
+    ) -> Self {
+        debug_assert!(request_metadata.tokens.is_empty());
+        Self::Deferred {
+            request_metadata,
+            input_length,
+            hash_ids,
+            trace_block_size,
+            prefix_tokens,
         }
     }
 
     pub(crate) fn input_length(&self) -> usize {
         match self {
             Self::Materialized(request) => request.tokens.len(),
-            Self::Deferred { input_length, .. } => *input_length,
+            Self::Deferred {
+                input_length,
+                prefix_tokens,
+                ..
+            } => input_length.saturating_add(prefix_tokens.len()),
         }
     }
 
@@ -286,8 +313,19 @@ impl ReplayRequestPayload {
                 input_length,
                 hash_ids,
                 trace_block_size,
+                prefix_tokens,
                 ..
-            } => synthesize_validated_trace_tokens(*input_length, hash_ids, *trace_block_size),
+            } => {
+                let mut tokens =
+                    Vec::with_capacity(input_length.saturating_add(prefix_tokens.len()));
+                tokens.extend_from_slice(prefix_tokens);
+                tokens.extend(synthesize_validated_trace_tokens(
+                    *input_length,
+                    hash_ids,
+                    *trace_block_size,
+                ));
+                tokens
+            }
         }
     }
 
@@ -299,9 +337,16 @@ impl ReplayRequestPayload {
                 input_length,
                 hash_ids,
                 trace_block_size,
+                prefix_tokens,
             } => {
-                request_metadata.tokens =
-                    synthesize_validated_trace_tokens(input_length, &hash_ids, trace_block_size);
+                request_metadata.tokens = prefix_tokens;
+                request_metadata
+                    .tokens
+                    .extend(synthesize_validated_trace_tokens(
+                        input_length,
+                        &hash_ids,
+                        trace_block_size,
+                    ));
                 request_metadata
             }
         }

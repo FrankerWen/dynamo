@@ -393,6 +393,81 @@ def create_session(
     )
 
 
+def compute_kv_block_footprint_bytes(
+    backend_name: str,
+    model_path: str,
+    tp_size: int,
+    block_size: int,
+    max_model_len: int,
+    moe_tp_size: int | None = None,
+    moe_ep_size: int | None = None,
+    attention_dp_size: int | None = None,
+    kv_cache_dtype: str | None = None,
+) -> list[int]:
+    """Return rank-local incremental KV bytes for every logical context block.
+
+    Unlike ``compute_kv_bytes_per_token`` this delegates footprint accounting to
+    the selected AIC model.  That distinction is required for models such as
+    DeepSeek-V4 whose persistent KV state is window-capped and compressed, so a
+    single linear bytes/token scalar is not physically meaningful.
+
+    The returned element at position ``p`` is
+    ``KV((p + 1) * block_size) - KV(p * block_size)``.  Fixed per-sequence
+    decode state is therefore charged to the first block.  Values are rounded
+    up to whole bytes and must remain non-negative and non-zero; callers use
+    the vector as the authoritative transfer/capacity profile.
+    """
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}")
+    if max_model_len <= 0:
+        raise ValueError(
+            f"max_model_len must be positive, got {max_model_len}"
+        )
+
+    aic = _load_aiconfigurator()
+    model_config_kwargs: dict = {
+        "tp_size": tp_size,
+        "moe_tp_size": moe_tp_size,
+        "moe_ep_size": moe_ep_size,
+        "attention_dp_size": attention_dp_size or 1,
+    }
+    quant_mode = _resolve_quant_mode("kvcache", kv_cache_dtype)
+    if quant_mode is not None:
+        model_config_kwargs["kvcache_quant_mode"] = quant_mode
+    model = aic["get_model"](
+        model_path=model_path,
+        model_config=aic["config"].ModelConfig(**model_config_kwargs),
+        backend_name=backend_name,
+    )
+
+    blocks = (max_model_len + block_size - 1) // block_size
+    result: list[int] = []
+    previous = 0
+    for position in range(blocks):
+        sequence_tokens = min((position + 1) * block_size, max_model_len)
+        total = int(math.ceil(model.get_kvcache_bytes_per_sequence(sequence_tokens)))
+        delta = total - previous
+        if delta <= 0:
+            raise RuntimeError(
+                "AIC returned a non-increasing KV footprint: "
+                f"position={position}, previous={previous}, total={total}"
+            )
+        result.append(delta)
+        previous = total
+
+    logger.info(
+        "Resolved AIC KV block footprint: backend=%s model=%s tp=%d "
+        "block_size=%d blocks=%d total_bytes=%d",
+        backend_name,
+        model_path,
+        tp_size,
+        block_size,
+        len(result),
+        sum(result),
+    )
+    return result
+
+
 def estimate_num_gpu_blocks(
     backend_name: str,
     system: str,

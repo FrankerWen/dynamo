@@ -4,7 +4,9 @@
 //! In-process wrapper over kvbm-engine's `OffloadEngine` + `InstanceLeader`
 //! backed by [`MockWorker`](super::worker::MockWorker).
 //!
-//! Construction is `async` (velo's `Messenger` needs a short TCP warmup).
+//! Construction is `async` because `InstanceLeader` owns a velo `Messenger`.
+//! Live mode uses a loopback TCP transport; deterministic offline replay uses
+//! a transport-free messenger because all simulated transfers are in-process.
 //! The hot-path methods ([`tick`](MockOffloadEngine::tick),
 //! [`prepare_onboard_prefix`](MockOffloadEngine::prepare_onboard_prefix),
 //! [`start_onboard_prefix`](MockOffloadEngine::start_onboard_prefix),
@@ -53,13 +55,14 @@ use crate::common::protocols::G1 as MockerG1;
 
 use super::KvbmDriveMode;
 use super::capacity_reservation::{
-    CapacityReservationGuard, CapacityReservationPolicy, CapacityReservations,
+    ByteCapacityMetrics, CapacityReservationGuard, CapacityReservationPolicy, CapacityReservations,
 };
 use super::config::KvbmOffloadConfig;
 use super::coordinator::{
     DirectSwapInLease, G1ToG2Lease, G2ToG3Lease, G2ToG4Lease, LeaseState, OffloadCoordinator,
     OffloadId, StagedSwapInLease, SwapInHandle, SwapInResources, SwapInStatus, SwapInTerminal,
 };
+use super::shared_g2::SharedG2Fabric;
 use super::shared_g3::SharedG3Pool;
 use super::shared_g4::SharedG4Store;
 use super::worker::{MockWorker, TransferDirection};
@@ -298,6 +301,15 @@ pub(crate) enum G1EvictionOutcome {
     },
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct OffloadEngineSnapshot {
+    pub config: KvbmOffloadConfig,
+    pub g2_capacity: Option<ByteCapacityMetrics>,
+    pub g4_cache: Option<super::shared_g4::G4CacheMetrics>,
+    pub transfers: super::worker::OffloadTransferMetrics,
+    pub fixed_slot_metadata_bytes: usize,
+}
+
 /// In-process offload engine driving a G1→G2 pipeline over [`MockWorker`].
 ///
 /// G1 blocks are handed to kvbm-engine as
@@ -335,6 +347,10 @@ pub struct MockOffloadEngine {
     /// live and offline synchronous scheduler passes explicitly pump transfer
     /// publication after PS completions drain.
     _runtime: Option<tokio::runtime::Runtime>,
+    /// Runtime handle used by synchronous pipeline barriers. Deterministic
+    /// offline engines point at one process-wide executor; live engines point
+    /// at their owned runtime. The handle carries no mutable replay state.
+    _runtime_handle: Option<tokio::runtime::Handle>,
 }
 
 impl MockOffloadEngine {
@@ -350,14 +366,20 @@ impl MockOffloadEngine {
         config: KvbmOffloadConfig,
         drive_mode: KvbmDriveMode,
     ) -> Result<Self> {
-        let messenger = create_local_messenger().await?;
+        let messenger = create_local_messenger(drive_mode).await?;
         let g2_events_manager = Arc::new(match drive_mode {
             KvbmDriveMode::Live => EventsManager::builder().build(),
-            // A single completion can replace the whole tier, emitting one
-            // removal and one creation per slot before the boundary drains it.
-            KvbmDriveMode::OfflineDeterministic => EventsManager::builder()
-                .channel_capacity(config.num_g2_blocks.saturating_mul(2).max(1024))
-                .build(),
+            // Offline deterministic replay drains events after each transfer completion batch.
+            // Channel capacity only needs to absorb the maximum in-flight transfer burst.
+            KvbmDriveMode::OfflineDeterministic => {
+                let burst_capacity = config
+                    .offload_batch_size
+                    .saturating_mul(64)
+                    .clamp(131072, 1048576);
+                EventsManager::builder()
+                    .channel_capacity(burst_capacity)
+                    .build()
+            }
         });
         let g2_event_stream = match drive_mode {
             KvbmDriveMode::Live => Some(G2EventStream::BestEffort(Box::pin(
@@ -380,6 +402,7 @@ impl MockOffloadEngine {
                     .map(|result| result.map_err(|error| error.to_string())),
             ))
         });
+        let shared_g2 = SharedG2Fabric::get_or_create_with_mode(&config, drive_mode)?;
         let shared_g3 = SharedG3Pool::get_or_create_with_mode(&config, drive_mode)?;
         let g3_manager = shared_g3.as_ref().map(|pool| pool.manager());
         let shared_g4 = SharedG4Store::get_or_create_with_mode(&config, drive_mode)?;
@@ -391,12 +414,17 @@ impl MockOffloadEngine {
             "kvbm-offload: building mock offload engine"
         );
 
-        let worker = Arc::new(MockWorker::new_with_drive_mode(
+        let worker = Arc::new(MockWorker::new_with_footprint_and_fabric(
             config.block_size_bytes.unwrap_or(0),
+            config
+                .block_footprint_bytes
+                .clone()
+                .map(Arc::<[usize]>::from),
             config.bandwidth_g1_to_g2_gbps,
             config.bandwidth_g2_to_g1_gbps,
             None,
             None,
+            shared_g2,
             shared_g3.clone(),
             shared_g4.clone(),
             drive_mode,
@@ -421,7 +449,18 @@ impl MockOffloadEngine {
         }
         let leader = Arc::new(leader_builder.build()?);
 
-        let g2_destination_reservations = Arc::new(CapacityReservations::default());
+        let g2_destination_reservations = Arc::new(match config.g2_capacity_bytes {
+            Some(capacity_bytes) => CapacityReservations::with_byte_capacity(
+                capacity_bytes,
+                Arc::from(
+                    config
+                        .block_footprint_bytes
+                        .clone()
+                        .expect("validated G2 byte capacity requires AIC footprint"),
+                ),
+            ),
+            None => CapacityReservations::default(),
+        });
         let g1_to_g2_pending = Arc::new(PendingTracker::new());
         let g1_to_g2_presence = PresenceFilter::<EngineG1, G2>::new(registry.clone())
             .with_pending_tracker(g1_to_g2_pending.clone());
@@ -509,6 +548,7 @@ impl MockOffloadEngine {
             pending_router_events: Mutex::new(Vec::new()),
             advance_state: Mutex::new(AdvanceState::default()),
             _runtime: None,
+            _runtime_handle: None,
         })
     }
 
@@ -522,7 +562,17 @@ impl MockOffloadEngine {
     /// engine.attach_runtime(rt);
     /// ```
     pub fn attach_runtime(&mut self, rt: tokio::runtime::Runtime) {
+        self._runtime_handle = Some(rt.handle().clone());
         self._runtime = Some(rt);
+    }
+
+    /// Attach a process-owned runtime without transferring ownership.
+    ///
+    /// This is used only by deterministic offline replay, whose immutable
+    /// async executor is shared while all tier, scheduler, and trial state
+    /// remains owned by this engine.
+    pub fn attach_runtime_handle(&mut self, handle: tokio::runtime::Handle) {
+        self._runtime_handle = Some(handle);
     }
 
     fn assert_offline_mutation_allowed(&self, operation: &str) {
@@ -594,11 +644,13 @@ impl MockOffloadEngine {
         for event in lifecycle_events {
             match event {
                 LogicalKvCacheEvent::Create(plh) => {
+                    self.g2_destination_reservations.mark_published(plh);
                     if let Some(meta) = metadata.get(&plh).cloned() {
                         router_events.push(G2RouterEvent::Stored(meta));
                     }
                 }
                 LogicalKvCacheEvent::Remove(plh) => {
+                    self.g2_destination_reservations.mark_removed(plh);
                     if let Some(meta) = metadata.remove(&plh) {
                         router_events.push(G2RouterEvent::Removed {
                             seq_hash: meta.seq_hash,
@@ -613,10 +665,16 @@ impl MockOffloadEngine {
     /// Drain kvbm-logical G2 lifecycle notifications and translate them into
     /// router-tier events. The caller owns event IDs and publishing.
     fn collect_g2_router_events(&self) -> Vec<G2RouterEvent> {
-        let mut router_events = self.translate_g2_lifecycle_events();
         #[cfg(feature = "replay-bench")]
-        order_g2_router_events(&mut router_events);
-        router_events
+        {
+            let mut router_events = self.translate_g2_lifecycle_events();
+            order_g2_router_events(&mut router_events);
+            router_events
+        }
+        #[cfg(not(feature = "replay-bench"))]
+        {
+            self.translate_g2_lifecycle_events()
+        }
     }
 
     pub(crate) fn drain_g2_router_events(&self) -> Vec<G2RouterEvent> {
@@ -651,12 +709,7 @@ impl MockOffloadEngine {
         F: Future<Output = bool>,
     {
         let current = tokio::runtime::Handle::try_current().ok();
-        let Some(runtime) = self
-            ._runtime
-            .as_ref()
-            .map(tokio::runtime::Runtime::handle)
-            .or(current.as_ref())
-        else {
+        let Some(runtime) = self._runtime_handle.as_ref().or(current.as_ref()) else {
             return false;
         };
         match current.as_ref().map(tokio::runtime::Handle::runtime_flavor) {
@@ -677,11 +730,7 @@ impl MockOffloadEngine {
         F: Future<Output = T>,
     {
         let current = tokio::runtime::Handle::try_current().ok();
-        let runtime = self
-            ._runtime
-            .as_ref()
-            .map(tokio::runtime::Runtime::handle)
-            .or(current.as_ref())?;
+        let runtime = self._runtime_handle.as_ref().or(current.as_ref())?;
         match current.as_ref().map(tokio::runtime::Handle::runtime_flavor) {
             Some(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(|| {
                 runtime.block_on(Self::with_barrier_timeout_value(wait))
@@ -709,9 +758,8 @@ impl MockOffloadEngine {
     fn settle_or_panic(&self, token: SettlementToken, target: SettlementTarget) {
         let current = tokio::runtime::Handle::try_current().ok();
         let runtime = self
-            ._runtime
+            ._runtime_handle
             .as_ref()
-            .map(tokio::runtime::Runtime::handle)
             .or(current.as_ref())
             .expect("pipeline settlement requires a Tokio runtime");
         let wait = Self::with_settlement_timeout(self.engine.settle_after(token, target));
@@ -946,6 +994,10 @@ impl MockOffloadEngine {
                     if let Some(g2_blocks) = maybe_g2_blocks {
                         drop(staged.g2_capacity_reservation.take());
                         let block_count = g2_blocks.len();
+                        let positions = g2_blocks
+                            .iter()
+                            .map(|block| block.sequence_hash().position())
+                            .collect::<Vec<_>>();
                         tracing::trace!(
                             now_ms,
                             block_count,
@@ -976,7 +1028,11 @@ impl MockOffloadEngine {
                             .resources
                             .status_tx
                             .send_replace(SwapInStatus::pending(block_count));
-                        return Some((block_count, staged.resources.status_tx.clone()));
+                        return Some((
+                            block_count,
+                            positions,
+                            staged.resources.status_tx.clone(),
+                        ));
                     }
                     if session_finished {
                         let matched_blocks = Self::completed_match_count(&staged.result);
@@ -1003,8 +1059,9 @@ impl MockOffloadEngine {
                     None
                 })
                 .flatten();
-            if let Some((block_count, status_tx)) = onboard {
-                self.worker.reserve_swap_in(now_ms, block_count, status_tx);
+            if let Some((block_count, positions, status_tx)) = onboard {
+                self.worker
+                    .reserve_swap_in(now_ms, block_count, Some(&positions), status_tx);
             }
         }
     }
@@ -1110,15 +1167,12 @@ impl MockOffloadEngine {
     /// best-effort drain; offline mode fires one completion at a time and
     /// settles its pipeline publication before exposing the next completion.
     ///
-    /// # Per-worker virtual-time containment
+    /// # Transfer-fabric scope
     ///
-    /// This `tick` only advances PS models owned by *this*
-    /// engine's `MockWorker`. With one engine per scheduler worker and
-    /// G1↔G2 transfers physically scoped to that worker's CPU/host
-    /// memory, the per-worker PS queue is the correct contention unit:
-    /// concurrent offloads on different workers do not contend for the
-    /// same DRAM bandwidth, and concurrent offloads on the same worker
-    /// fair-share via `BandwidthSharingModel`'s PS math.
+    /// When `g2_fabric_id` is set, this tick advances a node-scoped shared
+    /// G1<->G2 PS model. Due completions are partitioned by owner so only the
+    /// owning engine settles its pipeline and publishes into its rank-local
+    /// G2 manager. Without a fabric id the legacy per-worker queues remain.
     ///
     /// G3/G4 are modeled by process-local shared resources hanging off the
     /// worker, so lower-tier transfers contend globally while G1↔G2 remains
@@ -1267,8 +1321,8 @@ impl MockOffloadEngine {
         let g2_publish_blocks =
             current_shared_g3_onboard_blocks.saturating_add(current_shared_g4_onboard_blocks);
 
-        // Offline replay owns a private runtime for the kvbm-engine
-        // pipeline. Once drain fires transfer awaiters, give those
+        // Offline replay has an attached kvbm-engine executor. Once drain
+        // fires transfer awaiters, give those
         // pipeline tasks a chance to register completed destination blocks
         // before the scheduler immediately queries G2 in the same pass.
         if offload_drained > 0 {
@@ -1382,6 +1436,8 @@ impl MockOffloadEngine {
         }
         let acknowledged = self.coordinator.acknowledge_prepared();
         if !acknowledged.abandoned_visibility.is_empty() {
+            self.g2_destination_reservations
+                .release_hashes(&acknowledged.abandoned_visibility);
             let mut metadata = self
                 .g2_event_metadata
                 .lock()
@@ -1561,7 +1617,7 @@ impl MockOffloadEngine {
         {
             Some(tokio::runtime::RuntimeFlavor::MultiThread) => true,
             Some(tokio::runtime::RuntimeFlavor::CurrentThread) => false,
-            None => self._runtime.is_some(),
+            None => self._runtime_handle.is_some(),
             _ => unreachable!("Tokio runtime flavor is non-exhaustive"),
         };
         if dependency.is_none() && can_block_for_settlement {
@@ -1616,14 +1672,38 @@ impl MockOffloadEngine {
         if lower_tier_plan.stage_blocks() > 0 {
             let available_g2 = self.g2_manager.available_blocks();
             let required_g2 = lower_tier_plan.stage_blocks();
-            if self
-                .g2_destination_reservations
-                .try_reserve(available_g2, required_g2)
-            {
-                let g2_capacity_reservation = CapacityReservationGuard::new(
-                    self.g2_destination_reservations.clone(),
-                    required_g2,
-                );
+            let stage_start = lower_tier_plan.g2_prefix_blocks;
+            let stage_end = stage_start.saturating_add(required_g2);
+            let stage_hashes = plhs[stage_start..stage_end].to_vec();
+            let accepted = if self.g2_destination_reservations.uses_byte_capacity() {
+                let outcomes = self
+                    .g2_destination_reservations
+                    .try_reserve_hashes(available_g2, &stage_hashes);
+                let accepted_count = outcomes.iter().take_while(|accepted| **accepted).count();
+                let all_accepted = accepted_count == stage_hashes.len();
+                if !all_accepted && accepted_count > 0 {
+                    self.g2_destination_reservations
+                        .release_hashes(&stage_hashes[..accepted_count]);
+                    self.g2_destination_reservations.release(accepted_count);
+                }
+                all_accepted
+            } else {
+                self.g2_destination_reservations
+                    .try_reserve(available_g2, required_g2)
+            };
+            if accepted {
+                let g2_capacity_reservation =
+                    if self.g2_destination_reservations.uses_byte_capacity() {
+                        CapacityReservationGuard::with_hashes(
+                            self.g2_destination_reservations.clone(),
+                            stage_hashes,
+                        )
+                    } else {
+                        CapacityReservationGuard::new(
+                            self.g2_destination_reservations.clone(),
+                            required_g2,
+                        )
+                    };
                 return Some(PreparedSwapIn::from_staging_plan(
                     plhs.len(),
                     lower_tier_plan.reservation_blocks(),
@@ -1669,6 +1749,24 @@ impl MockOffloadEngine {
         Some(PreparedSwapIn::from_g2_blocks(plhs.len(), g2_blocks))
     }
 
+    pub(crate) fn g2_byte_capacity_metrics(&self) -> Option<ByteCapacityMetrics> {
+        self.g2_destination_reservations.byte_metrics()
+    }
+
+    pub(crate) fn g4_cache_metrics(&self) -> Option<super::shared_g4::G4CacheMetrics> {
+        self.shared_g4.as_ref().map(|store| store.metrics())
+    }
+
+    pub(crate) fn resource_snapshot(&self) -> OffloadEngineSnapshot {
+        OffloadEngineSnapshot {
+            config: self.config.clone(),
+            g2_capacity: self.g2_byte_capacity_metrics(),
+            g4_cache: self.g4_cache_metrics(),
+            transfers: self.worker.transfer_metrics(),
+            fixed_slot_metadata_bytes: self.g2_manager.fixed_slot_metadata_bytes(),
+        }
+    }
+
     /// Reserve G2→G1 bandwidth for a prepared lookup after the caller has
     /// already reserved destination G1 slots.
     pub(crate) fn start_onboard_prefix(
@@ -1687,6 +1785,10 @@ impl MockOffloadEngine {
                 g2_blocks,
             } => {
                 let block_count = g2_blocks.len();
+                let positions = g2_blocks
+                    .iter()
+                    .map(|block| block.sequence_hash().position())
+                    .collect::<Vec<_>>();
                 tracing::debug!(
                     now_ms,
                     plhs_len = requested_blocks,
@@ -1694,8 +1796,12 @@ impl MockOffloadEngine {
                     "kvbm-offload: G2→G1 swap-in HIT"
                 );
                 let (status_tx, _) = watch::channel(SwapInStatus::pending(block_count));
-                self.worker
-                    .reserve_swap_in(now_ms, block_count, status_tx.clone());
+                self.worker.reserve_swap_in(
+                    now_ms,
+                    block_count,
+                    Some(&positions),
+                    status_tx.clone(),
+                );
                 self.coordinator
                     .insert_direct_swap_in(DirectSwapInLease::new(SwapInResources {
                         status_tx,
@@ -1825,9 +1931,19 @@ impl Drop for MockOffloadEngine {
     }
 }
 
-/// Local velo `Messenger` on a random TCP port. Avoids pulling in
-/// kvbm-engine's `testing` feature for a ~20 line helper.
-async fn create_local_messenger() -> Result<Arc<velo::Messenger>> {
+/// Construct the velo runtime required by `InstanceLeader`.
+///
+/// Offline replay never sends an RPC: the mock worker and all tier managers
+/// live in this process and virtual time drives every transfer.  Starting a
+/// loopback TCP acceptor for every scheduler rank added a fixed 100 ms warmup
+/// (and matching teardown work) to every trial without changing simulation
+/// semantics.  Keep TCP for the live path, but use velo's valid
+/// transport-free local runtime for deterministic replay.
+async fn create_local_messenger(drive_mode: KvbmDriveMode) -> Result<Arc<velo::Messenger>> {
+    if drive_mode == KvbmDriveMode::OfflineDeterministic {
+        return Ok(velo::Messenger::builder().build().await?);
+    }
+
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let transport: Arc<dyn velo::backend::Transport> = Arc::new(
         velo::backend::tcp::TcpTransportBuilder::new()
@@ -1888,6 +2004,7 @@ mod tests {
     fn g4_config() -> KvbmOffloadConfig {
         KvbmOffloadConfig {
             enable_g4_storage: true,
+            g4_capacity_bytes: Some(64_000_000),
             block_size_bytes: Some(1_000_000),
             offload_batch_size: 4,
             bandwidth_g2_to_g1_gbps: 1.0,

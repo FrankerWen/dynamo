@@ -53,6 +53,9 @@ fn load_trace_from_file(
         TraceFileFormat::AgenticMooncake => {
             bail!("agentic_mooncake trace format must be loaded as an agentic workload")
         }
+        TraceFileFormat::AgentxExactV1 => {
+            bail!("agentx_exact_v1 must be loaded through run_mocker_agentx_replay")
+        }
         TraceFileFormat::AppliedComputeAgentic => Trace::from_applied_compute_agentic(
             trace_path,
             trace_block_size,
@@ -320,8 +323,8 @@ pub fn simulate_loaded_trace_live_with_router_mode_and_options(
     record_per_request: bool,
     sla: SlaThresholds,
 ) -> Result<TraceSimulationReport> {
-    let args = args.normalized()?;
     validate_online_replay_args(&args, num_workers)?;
+    let args = args.normalized()?;
     let trace = trace
         .normalize_session_starts()?
         .speed_up_timing(arrival_speedup_ratio)?;
@@ -769,8 +772,8 @@ pub fn simulate_trace_live_file_with_router_mode_and_format_and_options(
     record_per_request: bool,
     sla: SlaThresholds,
 ) -> Result<TraceSimulationReport> {
-    let args = args.normalized()?;
     validate_online_replay_args(&args, num_workers)?;
+    let args = args.normalized()?;
     if trace_format == TraceFileFormat::AgenticMooncake {
         let trace =
             load_agentic_trace_from_file(trace_path, trace_block_size, arrival_speedup_ratio)?;
@@ -1004,8 +1007,8 @@ pub fn simulate_trace_live_requests_with_router_mode_and_options(
     record_per_request: bool,
     sla: SlaThresholds,
 ) -> Result<TraceSimulationReport> {
-    let args = args.normalized()?;
     validate_online_replay_args(&args, num_workers)?;
+    let args = args.normalized()?;
     if requests.is_empty() {
         bail!("trace replay requires at least one request");
     }
@@ -1384,8 +1387,8 @@ pub fn simulate_concurrency_live_file_with_router_mode_and_format_and_options(
     record_per_request: bool,
     sla: SlaThresholds,
 ) -> Result<TraceSimulationReport> {
-    let args = args.normalized()?;
     validate_online_concurrency_args(&args, num_workers, max_in_flight)?;
+    let args = args.normalized()?;
     if trace_format == TraceFileFormat::AgenticMooncake {
         bail!(
             "agentic_mooncake trace format requires online trace mode and is not supported with replay_concurrency"
@@ -1466,8 +1469,8 @@ pub fn simulate_concurrency_live_requests_with_router_mode_and_options(
     record_per_request: bool,
     sla: SlaThresholds,
 ) -> Result<TraceSimulationReport> {
-    let args = args.normalized()?;
     validate_online_concurrency_args(&args, num_workers, max_in_flight)?;
+    let args = args.normalized()?;
     if requests.is_empty() {
         bail!("concurrency replay requires at least one request");
     }
@@ -1846,8 +1849,8 @@ pub fn simulate_trace_live_workload_with_router_mode_and_options(
     record_per_request: bool,
     sla: SlaThresholds,
 ) -> Result<TraceSimulationReport> {
-    let args = args.normalized()?;
     validate_online_replay_args(&args, num_workers)?;
+    let args = args.normalized()?;
     online::simulate_trace_workload(
         online_replay_config(
             args,
@@ -2090,8 +2093,8 @@ pub fn simulate_agentic_trace_live_workload_with_router_mode_and_options(
     record_per_request: bool,
     sla: SlaThresholds,
 ) -> Result<TraceSimulationReport> {
-    let args = args.normalized()?;
     validate_online_replay_args(&args, num_workers)?;
+    let args = args.normalized()?;
     online::simulate_agentic_trace_workload(
         online_replay_config(
             args,
@@ -2156,8 +2159,8 @@ pub fn simulate_concurrency_live_workload_with_router_mode_and_options(
     record_per_request: bool,
     sla: SlaThresholds,
 ) -> Result<TraceSimulationReport> {
-    let args = args.normalized()?;
     validate_online_concurrency_args(&args, num_workers, max_in_flight)?;
+    let args = args.normalized()?;
     online::simulate_concurrency_workload(
         online_replay_config(
             args,

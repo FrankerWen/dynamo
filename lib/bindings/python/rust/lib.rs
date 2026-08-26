@@ -180,6 +180,7 @@ fn register_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_select_service, m)?)?;
     m.add_function(wrap_pyfunction!(llm::entrypoint::make_engine, m)?)?;
     m.add_function(wrap_pyfunction!(llm::replay::run_mocker_trace_replay, m)?)?;
+    m.add_function(wrap_pyfunction!(llm::replay::run_mocker_agentx_replay, m)?)?;
     m.add_function(wrap_pyfunction!(
         llm::replay::run_mocker_synthetic_trace_replay,
         m

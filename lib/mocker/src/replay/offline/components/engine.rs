@@ -136,7 +136,7 @@ where
         pass_mode: EnginePassMode,
         args: MockEngineArgs,
         num_workers: usize,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         Self::new_ranked_with_capture(
             stage,
             pass_mode,
@@ -156,7 +156,7 @@ where
         args: MockEngineArgs,
         num_workers: usize,
         capture_raw: bool,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let dp_size = args.dp_size.max(1) as usize;
         let mut workers = Vec::with_capacity(num_workers.saturating_mul(dp_size));
         let mut worker_groups = Vec::with_capacity(num_workers);
@@ -165,13 +165,14 @@ where
             for dp_rank in 0..dp_size {
                 let rank_id = worker_id * dp_size + dp_rank;
                 debug_assert_eq!(rank_id, workers.len());
+                let rank_args = args.for_offline_rank(worker_id, dp_rank as u32)?;
                 workers.push(Some(OfflineWorkerState::new_with_rank(
                     rank_id,
                     worker_id as u64,
                     dp_rank as u32,
-                    args.clone(),
+                    rank_args,
                     capture_raw,
-                )));
+                )?));
                 rank_ids.push(rank_id);
             }
             debug_assert_eq!(worker_id, worker_groups.len());
@@ -193,7 +194,7 @@ where
             observation: PhantomData,
         };
         component.refresh_all_groups();
-        component
+        Ok(component)
     }
 
     /// Set the engine args used when adding workers dynamically.
@@ -328,18 +329,19 @@ where
 
     /// Add a new mocker worker and all of its DP-rank schedulers, returning
     /// the stable mocker worker ID.
-    pub(in crate::replay::offline) fn add_worker(&mut self) -> usize {
+    pub(in crate::replay::offline) fn add_worker(&mut self) -> anyhow::Result<usize> {
         let worker_id = self.worker_groups.len();
         let mut rank_ids = Vec::with_capacity(self.args.dp_size.max(1) as usize);
         for dp_rank in 0..self.args.dp_size.max(1) {
             let rank_id = self.workers.len();
+            let rank_args = self.args.for_offline_rank(worker_id, dp_rank)?;
             let worker = OfflineWorkerState::new_with_rank(
                 rank_id,
                 worker_id as u64,
                 dp_rank,
-                self.args.clone(),
+                rank_args,
                 self.capture_raw,
-            );
+            )?;
             debug_assert_eq!(rank_id, self.workers.len());
             self.workers.push(Some(worker));
             rank_ids.push(rank_id);
@@ -349,7 +351,7 @@ where
         self.live_group_count += 1;
         #[cfg(debug_assertions)]
         self.debug_assert_total_in_flight();
-        worker_id
+        Ok(worker_id)
     }
 
     fn tombstone_group(&mut self, worker_id: usize) -> bool {
@@ -431,7 +433,7 @@ where
     pub(in crate::replay::offline) fn apply_target_count(
         &mut self,
         target: usize,
-    ) -> WorkerScaleDelta {
+    ) -> anyhow::Result<WorkerScaleDelta> {
         let active_ids = self.active_group_ids();
         let effective = active_ids.len() + self.pending_startup.len();
         let mut added = Vec::new();
@@ -441,7 +443,7 @@ where
         if target > effective {
             let has_startup_delay = self.startup_time_ms().is_some();
             for _ in 0..(target - effective) {
-                let id = self.add_worker();
+                let id = self.add_worker()?;
                 if has_startup_delay {
                     self.pending_startup.insert(id);
                 }
@@ -474,12 +476,12 @@ where
 
         // Clean up any workers that have already fully drained.
         let removed = self.try_remove_drained();
-        WorkerScaleDelta {
+        Ok(WorkerScaleDelta {
             added,
             cancelled_startups,
             newly_draining: newly_marked,
             removed,
-        }
+        })
     }
 
     /// Return stable mocker worker IDs that are active for new admissions.
@@ -548,6 +550,40 @@ where
     pub(in crate::replay::offline) fn rank_identity(&self, rank_id: usize) -> Option<(usize, u32)> {
         let (worker_id, dp_rank) = self.worker(rank_id)?.rank_identity();
         Some((usize::try_from(worker_id).ok()?, dp_rank))
+    }
+
+    #[cfg(feature = "kvbm-offload")]
+    pub(in crate::replay::offline) fn offload_resource_snapshots(
+        &self,
+    ) -> Vec<(usize, u32, crate::kvbm_offload::OffloadEngineSnapshot)> {
+        self.workers
+            .iter()
+            .filter_map(Option::as_ref)
+            .filter_map(|worker| {
+                let (worker_id, dp_rank) = worker.rank_identity();
+                worker.offload_resource_snapshot().map(|snapshot| {
+                    (
+                        usize::try_from(worker_id).expect("offline worker id must fit usize"),
+                        dp_rank,
+                        snapshot,
+                    )
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "kvbm-offload")]
+    pub(in crate::replay::offline) fn configured_scheduler_rank_count(&self) -> usize {
+        self.workers.len()
+    }
+
+    #[cfg(feature = "kvbm-offload")]
+    pub(in crate::replay::offline) fn offload_requested(&self) -> bool {
+        self.args.g2_capacity_bytes.is_some()
+            || self.args.num_g2_blocks.is_some_and(|blocks| blocks > 0)
+            || self.args.g2_rank_resource_configs.is_some()
+            || self.args.num_g3_blocks.is_some_and(|blocks| blocks > 0)
+            || self.args.enable_g4_storage
     }
 
     pub(in crate::replay::offline) fn has_active_workers(&self) -> bool {
@@ -1064,6 +1100,7 @@ mod tests {
             args,
             1,
         )
+        .expect("ranked timing engine must attach")
     }
 
     fn timed_request(uuid: Uuid, input_length: usize) -> DirectRequest {
@@ -1322,7 +1359,7 @@ mod tests {
     #[test]
     fn test_apply_target_count_scale_up_with_startup() {
         let mut engine = engine_with_startup(2, Some(5.0));
-        let delta = engine.apply_target_count(4);
+        let delta = engine.apply_target_count(4).unwrap();
 
         assert_eq!(delta.added.len(), 2);
         assert!(delta.newly_draining.is_empty());
@@ -1334,7 +1371,7 @@ mod tests {
     #[test]
     fn test_apply_target_count_scale_up_without_startup() {
         let mut engine = engine_with_startup(2, None);
-        let delta = engine.apply_target_count(4);
+        let delta = engine.apply_target_count(4).unwrap();
 
         assert_eq!(delta.added.len(), 2);
         assert!(delta.newly_draining.is_empty());
@@ -1348,14 +1385,14 @@ mod tests {
         let mut engine = engine_with_startup(2, Some(5.0));
 
         // Scale up to 4 — adds 2 in pending_startup.
-        engine.apply_target_count(4);
+        engine.apply_target_count(4).unwrap();
         assert_eq!(engine.active_worker_ids().len(), 2);
         assert_eq!(engine.worker_count(), 4);
 
         // Scale down to 3 — should cancel 1 startup worker, not mark any active.
         engine.ready_groups.insert(3);
         engine.deferred_ready_groups.insert(3);
-        let delta = engine.apply_target_count(3);
+        let delta = engine.apply_target_count(3).unwrap();
         assert!(delta.newly_draining.is_empty());
         assert_eq!(delta.cancelled_startups, vec![3]);
         assert_eq!(engine.active_worker_ids().len(), 2);
@@ -1366,7 +1403,7 @@ mod tests {
         assert!(engine.workers[3].is_none());
 
         // Scale down to 2 — should cancel the remaining startup worker.
-        let delta = engine.apply_target_count(2);
+        let delta = engine.apply_target_count(2).unwrap();
         assert!(delta.newly_draining.is_empty());
         assert_eq!(delta.cancelled_startups, vec![2]);
         assert_eq!(engine.active_worker_ids().len(), 2);
@@ -1374,7 +1411,7 @@ mod tests {
 
         // Tombstoned stable IDs are never reused. The next worker and rank
         // come from the append-only vector tails.
-        let delta = engine.apply_target_count(3);
+        let delta = engine.apply_target_count(3).unwrap();
         assert_eq!(delta.added, vec![4]);
         assert!(delta.newly_draining.is_empty());
         assert!(delta.removed.is_empty());
@@ -1387,10 +1424,10 @@ mod tests {
         let mut engine = engine_with_startup(3, Some(5.0));
 
         // Scale up to 5 — adds 2 in pending_startup.
-        engine.apply_target_count(5);
+        engine.apply_target_count(5).unwrap();
 
         // Scale down to 1 — should cancel 2 startup, mark 2 active.
-        let delta = engine.apply_target_count(1);
+        let delta = engine.apply_target_count(1).unwrap();
         assert_eq!(delta.cancelled_startups.len(), 2);
         assert_eq!(delta.newly_draining.len(), 2);
         assert_eq!(engine.active_worker_ids().len(), 1);
@@ -1420,12 +1457,12 @@ mod tests {
             Some(1)
         );
 
-        let delta = engine.apply_target_count(1);
+        let delta = engine.apply_target_count(1).unwrap();
         assert_eq!(delta.newly_draining, vec![1]);
         assert_eq!(engine.active_group_ids(), vec![0]);
         assert_eq!(engine.draining_group_ids(), vec![1]);
 
-        let delta = engine.apply_target_count(2);
+        let delta = engine.apply_target_count(2).unwrap();
         assert_eq!(delta.added, vec![2]);
         assert_eq!(engine.active_group_ids(), vec![0, 2]);
         assert_eq!(engine.draining_group_ids(), vec![1]);
@@ -1436,7 +1473,7 @@ mod tests {
     #[test]
     fn test_mark_worker_ready_activates_pending() {
         let mut engine = engine_with_startup(1, Some(5.0));
-        let delta = engine.apply_target_count(2);
+        let delta = engine.apply_target_count(2).unwrap();
         let new_id = delta.added[0];
 
         assert_eq!(engine.active_worker_ids().len(), 1);
@@ -1538,11 +1575,11 @@ mod tests {
     #[test]
     fn test_mark_worker_ready_returns_false_for_cancelled() {
         let mut engine = engine_with_startup(1, Some(5.0));
-        let delta = engine.apply_target_count(2);
+        let delta = engine.apply_target_count(2).unwrap();
         let new_id = delta.added[0];
 
         // Cancel by scaling back down.
-        engine.apply_target_count(1);
+        engine.apply_target_count(1).unwrap();
         // Worker was removed from pending_startup and workers map.
         assert!(!engine.mark_worker_ready(new_id));
     }
@@ -1620,7 +1657,7 @@ mod tests {
         ));
         assert!(effects.lifecycle_events.is_empty());
 
-        let delta = engine.apply_target_count(0);
+        let delta = engine.apply_target_count(0).unwrap();
         assert_eq!(delta.newly_draining, vec![0]);
         assert!(engine.active_worker_ids().is_empty());
         assert_eq!(engine.worker_count(), 1);
@@ -1692,12 +1729,6 @@ mod tests {
             .unwrap();
         let mut collector = TraceCollector::default();
         let mut seed = engine.drive_ready(0.0, &mut collector).unwrap();
-        assert!(
-            seed.pass_start_events
-                .0
-                .iter()
-                .any(|event| { event.storage_tier == StorageTier::Device })
-        );
         assert_eq!(
             seed.immediate_completions.len() + usize::from(seed.scheduled_completion.is_some()),
             1,
@@ -1711,6 +1742,14 @@ mod tests {
                 .pop()
                 .expect("singleton completion batch must contain one payload")
         });
+        assert!(
+            seed.pass_start_events
+                .0
+                .iter()
+                .chain(completion.engine_events.0.iter())
+                .any(|event| event.storage_tier == StorageTier::Device),
+            "the seed block must be visible at its configured pass boundary"
+        );
         // Model a reservation attempt at the t=0 boundary, before the GPU
         // compute interval becomes externally busy.
         engine

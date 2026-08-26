@@ -13,7 +13,7 @@ use super::{KvRouterPlacement, ReplayKvRouterConfig};
 use crate::common::protocols::{DirectRequest, MockEngineArgs};
 #[cfg(test)]
 use crate::loadgen::ReplayRequestPayload;
-use crate::loadgen::WorkloadDriver;
+use crate::loadgen::{AgentxReplayController, WorkloadDriver};
 use crate::replay::offline::agg::{AggRuntimeImpl, AggregatedPlacement};
 #[cfg(test)]
 use crate::replay::offline::components::OfflineRouterSnapshot;
@@ -302,6 +302,29 @@ where
             router_config,
             prefill_load_estimator,
             AdmissionQueue::<Metadata>::new_workload(driver, mode),
+            num_workers,
+            router_mode,
+        )
+    }
+
+    /// Create the KV-configurable aggregate runtime from the shared exact
+    /// AgentX admission controller.
+    pub(in crate::replay) fn new_agentx(
+        args: &MockEngineArgs,
+        router_config: Option<ReplayKvRouterConfig>,
+        prefill_load_estimator: Option<ReplayPrefillLoadEstimator>,
+        controller: AgentxReplayController,
+        num_workers: usize,
+        router_mode: ReplayRouterMode,
+    ) -> Result<Self>
+    where
+        PlacementPolicyImpl: ConfiguredAggregatedPlacement<Observation::Batch, Metadata>,
+    {
+        Self::new_with_source(
+            args,
+            router_config,
+            prefill_load_estimator,
+            AdmissionQueue::<Metadata>::new_agentx(controller),
             num_workers,
             router_mode,
         )

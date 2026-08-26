@@ -26,10 +26,10 @@ pub(crate) use collector::TraceCollector;
 #[cfg(test)]
 pub(crate) use collector::TraceRequestStatsSnapshot;
 pub use collector::{
-    PerRequestAdmissionRecord, PerRequestRecord, PerRequestRoutingRecord, ReplayRequestPool,
-    ReplayRoutingOutcome, ReplayTerminalStatus, SlaThresholds, TraceDistributionStats,
-    TraceGoodputStats, TraceInterTokenLatencyStats, TraceLatencyStats, TraceRequestCounts,
-    TraceSimulationReport, TraceThroughputStats,
+    OffloadResourceSummary, PerRequestAdmissionRecord, PerRequestRecord, PerRequestRoutingRecord,
+    ReplayRequestPool, ReplayRoutingOutcome, ReplayTerminalStatus, SlaThresholds,
+    TraceDistributionStats, TraceGoodputStats, TraceInterTokenLatencyStats, TraceLatencyStats,
+    TraceRequestCounts, TraceSimulationReport, TraceThroughputStats,
 };
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReplayRouterMode {
@@ -177,7 +177,8 @@ pub use offline::{
     KvIngestBoundaryStats, KvIngestEvidence, LifecycleOperation, OfflineRuntimeEvidence,
     PressureEvidence, PressureKind, PressureRecord, WorkerLifecycleTransition,
     WorkerLifecycleTransitionKind, WorkerPool, WorkerPoolState, canonical_engine_pool_metadata,
-    canonical_router_metadata, canonical_topology, with_runtime_evidence,
+    canonical_router_metadata, canonical_topology, simulate_agentx_exact_workload,
+    simulate_agentx_exact_workload_disagg, with_runtime_evidence,
 };
 pub use validate::validate_replay_args_mode;
 

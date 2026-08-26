@@ -40,7 +40,7 @@ use super::{
     state::AggRequestState,
 };
 use crate::common::protocols::{DirectRequest, ForwardPassSnapshot, MockEngineArgs, OutputSignal};
-use crate::loadgen::{ReplayRequestPayload, WorkloadDriver};
+use crate::loadgen::{AgentxReplayController, ReplayRequestPayload, WorkloadDriver};
 #[cfg(test)]
 use crate::replay::ReplayRouterMode;
 use crate::replay::{ReplayRequestPool, ReplayTerminalStatus, TraceCollector};
@@ -180,6 +180,19 @@ impl AggRuntimeImpl<AggregatedRoundRobinPlacement<()>, NoEngineEvents, NoReplayM
             |args, topology| Ok(AggregatedRoundRobinPlacement::new(args.dp_size, topology)),
         )
     }
+
+    pub(in crate::replay) fn new_round_robin_agentx(
+        args: &MockEngineArgs,
+        controller: AgentxReplayController,
+        num_workers: usize,
+    ) -> anyhow::Result<Self> {
+        Self::new_composed(
+            args,
+            AdmissionQueue::new_agentx(controller),
+            num_workers,
+            |args, topology| Ok(AggregatedRoundRobinPlacement::new(args.dp_size, topology)),
+        )
+    }
 }
 
 impl<PlacementPolicyImpl, Observation, Metadata>
@@ -208,7 +221,7 @@ where
             EnginePassMode::Visible,
             args.clone(),
             num_workers,
-        );
+        )?;
         engine.set_scaling_args(args.clone(), Observation::CAPTURE_RAW);
         let placement = create_placement(&args, engine.active_topology())?;
 
@@ -738,12 +751,16 @@ where
                 metadata,
                 session_id,
                 turn_index,
+                agentx_context,
             } = ready;
             let session_metadata = session_id.clone().zip(turn_index);
             let uuid = self.assign_request(request, arrival_time_ms, metadata, session_id)?;
             if let Some((session_id, turn_index)) = session_metadata {
                 self.collector
                     .on_session_metadata(uuid, session_id, turn_index);
+            }
+            if let Some(context) = agentx_context {
+                self.collector.on_agentx_context(uuid, context);
             }
             released_any = true;
         }
@@ -987,7 +1004,10 @@ where
     /// ramp and the scale-down drain tail. Aggregated replay has no separate
     /// prefill pool, so it reports through the decode role (prefill = 0).
     fn advance_now_ms(&mut self, new_now_ms: f64) {
-        let dt_ms = (new_now_ms - self.now_ms).max(0.0);
+        let dt_ms = self
+            .admission
+            .agentx_profile_overlap_ms(self.now_ms, new_now_ms)
+            .unwrap_or_else(|| (new_now_ms - self.now_ms).max(0.0));
         if dt_ms > 0.0 {
             let decode_worker_seconds = self.engine.worker_count() as f64 * dt_ms / 1000.0;
             self.collector
@@ -1030,7 +1050,7 @@ where
         if target_workers != self.engine.non_draining_group_count() {
             self.collector.clear_static_worker_count();
         }
-        let delta = self.engine.apply_target_count(target_workers);
+        let delta = self.engine.apply_target_count(target_workers)?;
         #[cfg(test)]
         if !delta.added.is_empty() {
             self.worker_active_requests
@@ -1283,6 +1303,26 @@ where
         }
 
         self.progress.finish();
+        if let Some(summary) = self.admission.agentx_summary() {
+            self.collector.set_agentx_summary(summary);
+        }
+        #[cfg(feature = "kvbm-offload")]
+        if self.engine.offload_requested() {
+            let expected = self.engine.configured_scheduler_rank_count();
+            let snapshots = self
+                .engine
+                .offload_resource_snapshots()
+                .into_iter()
+                .map(|(worker_id, dp_rank, snapshot)| {
+                    ("aggregated".to_string(), worker_id, dp_rank, snapshot)
+                })
+                .collect();
+            self.collector.set_offload_summary(
+                crate::replay::OffloadResourceSummary::from_engine_snapshots(
+                    true, expected, snapshots,
+                ),
+            );
+        }
         Ok((self.collector, self.stats))
     }
 

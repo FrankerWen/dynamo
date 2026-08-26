@@ -39,6 +39,7 @@ pub(super) struct SglangConfig {
     pub(super) block_size: usize,
     pub(super) total_kv_tokens: usize,
     pub(super) kv_bytes_per_token: Option<usize>,
+    pub(super) kv_block_footprint_bytes: Option<Arc<[usize]>>,
     pub(super) kv_transfer_bandwidth: Option<f64>,
     pub(super) kv_transfer_timing_mode: KvTransferTimingMode,
     pub(super) speculative_max_tokens: Option<usize>,
@@ -90,6 +91,10 @@ impl SglangConfig {
             block_size: args.block_size,
             total_kv_tokens: args.num_gpu_blocks * args.block_size,
             kv_bytes_per_token: args.kv_bytes_per_token,
+            kv_block_footprint_bytes: args
+                .kv_block_footprint_bytes
+                .clone()
+                .map(Arc::<[usize]>::from),
             kv_transfer_bandwidth: args.kv_transfer_bandwidth,
             kv_transfer_timing_mode: args.kv_transfer_timing_mode,
             speculative_max_tokens: args.aic_nextn.map(|nextn| nextn + 1),

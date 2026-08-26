@@ -1,0 +1,16 @@
+{
+  "oracle": "SemiAnalysisAI/agentx-harness",
+  "commit": "56a0cf70f4c0359454ee4bd15a17770b541a3e3e",
+  "scenario": "one_lane_snapshot_primer_real_warmup_barrier",
+  "normalized_events": [
+    {"kind": "play_started", "phase": "primer", "logical_time_ms": 0.0, "source_request_id": null},
+    {"kind": "request_dispatched", "phase": "primer", "logical_time_ms": 0.0, "source_request_id": "a"},
+    {"kind": "request_completed", "phase": "primer", "logical_time_ms": 1.0, "source_request_id": "a"},
+    {"kind": "request_dispatched", "phase": "warmup", "logical_time_ms": 1.0, "source_request_id": "b"},
+    {"kind": "request_completed", "phase": "warmup", "logical_time_ms": 2.0, "source_request_id": "b"},
+    {"kind": "play_completed", "phase": "warmup", "logical_time_ms": 2.0, "source_request_id": null},
+    {"kind": "play_recycled", "phase": "warmup", "logical_time_ms": 2.0, "source_request_id": null},
+    {"kind": "play_started", "phase": "warmup", "logical_time_ms": 2.0, "source_request_id": null},
+    {"kind": "barrier_opened", "phase": "profile", "logical_time_ms": 2.0, "source_request_id": null}
+  ]
+}

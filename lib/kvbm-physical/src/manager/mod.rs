@@ -247,6 +247,7 @@ impl TransferManager {
         }; // Lock released here
 
         let (
+            _block_positions,
             layer_range,
             nixl_write_notification,
             bounce_buffer,

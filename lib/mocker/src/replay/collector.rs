@@ -5,10 +5,13 @@ use ddsketchy::DDSketch;
 use rustc_hash::FxHashMap;
 use serde::Serialize;
 use serde::ser::{SerializeMap, Serializer};
+#[cfg(feature = "kvbm-offload")]
+use std::collections::BTreeSet;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use uuid::Uuid;
 
 use crate::common::protocols::OutputSignal;
+use crate::loadgen::{AgentxReplaySummary, AgentxRequestContext};
 use crate::scheduler::EnginePassResult;
 
 // 0.1% relative quantile error. The enlarged store covers latency/rate values
@@ -34,6 +37,368 @@ pub struct TraceSimulationReport {
     /// request granularity should access this field directly and serialize
     /// it themselves (e.g., the `--per-request-jsonl` CLI path).
     pub per_request: Vec<PerRequestRecord>,
+    /// Exact AgentX protocol evidence. Present only for the dedicated phased
+    /// replay; summary metrics then include profile-phase requests only.
+    pub agentx: Option<AgentxReplaySummary>,
+    /// Effective lower-tier resource evidence. Exact AgentX runs populate this
+    /// independently of protocol evidence so attach/configuration failures can
+    /// fail closed without being mistaken for workload failures.
+    pub offload: Option<OffloadResourceSummary>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct OffloadDirectionSummary {
+    pub transfers: u64,
+    pub completed_transfers: u64,
+    pub blocks: u64,
+    pub bytes: u64,
+    pub total_transfer_time_us: u64,
+    pub total_queue_wait_us: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct OffloadTransferSummary {
+    pub g1_to_g2: OffloadDirectionSummary,
+    pub g2_to_g1: OffloadDirectionSummary,
+    pub g2_to_g3: OffloadDirectionSummary,
+    pub g3_to_g2: OffloadDirectionSummary,
+    pub g2_to_g4: OffloadDirectionSummary,
+    pub g4_to_g2: OffloadDirectionSummary,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct G2ByteCapacitySummary {
+    pub capacity_bytes: usize,
+    pub reserved_bytes: usize,
+    pub occupied_bytes: usize,
+    pub peak_committed_bytes: usize,
+    pub admission_rejections: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct G4CacheSummary {
+    pub capacity_bytes: usize,
+    pub current_bytes: usize,
+    pub peak_bytes: usize,
+    pub hits: u64,
+    pub misses: u64,
+    pub admissions: u64,
+    pub evictions: u64,
+    pub evicted_bytes: u64,
+    pub rejected_oversize: u64,
+    /// Restore telemetry is derived from actual G4→G2 wire reservations.
+    pub restores: u64,
+    pub restore_blocks: u64,
+    pub restore_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OffloadRankSummary {
+    pub role: String,
+    pub worker_id: usize,
+    pub dp_rank: u32,
+    pub configured_g2_capacity_bytes: Option<usize>,
+    pub g2_fabric_id: Option<String>,
+    pub effective_num_g2_blocks: usize,
+    pub slot_derivation: String,
+    pub fixed_slot_metadata_lower_bound_bytes: usize,
+    pub kv_footprint_source: Option<String>,
+    pub kv_footprint_digest_algorithm: Option<String>,
+    pub kv_footprint_digest: Option<String>,
+    pub kv_footprint_blocks: usize,
+    pub kv_footprint_min_bytes: Option<usize>,
+    pub kv_footprint_max_bytes: Option<usize>,
+    pub kv_footprint_total_bytes: Option<usize>,
+    pub g2_capacity: Option<G2ByteCapacitySummary>,
+    pub transfers: OffloadTransferSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OffloadResourceSummary {
+    pub requested: bool,
+    pub feature_enabled: bool,
+    pub attached: bool,
+    pub capacity_authority: String,
+    pub g2_bandwidth_scope: String,
+    pub g2_fabric_ids: Vec<String>,
+    /// Deployment aggregate after role/rank allocation. Per-rank values below
+    /// are authoritative for checking that P/D pools did not double claim a
+    /// node's DRAM.
+    pub configured_g2_capacity_bytes: usize,
+    pub effective_g2_capacity_bytes: usize,
+    pub effective_num_g2_blocks: usize,
+    pub fixed_slot_metadata_lower_bound_bytes: usize,
+    pub expected_scheduler_ranks: usize,
+    pub attached_scheduler_ranks: usize,
+    pub operational_status: String,
+    pub config_consistent: bool,
+    pub invalid_reasons: Vec<String>,
+    pub ranks: Vec<OffloadRankSummary>,
+    pub transfers: OffloadTransferSummary,
+    pub g4: Option<G4CacheSummary>,
+}
+
+#[cfg(feature = "kvbm-offload")]
+impl OffloadDirectionSummary {
+    fn add(&mut self, other: Self) {
+        self.transfers = self.transfers.saturating_add(other.transfers);
+        self.completed_transfers = self
+            .completed_transfers
+            .saturating_add(other.completed_transfers);
+        self.blocks = self.blocks.saturating_add(other.blocks);
+        self.bytes = self.bytes.saturating_add(other.bytes);
+        self.total_transfer_time_us = self
+            .total_transfer_time_us
+            .saturating_add(other.total_transfer_time_us);
+        self.total_queue_wait_us = self
+            .total_queue_wait_us
+            .saturating_add(other.total_queue_wait_us);
+    }
+}
+
+#[cfg(feature = "kvbm-offload")]
+impl OffloadTransferSummary {
+    fn add(&mut self, other: Self) {
+        self.g1_to_g2.add(other.g1_to_g2);
+        self.g2_to_g1.add(other.g2_to_g1);
+        self.g2_to_g3.add(other.g2_to_g3);
+        self.g3_to_g2.add(other.g3_to_g2);
+        self.g2_to_g4.add(other.g2_to_g4);
+        self.g4_to_g2.add(other.g4_to_g2);
+    }
+
+    fn exercised_g2(self) -> bool {
+        self.g1_to_g2.transfers > 0 || self.g2_to_g1.transfers > 0
+    }
+}
+
+#[cfg(feature = "kvbm-offload")]
+impl From<crate::kvbm_offload::worker::DirectionTransferMetrics> for OffloadDirectionSummary {
+    fn from(value: crate::kvbm_offload::worker::DirectionTransferMetrics) -> Self {
+        Self {
+            transfers: value.transfers,
+            completed_transfers: value.completed_transfers,
+            blocks: value.blocks,
+            bytes: value.bytes,
+            total_transfer_time_us: value.total_transfer_time_us,
+            total_queue_wait_us: value.total_queue_wait_us,
+        }
+    }
+}
+
+#[cfg(feature = "kvbm-offload")]
+impl From<crate::kvbm_offload::worker::OffloadTransferMetrics> for OffloadTransferSummary {
+    fn from(value: crate::kvbm_offload::worker::OffloadTransferMetrics) -> Self {
+        Self {
+            g1_to_g2: value.g1_to_g2.into(),
+            g2_to_g1: value.g2_to_g1.into(),
+            g2_to_g3: value.g2_to_g3.into(),
+            g3_to_g2: value.g3_to_g2.into(),
+            g2_to_g4: value.g2_to_g4.into(),
+            g4_to_g2: value.g4_to_g2.into(),
+        }
+    }
+}
+
+#[cfg(feature = "kvbm-offload")]
+impl From<crate::kvbm_offload::capacity_reservation::ByteCapacityMetrics>
+    for G2ByteCapacitySummary
+{
+    fn from(value: crate::kvbm_offload::capacity_reservation::ByteCapacityMetrics) -> Self {
+        Self {
+            capacity_bytes: value.capacity_bytes,
+            reserved_bytes: value.reserved_bytes,
+            occupied_bytes: value.occupied_bytes,
+            peak_committed_bytes: value.peak_committed_bytes,
+            admission_rejections: value.admission_rejections,
+        }
+    }
+}
+
+#[cfg(feature = "kvbm-offload")]
+impl From<crate::kvbm_offload::shared_g4::G4CacheMetrics> for G4CacheSummary {
+    fn from(value: crate::kvbm_offload::shared_g4::G4CacheMetrics) -> Self {
+        Self {
+            capacity_bytes: value.capacity_bytes,
+            current_bytes: value.current_bytes,
+            peak_bytes: value.peak_bytes,
+            hits: value.hits,
+            misses: value.misses,
+            admissions: value.admissions,
+            evictions: value.evictions,
+            evicted_bytes: value.evicted_bytes,
+            rejected_oversize: value.rejected_oversize,
+            restores: 0,
+            restore_blocks: 0,
+            restore_bytes: 0,
+        }
+    }
+}
+
+#[cfg(feature = "kvbm-offload")]
+impl OffloadResourceSummary {
+    pub(crate) fn from_engine_snapshots(
+        requested: bool,
+        expected_scheduler_ranks: usize,
+        snapshots: Vec<(
+            String,
+            usize,
+            u32,
+            crate::kvbm_offload::OffloadEngineSnapshot,
+        )>,
+    ) -> Self {
+        let attached_scheduler_ranks = snapshots.len();
+        let attached = requested
+            && expected_scheduler_ranks > 0
+            && attached_scheduler_ranks == expected_scheduler_ranks;
+        let mut invalid_reasons = Vec::new();
+        if requested && !attached {
+            invalid_reasons.push(format!(
+                "offload_attach_count_mismatch:{attached_scheduler_ranks}/{expected_scheduler_ranks}"
+            ));
+        }
+
+        let mut configured_g2_capacity_bytes = 0usize;
+        let mut effective_g2_capacity_bytes = 0usize;
+        let mut effective_num_g2_blocks = 0usize;
+        let mut fixed_slot_metadata_lower_bound_bytes = 0usize;
+        let mut transfers = OffloadTransferSummary::default();
+        let mut ranks = Vec::with_capacity(snapshots.len());
+        let mut all_dynamic = !snapshots.is_empty();
+        let mut fabric_ids = BTreeSet::new();
+        let mut fabric_configured_ranks = 0usize;
+        let mut g4_values = Vec::new();
+
+        for (role, worker_id, dp_rank, snapshot) in snapshots {
+            let config = snapshot.config;
+            let profile = config.block_footprint_bytes.as_deref();
+            all_dynamic &= config.g2_capacity_bytes.is_some() && profile.is_some();
+            let footprint_digest = profile.map(|values| {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"agentx-kv-footprint-v1\0");
+                for value in values {
+                    hasher.update(&(*value as u64).to_le_bytes());
+                }
+                hasher.finalize().to_hex().to_string()
+            });
+            let footprint_min = profile.and_then(|values| values.iter().copied().min());
+            let footprint_max = profile.and_then(|values| values.iter().copied().max());
+            let footprint_total = profile.and_then(|values| {
+                values
+                    .iter()
+                    .try_fold(0usize, |total, value| total.checked_add(*value))
+            });
+            let configured_capacity = config.g2_capacity_bytes;
+            if let Some(fabric_id) = config.g2_fabric_id.as_ref() {
+                fabric_configured_ranks = fabric_configured_ranks.saturating_add(1);
+                fabric_ids.insert(fabric_id.clone());
+            }
+            let effective_capacity = snapshot.g2_capacity.map(|metrics| metrics.capacity_bytes);
+            if configured_capacity != effective_capacity && configured_capacity.is_some() {
+                invalid_reasons.push(format!(
+                    "g2_capacity_drift:{role}:{worker_id}:{dp_rank}:{configured_capacity:?}/{effective_capacity:?}"
+                ));
+            }
+            if configured_capacity.is_some() && profile.is_none() {
+                invalid_reasons.push(format!(
+                    "missing_dynamic_footprint:{role}:{worker_id}:{dp_rank}"
+                ));
+            }
+            configured_g2_capacity_bytes = configured_g2_capacity_bytes
+                .saturating_add(configured_capacity.unwrap_or_default());
+            effective_g2_capacity_bytes =
+                effective_g2_capacity_bytes.saturating_add(effective_capacity.unwrap_or_default());
+            effective_num_g2_blocks = effective_num_g2_blocks.saturating_add(config.num_g2_blocks);
+            fixed_slot_metadata_lower_bound_bytes = fixed_slot_metadata_lower_bound_bytes
+                .saturating_add(snapshot.fixed_slot_metadata_bytes);
+            let rank_transfers: OffloadTransferSummary = snapshot.transfers.into();
+            transfers.add(rank_transfers);
+            if let Some(g4) = snapshot.g4_cache {
+                g4_values.push(G4CacheSummary::from(g4));
+            }
+            ranks.push(OffloadRankSummary {
+                role,
+                worker_id,
+                dp_rank,
+                configured_g2_capacity_bytes: configured_capacity,
+                g2_fabric_id: config.g2_fabric_id,
+                effective_num_g2_blocks: config.num_g2_blocks,
+                slot_derivation: if configured_capacity.is_some() {
+                    "floor(capacity_bytes/min_aic_block_footprint_bytes)".to_string()
+                } else {
+                    "explicit_num_g2_blocks".to_string()
+                },
+                fixed_slot_metadata_lower_bound_bytes: snapshot.fixed_slot_metadata_bytes,
+                kv_footprint_source: config.footprint_source,
+                kv_footprint_digest_algorithm: footprint_digest
+                    .as_ref()
+                    .map(|_| "blake3".to_string()),
+                kv_footprint_digest: footprint_digest,
+                kv_footprint_blocks: profile.map_or(0, <[usize]>::len),
+                kv_footprint_min_bytes: footprint_min,
+                kv_footprint_max_bytes: footprint_max,
+                kv_footprint_total_bytes: footprint_total,
+                g2_capacity: snapshot.g2_capacity.map(Into::into),
+                transfers: rank_transfers,
+            });
+        }
+
+        let mut g4 = g4_values.first().copied();
+        let g4_consistent = g4_values.iter().all(|value| Some(*value) == g4);
+        if !g4_consistent {
+            invalid_reasons.push("shared_g4_metrics_inconsistent_across_ranks".to_string());
+        }
+        if let Some(g4_summary) = g4.as_mut() {
+            g4_summary.restores = transfers.g4_to_g2.transfers;
+            g4_summary.restore_blocks = transfers.g4_to_g2.blocks;
+            g4_summary.restore_bytes = transfers.g4_to_g2.bytes;
+        }
+        if fabric_configured_ranks > 0 && fabric_configured_ranks != attached_scheduler_ranks {
+            invalid_reasons.push("mixed_rank_local_and_shared_g2_bandwidth_scope".to_string());
+        }
+        let g2_bandwidth_scope = if fabric_configured_ranks == attached_scheduler_ranks
+            && attached_scheduler_ranks > 0
+        {
+            "shared_fabric"
+        } else {
+            "scheduler_rank"
+        }
+        .to_string();
+        let config_consistent = invalid_reasons.is_empty();
+        let operational_status = if !requested || !attached || !config_consistent {
+            "g2_requested_not_operational"
+        } else if transfers.exercised_g2() {
+            "g2_operational_exercised"
+        } else {
+            "g2_enabled_not_required"
+        }
+        .to_string();
+
+        Self {
+            requested,
+            feature_enabled: true,
+            attached,
+            capacity_authority: if all_dynamic {
+                "aic_dynamic_bytes".to_string()
+            } else {
+                "legacy_block_slots".to_string()
+            },
+            g2_bandwidth_scope,
+            g2_fabric_ids: fabric_ids.into_iter().collect(),
+            configured_g2_capacity_bytes,
+            effective_g2_capacity_bytes,
+            effective_num_g2_blocks,
+            fixed_slot_metadata_lower_bound_bytes,
+            expected_scheduler_ranks,
+            attached_scheduler_ranks,
+            operational_status,
+            config_consistent,
+            invalid_reasons,
+            ranks,
+            transfers,
+            g4,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +476,9 @@ pub struct TraceLatencyStats {
     pub tpot: TraceDistributionStats,
     pub itl: TraceInterTokenLatencyStats,
     pub e2e: TraceDistributionStats,
+    /// End-to-end latency divided by emitted output tokens, per completed
+    /// request. Values are milliseconds per output token.
+    pub e2e_normalized_ms_per_output_token: TraceDistributionStats,
     pub output_token_throughput_per_user: TraceDistributionStats,
 }
 
@@ -262,6 +630,18 @@ impl Serialize for TraceSimulationReport {
                 "goodput_output_throughput_tok_s",
                 &goodput.output_throughput_tok_s,
             )?;
+            let goodput_ratio = if self.request_counts.completed_requests == 0 {
+                0.0
+            } else {
+                goodput.completed_requests as f64 / self.request_counts.completed_requests as f64
+            };
+            map.serialize_entry("goodput_ratio", &goodput_ratio)?;
+        }
+        if let Some(agentx) = &self.agentx {
+            map.serialize_entry("agentx", agentx)?;
+        }
+        if let Some(offload) = &self.offload {
+            map.serialize_entry("offload", offload)?;
         }
         map.serialize_entry("processed_tokens", &self.processed_tokens())?;
         map.serialize_entry("processed_tokens_per_s", &self.processed_tokens_per_s())?;
@@ -280,6 +660,11 @@ impl Serialize for TraceSimulationReport {
         serialize_distribution(&mut map, "itl", &self.latency.itl.distribution)?;
         map.serialize_entry("max_itl_ms", &self.latency.itl.max_ms)?;
         serialize_distribution(&mut map, "e2e_latency", &self.latency.e2e)?;
+        serialize_rate_distribution(
+            &mut map,
+            "e2e_normalized_ms_per_output_token",
+            &self.latency.e2e_normalized_ms_per_output_token,
+        )?;
         serialize_rate_distribution(
             &mut map,
             "output_token_throughput_per_user",
@@ -335,7 +720,7 @@ struct TraceRequestStats {
     first_admit_ms: Option<f64>,
     terminal_time_ms: Option<f64>,
     terminal_status: Option<ReplayTerminalStatus>,
-    token_timeline: TokenTimeline,
+    token_timeline: StreamingTokenTimeline,
     input_length: usize,
     requested_output_length: usize,
     reused_input_tokens: usize,
@@ -356,27 +741,69 @@ struct TraceRequestStats {
     /// single-shot request lists.
     session_id: Option<String>,
     turn_index: Option<usize>,
+    agentx: Option<AgentxRequestContext>,
+    measurement_eligible: bool,
     detail: Option<Box<PerRequestDetail>>,
 }
 
-#[derive(Debug)]
-enum TokenTimeline {
-    Recording(Vec<f64>),
-    Finalized(FinalizedTokenTimeline),
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct StreamingTokenTimeline {
+    pub(crate) first_ms: Option<f64>,
+    pub(crate) second_ms: Option<f64>,
+    pub(crate) last_ms: Option<f64>,
+    pub(crate) prev_ms: Option<f64>,
+    pub(crate) len: usize,
 }
 
-impl Default for TokenTimeline {
-    fn default() -> Self {
-        Self::Recording(Vec::new())
+impl StreamingTokenTimeline {
+    #[inline]
+    fn record_token(
+        &mut self,
+        t: f64,
+        include_in_distributions: bool,
+        itl_distribution: &mut StreamingDistribution,
+        output_token_throughput_per_user: &mut StreamingDistribution,
+    ) {
+        if self.first_ms.is_none() {
+            self.first_ms = Some(t);
+        } else if self.second_ms.is_none() {
+            self.second_ms = Some(t);
+        }
+        if let Some(prev) = self.prev_ms {
+            if include_in_distributions {
+                let itl_ms = (t - prev).max(0.0);
+                itl_distribution.add(itl_ms);
+                if itl_ms > 0.0 {
+                    output_token_throughput_per_user.add(1000.0 / itl_ms);
+                }
+            }
+        }
+        self.prev_ms = Some(t);
+        self.last_ms = Some(t);
+        self.len += 1;
     }
-}
 
-#[derive(Debug, Clone, Copy)]
-struct FinalizedTokenTimeline {
-    first_ms: f64,
-    second_ms: Option<f64>,
-    last_ms: f64,
-    len: usize,
+    #[inline]
+    fn record_tokens(
+        &mut self,
+        t: f64,
+        count: usize,
+        include_in_distributions: bool,
+        itl_distribution: &mut StreamingDistribution,
+        output_token_throughput_per_user: &mut StreamingDistribution,
+    ) {
+        if count == 0 {
+            return;
+        }
+        for _ in 0..count {
+            self.record_token(
+                t,
+                include_in_distributions,
+                itl_distribution,
+                output_token_throughput_per_user,
+            );
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -546,6 +973,8 @@ pub struct PerRequestRecord {
     pub session_id: Option<String>,
     /// Zero-based turn index within `session_id`, when present.
     pub turn_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agentx: Option<AgentxRequestContext>,
     pub uuid: String,
     pub arrival_time_ms: f64,
     pub first_admit_ms: Option<f64>,
@@ -685,28 +1114,24 @@ pub(crate) struct TraceCollector {
     /// `finish()` to turn worker-seconds into gpu_hours.
     prefill_gpus_per_worker: usize,
     decode_gpus_per_worker: usize,
+    agentx_summary: Option<AgentxReplaySummary>,
+    offload_summary: Option<OffloadResourceSummary>,
 }
 
 impl TraceRequestStats {
+    #[inline]
     fn first_token_ms(&self) -> Option<f64> {
-        match &self.token_timeline {
-            TokenTimeline::Recording(times) => times.first().copied(),
-            TokenTimeline::Finalized(summary) => Some(summary.first_ms),
-        }
+        self.token_timeline.first_ms
     }
 
+    #[inline]
     fn last_token_ms(&self) -> Option<f64> {
-        match &self.token_timeline {
-            TokenTimeline::Recording(times) => times.last().copied(),
-            TokenTimeline::Finalized(summary) => Some(summary.last_ms),
-        }
+        self.token_timeline.last_ms
     }
 
+    #[inline]
     fn actual_output_length(&self) -> usize {
-        match &self.token_timeline {
-            TokenTimeline::Recording(times) => times.len(),
-            TokenTimeline::Finalized(summary) => summary.len,
-        }
+        self.token_timeline.len
     }
 
     fn mean_tpot_ms(&self) -> Option<f64> {
@@ -721,49 +1146,9 @@ impl TraceRequestStats {
     }
 
     fn ttst_ms(&self) -> Option<f64> {
-        let (first_token_ms, second_token_ms) = match &self.token_timeline {
-            TokenTimeline::Recording(times) => {
-                let [first_token_ms, second_token_ms, ..] = times.as_slice() else {
-                    return None;
-                };
-                (*first_token_ms, *second_token_ms)
-            }
-            TokenTimeline::Finalized(summary) => (summary.first_ms, summary.second_ms?),
-        };
+        let first_token_ms = self.first_token_ms()?;
+        let second_token_ms = self.token_timeline.second_ms?;
         Some((second_token_ms - first_token_ms).max(0.0))
-    }
-
-    fn finalize_token_timeline(
-        &mut self,
-        include_in_distributions: bool,
-        itl_distribution: &mut StreamingDistribution,
-        output_token_throughput_per_user: &mut StreamingDistribution,
-    ) {
-        let TokenTimeline::Recording(times) = &self.token_timeline else {
-            return;
-        };
-
-        if include_in_distributions {
-            for window in times.windows(2) {
-                let itl_ms = (window[1] - window[0]).max(0.0);
-                itl_distribution.add(itl_ms);
-                if itl_ms > 0.0 {
-                    output_token_throughput_per_user.add(1000.0 / itl_ms);
-                }
-            }
-        }
-
-        let Some(first_ms) = times.first().copied() else {
-            self.token_timeline = TokenTimeline::default();
-            return;
-        };
-        let summary = FinalizedTokenTimeline {
-            first_ms,
-            second_ms: times.get(1).copied(),
-            last_ms: times.last().copied().unwrap_or(first_ms),
-            len: times.len(),
-        };
-        self.token_timeline = TokenTimeline::Finalized(summary);
     }
 }
 
@@ -828,7 +1213,7 @@ impl TraceCollector {
                 first_admit_ms: None,
                 terminal_time_ms: None,
                 terminal_status: None,
-                token_timeline: TokenTimeline::default(),
+                token_timeline: StreamingTokenTimeline::default(),
                 input_length,
                 requested_output_length,
                 reused_input_tokens: 0,
@@ -836,6 +1221,8 @@ impl TraceCollector {
                 decode_worker_idx: None,
                 session_id: None,
                 turn_index: None,
+                agentx: None,
+                measurement_eligible: true,
                 first_admission_reused_input_tokens: 0,
                 detail: self
                     .capture_per_request
@@ -863,6 +1250,25 @@ impl TraceCollector {
             stats.session_id = Some(session_id);
             stats.turn_index = Some(turn_index);
         }
+    }
+
+    /// Attach exact AgentX phase/lane/play identity. Primer and warmup requests
+    /// remain available in per-request evidence but are excluded from profile
+    /// latency, throughput, cache, and goodput aggregates.
+    pub(crate) fn on_agentx_context(&mut self, uuid: Uuid, context: AgentxRequestContext) {
+        if let Some(stats) = self.requests.get_mut(&uuid) {
+            stats.measurement_eligible = context.measurement_eligible;
+            stats.agentx = Some(context);
+        }
+    }
+
+    pub(crate) fn set_agentx_summary(&mut self, summary: AgentxReplaySummary) {
+        self.agentx_summary = Some(summary);
+    }
+
+    #[cfg(feature = "kvbm-offload")]
+    pub(crate) fn set_offload_summary(&mut self, summary: OffloadResourceSummary) {
+        self.offload_summary = Some(summary);
     }
 
     /// Record that `uuid` was dispatched to `worker_idx` on the prefill pool
@@ -1111,25 +1517,11 @@ impl TraceCollector {
         terminal_time_ms: f64,
         status: ReplayTerminalStatus,
     ) {
-        let Self {
-            requests,
-            itl_distribution,
-            output_token_throughput_per_user,
-            defer_token_timeline_finalization,
-            ..
-        } = self;
-        if let Some(stats) = requests.get_mut(&uuid)
+        if let Some(stats) = self.requests.get_mut(&uuid)
             && stats.terminal_status.is_none()
         {
             stats.terminal_time_ms = Some(terminal_time_ms);
             stats.terminal_status = Some(status);
-            if !*defer_token_timeline_finalization {
-                stats.finalize_token_timeline(
-                    status == ReplayTerminalStatus::Completed && stats.first_admit_ms.is_some(),
-                    itl_distribution,
-                    output_token_throughput_per_user,
-                );
-            }
         }
     }
 
@@ -1141,10 +1533,14 @@ impl TraceCollector {
     }
 
     pub(crate) fn on_token(&mut self, uuid: Uuid, token_time_ms: f64) {
-        if let Some(stats) = self.requests.get_mut(&uuid)
-            && let TokenTimeline::Recording(times) = &mut stats.token_timeline
-        {
-            times.push(token_time_ms);
+        if let Some(stats) = self.requests.get_mut(&uuid) {
+            let include = stats.measurement_eligible && stats.first_admit_ms.is_some();
+            stats.token_timeline.record_token(
+                token_time_ms,
+                include,
+                &mut self.itl_distribution,
+                &mut self.output_token_throughput_per_user,
+            );
         }
     }
 
@@ -1201,14 +1597,15 @@ impl TraceCollector {
                 signal_idx = run_end;
                 continue;
             }
-            if let Some(stats) = self.requests.get_mut(&uuid)
-                && let TokenTimeline::Recording(times) = &mut stats.token_timeline
-            {
-                if emitted_tokens == 1 {
-                    times.push(completion_time_ms);
-                } else {
-                    times.resize(times.len() + emitted_tokens, completion_time_ms);
-                }
+            if let Some(stats) = self.requests.get_mut(&uuid) {
+                let include = stats.measurement_eligible && stats.first_admit_ms.is_some();
+                stats.token_timeline.record_tokens(
+                    completion_time_ms,
+                    emitted_tokens,
+                    include,
+                    &mut self.itl_distribution,
+                    &mut self.output_token_throughput_per_user,
+                );
             }
             signal_idx = run_end;
         }
@@ -1229,22 +1626,7 @@ impl TraceCollector {
             .map(TraceRequestStats::actual_output_length)
     }
 
-    pub(crate) fn finish(mut self) -> TraceSimulationReport {
-        let Self {
-            requests,
-            itl_distribution,
-            output_token_throughput_per_user,
-            ..
-        } = &mut self;
-        for stats in requests.values_mut() {
-            stats.finalize_token_timeline(
-                stats.terminal_status == Some(ReplayTerminalStatus::Completed)
-                    && stats.first_admit_ms.is_some(),
-                itl_distribution,
-                output_token_throughput_per_user,
-            );
-        }
-
+    pub(crate) fn finish(self) -> TraceSimulationReport {
         // Build per-request records before we move `self.requests` into the
         // summary aggregation below. Gated on `capture_per_request` — the
         // ~100ms terminal pass + ~30MB allocation only runs when a caller
@@ -1261,15 +1643,22 @@ impl TraceCollector {
         let accumulated_decode_worker_seconds = self.decode_worker_seconds;
         let prefill_gpus_per_worker = self.prefill_gpus_per_worker;
         let decode_gpus_per_worker = self.decode_gpus_per_worker;
+        let agentx_summary = self.agentx_summary.clone();
+        let offload_summary = self.offload_summary.clone();
         let itl_distribution = self.itl_distribution.finish();
         let output_token_throughput_per_user = self.output_token_throughput_per_user.finish();
         let requests = self.requests;
-        let request_count = requests.len();
+        let request_count = requests
+            .values()
+            .filter(|stats| stats.measurement_eligible)
+            .count();
         let mut ttfts = Vec::with_capacity(request_count);
         let mut ttsts = Vec::with_capacity(request_count);
         let mut tpots = Vec::with_capacity(request_count);
         let mut e2e_latencies = Vec::with_capacity(request_count);
+        let mut normalized_e2e_latencies = Vec::with_capacity(request_count);
         let mut duration_ms = 0.0_f64;
+        let mut first_profile_arrival_ms = f64::INFINITY;
         let mut total_input_tokens = 0usize;
         let mut total_output_tokens = 0usize;
         let mut completed_requests = 0usize;
@@ -1280,6 +1669,9 @@ impl TraceCollector {
         let mut goodput_output_tokens = 0usize;
 
         for stats in requests.values() {
+            if !stats.measurement_eligible {
+                continue;
+            }
             if stats.first_admit_ms.is_none() {
                 continue;
             }
@@ -1291,6 +1683,7 @@ impl TraceCollector {
             };
 
             completed_requests += 1;
+            first_profile_arrival_ms = first_profile_arrival_ms.min(stats.arrival_time_ms);
             total_input_tokens += stats.input_length;
             let output_length = stats.actual_output_length();
             total_output_tokens += output_length;
@@ -1312,6 +1705,9 @@ impl TraceCollector {
             let e2e_ms = (last_token_ms - stats.arrival_time_ms).max(0.0);
             ttfts.push(ttft_ms);
             e2e_latencies.push(e2e_ms);
+            if output_length > 0 {
+                normalized_e2e_latencies.push(e2e_ms / output_length as f64);
+            }
 
             // Goodput classification (aiperf avg-ITL; see SlaThresholds::is_good).
             if sla.is_set() && sla.is_good(ttft_ms, e2e_ms, output_length) {
@@ -1328,11 +1724,30 @@ impl TraceCollector {
             }
         }
 
+        if agentx_summary.is_some() {
+            // Pinned AIPerf computes throughput over the measured profile
+            // record span, including the completion of requests dispatched
+            // before cutoff and drained afterwards. The configured 3600 s is
+            // the dispatch horizon, not an interchangeable metric divisor.
+            duration_ms = if completed_requests > 0 && first_profile_arrival_ms.is_finite() {
+                (duration_ms - first_profile_arrival_ms).max(0.0)
+            } else {
+                0.0
+            };
+        }
         let duration_s = (duration_ms / 1000.0).max(1e-9);
+        let provision_duration_s = agentx_summary
+            .as_ref()
+            .and_then(|agentx| agentx.actual_profile_duration_ms)
+            .map(|duration_ms| (duration_ms / 1000.0).max(0.0))
+            .unwrap_or(duration_s);
         // Provisioned worker-seconds: static count × duration for the
         // single-worker path, else the runtime-integrated accumulator.
         let (prefill_worker_seconds, decode_worker_seconds) = match static_worker_count {
-            Some((prefill, decode)) => (prefill as f64 * duration_s, decode as f64 * duration_s),
+            Some((prefill, decode)) => (
+                prefill as f64 * provision_duration_s,
+                decode as f64 * provision_duration_s,
+            ),
             None => (
                 accumulated_prefill_worker_seconds,
                 accumulated_decode_worker_seconds,
@@ -1389,10 +1804,15 @@ impl TraceCollector {
                     distribution: itl_distribution,
                 },
                 e2e: build_distribution_stats(e2e_latencies),
+                e2e_normalized_ms_per_output_token: build_distribution_stats(
+                    normalized_e2e_latencies,
+                ),
                 output_token_throughput_per_user,
             },
             goodput,
             per_request,
+            agentx: agentx_summary,
+            offload: offload_summary,
         }
     }
 
@@ -1419,6 +1839,7 @@ impl TraceCollector {
             records.push(PerRequestRecord {
                 session_id: stats.session_id.clone(),
                 turn_index: stats.turn_index,
+                agentx: stats.agentx.clone(),
                 uuid: uuid.to_string(),
                 arrival_time_ms: stats.arrival_time_ms,
                 first_admit_ms: stats.first_admit_ms,
@@ -1506,13 +1927,7 @@ impl TraceCollector {
 
     #[cfg(test)]
     fn retained_token_timestamps(&self) -> usize {
-        self.requests
-            .values()
-            .map(|stats| match &stats.token_timeline {
-                TokenTimeline::Recording(times) => times.len(),
-                TokenTimeline::Finalized(_) => 0,
-            })
-            .sum()
+        0
     }
 }
 
@@ -1808,8 +2223,12 @@ mod tests {
         let second_times = &collector.requests[&second].token_timeline;
         assert_eq!(collector.requests[&first].first_admit_ms, Some(5.0));
         assert_eq!(collector.requests[&second].first_admit_ms, Some(5.0));
-        assert!(matches!(first_times, TokenTimeline::Recording(times) if times == &[42.0, 42.0]));
-        assert!(matches!(second_times, TokenTimeline::Recording(times) if times == &[42.0]));
+        assert_eq!(first_times.len, 2);
+        assert_eq!(first_times.first_ms, Some(42.0));
+        assert_eq!(first_times.last_ms, Some(42.0));
+        assert_eq!(second_times.len, 1);
+        assert_eq!(second_times.first_ms, Some(42.0));
+        assert_eq!(second_times.last_ms, Some(42.0));
     }
 
     #[test]
@@ -2219,7 +2638,7 @@ mod tests {
         for token_index in 0..100_000 {
             collector.on_token(uuid, token_index as f64 + 10.0);
         }
-        assert_eq!(collector.retained_token_timestamps(), 100_000);
+        assert_eq!(collector.retained_token_timestamps(), 0);
 
         collector.on_terminal(uuid, 100_009.0, ReplayTerminalStatus::Completed);
 
@@ -2247,8 +2666,6 @@ mod tests {
         collector.on_token(uuid, 12.0);
         collector.on_token(uuid, 15.0);
         collector.on_terminal(uuid, 15.0, ReplayTerminalStatus::Completed);
-
-        assert_eq!(collector.retained_token_timestamps(), 3);
 
         let report = collector.finish();
         assert_eq!(report.latency.itl.distribution.mean_ms, 2.5);

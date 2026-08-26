@@ -16,24 +16,26 @@ pub(crate) trait RequestIdentity {
 }
 
 #[derive(Debug)]
-pub(crate) struct ReadyArrival<Request, Metadata> {
+pub(crate) struct ReadyArrival<Request, Metadata, Context> {
     pub(in crate::replay::offline) request: Request,
     pub(in crate::replay::offline) arrival_time_ms: f64,
     pub(in crate::replay::offline) metadata: Metadata,
     pub(in crate::replay::offline) session_id: Option<String>,
     pub(in crate::replay::offline) turn_index: Option<usize>,
+    pub(in crate::replay::offline) agentx_context: Option<Context>,
 }
 
 pub(crate) trait AdmissionSource {
     type Request;
     type Metadata;
+    type Context;
 
     fn next_ready_time_ms(&mut self) -> Option<f64>;
     fn drain_ready(
         &mut self,
         now_ms: f64,
         cluster_in_flight: usize,
-    ) -> Result<Vec<ReadyArrival<Self::Request, Self::Metadata>>>;
+    ) -> Result<Vec<ReadyArrival<Self::Request, Self::Metadata, Self::Context>>>;
     fn on_output_token(&mut self, request_id: Uuid, token_id: u32) -> Result<()>;
     fn on_terminal(&mut self, request_id: Uuid, now_ms: f64, rejected: bool) -> Result<()>;
     fn is_drained(&self) -> bool;

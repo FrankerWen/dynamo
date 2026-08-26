@@ -1,9 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
+use anyhow::Context;
 use dynamo_mocker::common::perf_model::PerfModel;
 use dynamo_mocker::common::protocols::{
     DirectRequest, EngineType as RsMockerEngineType, G1Backend as RsG1Backend,
@@ -12,7 +14,8 @@ use dynamo_mocker::common::protocols::{
     WorkerType as RsWorkerType,
 };
 use dynamo_mocker::loadgen::{
-    ArrivalSpec, DelaySpec, DynamoRequestTrace, LengthSpec, SyntheticTraceSpec, Trace as RsTrace,
+    AgentxCompiledCorpus, AgentxExactCorpus, AgentxReplayConfig, ArrivalSpec, DelaySpec,
+    DynamoRequestTrace, LengthSpec, SyntheticTraceSpec, Trace as RsTrace,
 };
 use dynamo_mocker::replay::{
     ReplayArgsMode, ReplayScalingDecision, ReplayScalingPolicy, ReplayScalingSnapshot,
@@ -33,6 +36,53 @@ use super::entrypoint::{AicPerfConfig, KvRouterConfig, to_pyerr};
 
 const DEFAULT_GPU_MEMORY_UTILIZATION: f64 = 0.9;
 const DEFAULT_MEM_FRACTION_STATIC: f64 = 0.88;
+
+static AGENTX_COMPILED_CORPUS_CACHE: OnceLock<Mutex<HashMap<String, AgentxCompiledCorpus>>> =
+    OnceLock::new();
+
+fn agentx_corpus_cache_key(paths: &[PathBuf]) -> anyhow::Result<String> {
+    let mut entries = Vec::with_capacity(paths.len());
+    for path in paths {
+        let canonical = path
+            .canonicalize()
+            .with_context(|| format!("failed to canonicalize AgentX corpus {}", path.display()))?;
+        let metadata = canonical
+            .metadata()
+            .with_context(|| format!("failed to stat AgentX corpus {}", canonical.display()))?;
+        let modified_ns = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|value| value.as_nanos())
+            .unwrap_or(0);
+        entries.push(format!(
+            "{}:{}:{}",
+            canonical.display(),
+            metadata.len(),
+            modified_ns
+        ));
+    }
+    Ok(entries.join("|"))
+}
+
+fn load_compiled_agentx_corpus(paths: &[PathBuf]) -> anyhow::Result<AgentxCompiledCorpus> {
+    let key = agentx_corpus_cache_key(paths)?;
+    let cache = AGENTX_COMPILED_CORPUS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(corpus) = cache
+        .lock()
+        .map_err(|_| anyhow::anyhow!("AgentX compiled-corpus cache lock was poisoned"))?
+        .get(&key)
+        .cloned()
+    {
+        return Ok(corpus);
+    }
+
+    let compiled = AgentxExactCorpus::from_jsonl_files(paths)?.compile()?;
+    let mut guard = cache
+        .lock()
+        .map_err(|_| anyhow::anyhow!("AgentX compiled-corpus cache lock was poisoned"))?;
+    Ok(guard.entry(key).or_insert_with(|| compiled.clone()).clone())
+}
 
 #[derive(Debug, Serialize)]
 struct OfflineReplayCoverage {
@@ -284,7 +334,7 @@ impl MockEngineArgs {
 #[pymethods]
 impl MockEngineArgs {
     #[new]
-    #[pyo3(signature = (engine_type="vllm", num_gpu_blocks=None, block_size=0, max_num_seqs=Some(256), max_num_batched_tokens=Some(8192), enable_prefix_caching=true, enable_chunked_prefill=true, speedup_ratio=1.0, decode_speedup_ratio=1.0, dp_size=1, startup_time=None, worker_type="aggregated", planner_profile_data=None, aic_backend=None, aic_system=None, aic_backend_version=None, aic_database_mode=None, aic_analytical_config=None, aic_tp_size=None, aic_model_path=None, aic_moe_tp_size=None, aic_moe_ep_size=None, aic_attention_dp_size=None, aic_nextn=None, aic_nextn_accept_rates=None, aic_mtp_seed=42, aic_gemm_dtype=None, aic_moe_dtype=None, aic_fmha_dtype=None, aic_kv_cache_dtype=None, aic_comm_dtype=None, gpu_memory_utilization=None, mem_fraction_static=None, free_gpu_memory_fraction=None, enable_local_indexer=false, bootstrap_port=None, handoff_session_timeout_ms=300000, kv_bytes_per_token=None, kv_transfer_bandwidth=None, kv_transfer_timing_mode="full_prompt", reasoning=None, response_replay_trace_path=None, zmq_kv_events_port=None, zmq_replay_port=None, preemption_mode="lifo", router_queue_policy=None, sglang=None, trtllm=None, num_g2_blocks=None, num_g3_blocks=None, offload_batch_size=None, bandwidth_g1_to_g2_gbps=None, bandwidth_g2_to_g1_gbps=None, bandwidth_g2_to_g3_gbps=None, bandwidth_g3_to_g2_gbps=None, enable_g4_storage=false, bandwidth_g2_to_g4_gbps=None, bandwidth_g4_to_g2_gbps=None, max_model_len=None, g1_backend=None))]
+    #[pyo3(signature = (engine_type="vllm", num_gpu_blocks=None, block_size=0, max_num_seqs=Some(256), max_num_batched_tokens=Some(8192), enable_prefix_caching=true, enable_chunked_prefill=true, speedup_ratio=1.0, decode_speedup_ratio=1.0, dp_size=1, startup_time=None, worker_type="aggregated", planner_profile_data=None, aic_backend=None, aic_system=None, aic_backend_version=None, aic_database_mode=None, aic_systems_path=None, aic_database_snapshot_sha256=None, aic_analytical_config=None, aic_tp_size=None, aic_model_path=None, aic_moe_tp_size=None, aic_moe_ep_size=None, aic_attention_dp_size=None, aic_nextn=None, aic_nextn_accept_rates=None, aic_mtp_seed=42, aic_gemm_dtype=None, aic_moe_dtype=None, aic_fmha_dtype=None, aic_kv_cache_dtype=None, aic_comm_dtype=None, gpu_memory_utilization=None, mem_fraction_static=None, free_gpu_memory_fraction=None, enable_local_indexer=false, bootstrap_port=None, handoff_session_timeout_ms=300000, kv_bytes_per_token=None, kv_block_footprint_bytes=None, kv_footprint_source=None, kv_transfer_bandwidth=None, kv_transfer_timing_mode="full_prompt", reasoning=None, response_replay_trace_path=None, zmq_kv_events_port=None, zmq_replay_port=None, preemption_mode="lifo", router_queue_policy=None, sglang=None, trtllm=None, num_g2_blocks=None, g2_capacity_bytes=None, g2_fabric_id=None, num_g3_blocks=None, offload_batch_size=None, bandwidth_g1_to_g2_gbps=None, bandwidth_g2_to_g1_gbps=None, bandwidth_g2_to_g3_gbps=None, bandwidth_g3_to_g2_gbps=None, enable_g4_storage=false, g4_capacity_bytes=None, bandwidth_g2_to_g4_gbps=None, bandwidth_g4_to_g2_gbps=None, max_model_len=None, g1_backend=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         engine_type: &str,
@@ -304,6 +354,8 @@ impl MockEngineArgs {
         aic_system: Option<String>,
         aic_backend_version: Option<String>,
         aic_database_mode: Option<String>,
+        aic_systems_path: Option<String>,
+        aic_database_snapshot_sha256: Option<String>,
         aic_analytical_config: Option<String>,
         aic_tp_size: Option<usize>,
         aic_model_path: Option<String>,
@@ -325,6 +377,8 @@ impl MockEngineArgs {
         bootstrap_port: Option<u16>,
         handoff_session_timeout_ms: u64,
         kv_bytes_per_token: Option<usize>,
+        kv_block_footprint_bytes: Option<Vec<usize>>,
+        kv_footprint_source: Option<String>,
         kv_transfer_bandwidth: Option<f64>,
         kv_transfer_timing_mode: &str,
         reasoning: Option<ReasoningConfig>,
@@ -336,6 +390,8 @@ impl MockEngineArgs {
         sglang: Option<SglangArgs>,
         trtllm: Option<TrtllmArgs>,
         num_g2_blocks: Option<usize>,
+        g2_capacity_bytes: Option<usize>,
+        g2_fabric_id: Option<String>,
         num_g3_blocks: Option<usize>,
         offload_batch_size: Option<usize>,
         bandwidth_g1_to_g2_gbps: Option<f64>,
@@ -343,6 +399,7 @@ impl MockEngineArgs {
         bandwidth_g2_to_g3_gbps: Option<f64>,
         bandwidth_g3_to_g2_gbps: Option<f64>,
         enable_g4_storage: bool,
+        g4_capacity_bytes: Option<usize>,
         bandwidth_g2_to_g4_gbps: Option<f64>,
         bandwidth_g4_to_g2_gbps: Option<f64>,
         max_model_len: Option<usize>,
@@ -381,6 +438,8 @@ impl MockEngineArgs {
             .aic_system(aic_system)
             .aic_backend_version(aic_backend_version)
             .aic_database_mode(aic_database_mode)
+            .aic_systems_path(aic_systems_path)
+            .aic_database_snapshot_sha256(aic_database_snapshot_sha256)
             .aic_analytical_config(aic_analytical_config)
             .aic_tp_size(aic_tp_size)
             .aic_model_path(aic_model_path)
@@ -402,11 +461,16 @@ impl MockEngineArgs {
             .bootstrap_port(bootstrap_port)
             .handoff_session_timeout_ms(handoff_session_timeout_ms)
             .kv_bytes_per_token(kv_bytes_per_token)
+            .kv_block_footprint_bytes(kv_block_footprint_bytes)
+            .kv_footprint_source(kv_footprint_source)
             .kv_transfer_bandwidth(kv_transfer_bandwidth)
             .kv_transfer_timing_mode(kv_transfer_timing_mode)
             .num_g2_blocks(num_g2_blocks)
+            .g2_capacity_bytes(g2_capacity_bytes)
+            .g2_fabric_id(g2_fabric_id)
             .num_g3_blocks(num_g3_blocks)
             .enable_g4_storage(enable_g4_storage)
+            .g4_capacity_bytes(g4_capacity_bytes)
             .offload_batch_size(offload_batch_size)
             .bandwidth_g1_to_g2_gbps(bandwidth_g1_to_g2_gbps)
             .bandwidth_g2_to_g1_gbps(bandwidth_g2_to_g1_gbps)
@@ -567,6 +631,16 @@ impl MockEngineArgs {
     }
 
     #[getter]
+    fn kv_block_footprint_bytes(&self) -> Option<Vec<usize>> {
+        self.inner.kv_block_footprint_bytes.clone()
+    }
+
+    #[getter]
+    fn kv_footprint_source(&self) -> Option<String> {
+        self.inner.kv_footprint_source.clone()
+    }
+
+    #[getter]
     fn response_replay_trace_path(&self) -> Option<PathBuf> {
         self.inner.response_replay_trace_path.clone()
     }
@@ -577,6 +651,16 @@ impl MockEngineArgs {
     }
 
     #[getter]
+    fn g2_capacity_bytes(&self) -> Option<usize> {
+        self.inner.g2_capacity_bytes
+    }
+
+    #[getter]
+    fn g2_fabric_id(&self) -> Option<String> {
+        self.inner.g2_fabric_id.clone()
+    }
+
+    #[getter]
     fn num_g3_blocks(&self) -> Option<usize> {
         self.inner.num_g3_blocks
     }
@@ -584,6 +668,11 @@ impl MockEngineArgs {
     #[getter]
     fn enable_g4_storage(&self) -> bool {
         self.inner.enable_g4_storage
+    }
+
+    #[getter]
+    fn g4_capacity_bytes(&self) -> Option<usize> {
+        self.inner.g4_capacity_bytes
     }
 
     #[getter]
@@ -659,6 +748,16 @@ impl MockEngineArgs {
     #[setter]
     fn set_aic_database_mode(&mut self, value: Option<String>) {
         self.inner.aic_database_mode = value;
+    }
+
+    #[getter]
+    fn aic_systems_path(&self) -> Option<String> {
+        self.inner.aic_systems_path.clone()
+    }
+
+    #[getter]
+    fn aic_database_snapshot_sha256(&self) -> Option<String> {
+        self.inner.aic_database_snapshot_sha256.clone()
     }
 
     #[getter]
@@ -1131,6 +1230,11 @@ pub fn run_mocker_trace_replay(
 
         let trace_block_size = trace_block_size.unwrap_or(512);
         let trace_file = &trace_files[0];
+        if trace_format == dynamo_mocker::loadgen::TraceFileFormat::AgentxExactV1 {
+            anyhow::bail!(
+                "trace_format='agentx_exact_v1' requires run_mocker_agentx_replay and protocol_config_json"
+            );
+        }
         if trace_format == dynamo_mocker::loadgen::TraceFileFormat::AppliedComputeAgentic
             && replay_concurrency.is_none()
         {
@@ -1288,6 +1392,126 @@ pub fn run_mocker_trace_replay(
         .map(Py::into_any);
     }
     pythonize(py, &report).map(Bound::unbind).map_err(to_pyerr)
+}
+
+/// Run the native exact AgentX phased closed loop. This is intentionally a
+/// separate entrypoint: legacy `replay_concurrency`, arrival pacing, and soft
+/// simulation caps are not valid substitutes for session-tree concurrency and
+/// the primer/warmup/profile/drain protocol.
+#[pyfunction]
+#[pyo3(signature = (trace_files, protocol_config_json, extra_engine_args=None, prefill_engine_args=None, decode_engine_args=None, router_config=None, aic_perf_config=None, num_workers=1, num_prefill_workers=1, num_decode_workers=1, session_tree_concurrency=None, router_mode="round_robin", report_jsonl_path=None, model_name=None, sla_ttft_ms=None, sla_itl_ms=None, sla_e2e_ms=None, capture_per_request=true, capture_agentx_events=false))]
+#[allow(clippy::too_many_arguments)]
+pub fn run_mocker_agentx_replay(
+    py: Python<'_>,
+    trace_files: Vec<PathBuf>,
+    protocol_config_json: &str,
+    extra_engine_args: Option<MockEngineArgs>,
+    prefill_engine_args: Option<MockEngineArgs>,
+    decode_engine_args: Option<MockEngineArgs>,
+    router_config: Option<KvRouterConfig>,
+    aic_perf_config: Option<&AicPerfConfig>,
+    num_workers: usize,
+    num_prefill_workers: usize,
+    num_decode_workers: usize,
+    session_tree_concurrency: Option<usize>,
+    router_mode: &str,
+    report_jsonl_path: Option<PathBuf>,
+    model_name: Option<String>,
+    sla_ttft_ms: Option<f64>,
+    sla_itl_ms: Option<f64>,
+    sla_e2e_ms: Option<f64>,
+    capture_per_request: bool,
+    capture_agentx_events: bool,
+) -> PyResult<PyObject> {
+    let mut protocol: AgentxReplayConfig =
+        serde_json::from_str(protocol_config_json).map_err(|error| {
+            PyValueError::new_err(format!(
+                "invalid protocol_config_json for agentx_exact_v1: {error}"
+            ))
+        })?;
+    if let Some(concurrency) = session_tree_concurrency {
+        protocol.session_tree_concurrency = concurrency;
+    }
+    protocol.capture_events |= capture_agentx_events;
+    protocol.validate().map_err(to_pyerr)?;
+    // Parsing and compiling a full AgentX corpus is a cold-process operation.
+    // Candidate trials share the immutable compiled DAG keyed by canonical
+    // file identity; each replay still receives fresh lane/controller state.
+    let corpus = py
+        .allow_threads(|| load_compiled_agentx_corpus(&trace_files))
+        .map_err(to_pyerr)?;
+
+    validate_sla_threshold("sla_ttft_ms", sla_ttft_ms)?;
+    validate_sla_threshold("sla_itl_ms", sla_itl_ms)?;
+    validate_sla_threshold("sla_e2e_ms", sla_e2e_ms)?;
+    let sla = dynamo_mocker::replay::SlaThresholds {
+        ttft_ms: sla_ttft_ms,
+        itl_ms: sla_itl_ms,
+        e2e_ms: sla_e2e_ms,
+    };
+    let args_selection = load_replay_args_selection(
+        py,
+        extra_engine_args,
+        prefill_engine_args,
+        decode_engine_args,
+        num_workers,
+        num_prefill_workers,
+        num_decode_workers,
+    )?;
+    let router_mode = parse_replay_router_mode(router_mode)?;
+    let (prefill_load_estimator, _) = load_replay_prefill_load_estimator(
+        py,
+        router_mode,
+        router_config.as_ref(),
+        aic_perf_config,
+    )?;
+    let router_config = load_replay_router_config(router_config, model_name)?;
+    let record_per_request = capture_per_request || report_jsonl_path.is_some();
+    let capture_options = dynamo_mocker::replay::ReplayCaptureOptions {
+        capture_per_request: record_per_request,
+        capture_planner_details: false,
+        ..Default::default()
+    };
+
+    let run = move || match args_selection {
+        ReplayArgsSelection::Aggregated(args) => {
+            dynamo_mocker::replay::simulate_agentx_exact_workload(
+                *args,
+                router_config,
+                prefill_load_estimator,
+                corpus,
+                protocol,
+                num_workers,
+                router_mode,
+                record_per_request,
+                sla,
+            )
+        }
+        ReplayArgsSelection::Disagg(config) => {
+            dynamo_mocker::replay::simulate_agentx_exact_workload_disagg(
+                *config,
+                router_config,
+                prefill_load_estimator,
+                corpus,
+                protocol,
+                router_mode,
+                record_per_request,
+                sla,
+            )
+        }
+    };
+    let (report, runtime_evidence) = py
+        .allow_threads(move || dynamo_mocker::replay::with_runtime_evidence(capture_options, run));
+    let report = report.map_err(to_pyerr)?;
+    if let Some(path) = report_jsonl_path.as_ref() {
+        py.allow_threads(|| write_per_request_jsonl(path, &report.per_request))
+            .map_err(to_pyerr)?;
+    }
+    Py::new(
+        py,
+        OfflineReplayResult::new(report, record_per_request, false, runtime_evidence),
+    )
+    .map(Py::into_any)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2129,6 +2353,8 @@ fn materialize_replay_mocker_args(
             tp_size,
             backend_version.as_deref(),
             args.aic_database_mode.as_deref(),
+            args.aic_systems_path.as_deref(),
+            args.aic_database_snapshot_sha256.as_deref(),
             args.aic_analytical_config.as_deref(),
             moe_tp_size,
             moe_ep_size,
@@ -2187,10 +2413,52 @@ fn populate_missing_offload_kv_bytes_per_token(
     py: Python<'_>,
     args: &mut RsMockEngineArgs,
 ) -> PyResult<()> {
+    fn materialize_g2_slots(args: &mut RsMockEngineArgs) -> PyResult<()> {
+        let Some(capacity_bytes) = args.g2_capacity_bytes else {
+            return Ok(());
+        };
+        let profile = args.kv_block_footprint_bytes.as_ref().ok_or_else(|| {
+            PyException::new_err(
+                "g2_capacity_bytes requires an AIC dynamic KV block-footprint profile",
+            )
+        })?;
+        let min_block_bytes = profile.iter().copied().min().ok_or_else(|| {
+            PyException::new_err("AIC dynamic KV block-footprint profile is empty")
+        })?;
+        let derived_slots = (capacity_bytes / min_block_bytes)
+            .min(dynamo_mocker::kvbm_offload::config::DEFAULT_MAX_DERIVED_G2_SLOTS);
+        if derived_slots == 0 {
+            return Err(PyException::new_err(format!(
+                "g2_capacity_bytes={capacity_bytes} cannot hold the smallest AIC KV block ({min_block_bytes} bytes)"
+            )));
+        }
+        if let Some(explicit_slots) = args.num_g2_blocks {
+            if explicit_slots < derived_slots {
+                return Err(PyException::new_err(format!(
+                    "explicit num_g2_blocks={explicit_slots} would add a non-physical slot constraint below the byte-capacity upper bound {derived_slots}"
+                )));
+            }
+        } else {
+            args.num_g2_blocks = Some(derived_slots);
+        }
+        Ok(())
+    }
+
+    if args.kv_block_footprint_bytes.is_some() {
+        materialize_g2_slots(args)?;
+        return Ok(());
+    }
     if args.kv_bytes_per_token.is_some() {
+        if args.g2_capacity_bytes.is_some() {
+            return Err(PyException::new_err(
+                "formal G2 byte capacity cannot use legacy kv_bytes_per_token; provide AIC dynamic footprint inputs",
+            ));
+        }
         return Ok(());
     }
     let offload_requested = args.num_g2_blocks.unwrap_or_default() > 0
+        || args.g2_capacity_bytes.is_some()
+        || args.g2_rank_resource_configs.is_some()
         || args.num_g3_blocks.unwrap_or_default() > 0
         || args.enable_g4_storage;
     if !offload_requested {
@@ -2199,6 +2467,35 @@ fn populate_missing_offload_kv_bytes_per_token(
     let Some(model_path) = args.aic_model_path.as_deref() else {
         return Ok(());
     };
+
+    if let (Some(backend_name), Some(max_model_len)) =
+        (args.aic_backend.as_deref(), args.max_model_len)
+    {
+        let aic_module = py.import("dynamo._internal.aic")?;
+        let footprint = aic_module
+            .getattr("compute_kv_block_footprint_bytes")?
+            .call1((
+                backend_name,
+                model_path,
+                args.aic_tp_size.unwrap_or(1),
+                args.block_size,
+                max_model_len,
+                args.aic_moe_tp_size,
+                args.aic_moe_ep_size,
+                args.aic_attention_dp_size,
+                args.aic_kv_cache_dtype.as_deref(),
+            ))?
+            .extract::<Vec<usize>>()?;
+        args.kv_block_footprint_bytes = Some(footprint);
+        args.kv_footprint_source = Some(format!(
+            "aic:{backend_name}:{}:{}:block={}:max_context={max_model_len}",
+            args.aic_backend_version.as_deref().unwrap_or("default"),
+            model_path,
+            args.block_size,
+        ));
+        materialize_g2_slots(args)?;
+        return Ok(());
+    }
 
     // Match the Python `_resolve_kv_bytes_per_token`: normalize the configured
     // KV-cache dtype (auto/none -> "auto") and forward it so offload KV-byte
@@ -2221,6 +2518,7 @@ fn populate_missing_offload_kv_bytes_per_token(
     if let Some(kv_bytes_per_token) = kv_bytes_per_token {
         args.kv_bytes_per_token = Some(kv_bytes_per_token);
     }
+    materialize_g2_slots(args)?;
     Ok(())
 }
 
@@ -2290,6 +2588,8 @@ fn load_replay_prefill_load_estimator<'a>(
         Some(&resolved_aic_perf_config.backend_version),
         None,
         None,
+        None,
+        None,
         aic_perf_config.moe_tp_size(),
         aic_perf_config.moe_ep_size(),
         aic_perf_config.attention_dp_size(),
@@ -2328,12 +2628,15 @@ fn parse_trace_file_format(
         "agentic_mooncake" | "agentic-mooncake" => {
             Ok(dynamo_mocker::loadgen::TraceFileFormat::AgenticMooncake)
         }
+        "agentx_exact_v1" | "agentx-exact-v1" => {
+            Ok(dynamo_mocker::loadgen::TraceFileFormat::AgentxExactV1)
+        }
         "applied_compute_agentic" => {
             Ok(dynamo_mocker::loadgen::TraceFileFormat::AppliedComputeAgentic)
         }
         "dynamo" => Ok(dynamo_mocker::loadgen::TraceFileFormat::Dynamo),
         other => Err(PyException::new_err(format!(
-            "trace_format must be 'mooncake', 'mooncake-delta', 'agentic_mooncake'/'agentic-mooncake', 'applied_compute_agentic', or 'dynamo', got '{}'",
+            "trace_format must be 'mooncake', 'mooncake-delta', 'agentic_mooncake'/'agentic-mooncake', 'agentx_exact_v1'/'agentx-exact-v1', 'applied_compute_agentic', or 'dynamo', got '{}'",
             other
         ))),
     }

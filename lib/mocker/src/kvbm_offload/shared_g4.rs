@@ -27,12 +27,33 @@ struct DeferredOwnerCompletions {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct G4ObjectRecord {
     pub(crate) size_bytes: usize,
+    last_access: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct G4CacheMetrics {
+    pub capacity_bytes: usize,
+    pub current_bytes: usize,
+    pub peak_bytes: usize,
+    pub hits: u64,
+    pub misses: u64,
+    pub admissions: u64,
+    pub evictions: u64,
+    pub evicted_bytes: u64,
+    pub rejected_oversize: u64,
+}
+
+#[derive(Debug, Default)]
+struct G4Catalog {
+    objects: HashMap<SequenceHash, G4ObjectRecord>,
+    clock: u64,
+    metrics: G4CacheMetrics,
 }
 
 #[derive(Debug)]
 struct PendingG4Put {
     keys: Vec<SequenceHash>,
-    size_bytes: usize,
+    sizes_bytes: Vec<usize>,
 }
 
 /// Shared process-local G4 resource. All mock workers in the process share
@@ -40,7 +61,7 @@ struct PendingG4Put {
 pub(crate) struct SharedG4Store {
     config: KvbmOffloadConfig,
     drive_mode: KvbmDriveMode,
-    objects: Mutex<HashMap<SequenceHash, G4ObjectRecord>>,
+    catalog: Mutex<G4Catalog>,
     pending_puts: Mutex<HashMap<TransferId, PendingG4Put>>,
     state: Arc<Mutex<TransferState>>,
     pending_tracker: Arc<PendingTracker>,
@@ -81,7 +102,15 @@ impl SharedG4Store {
         let store = Arc::new(Self {
             config: config.clone(),
             drive_mode,
-            objects: Mutex::new(HashMap::new()),
+            catalog: Mutex::new(G4Catalog {
+                metrics: G4CacheMetrics {
+                    capacity_bytes: config
+                        .g4_capacity_bytes
+                        .expect("validated finite G4 capacity"),
+                    ..G4CacheMetrics::default()
+                },
+                ..G4Catalog::default()
+            }),
             pending_puts: Mutex::new(HashMap::new()),
             state: Arc::new(Mutex::new(TransferState::new(
                 config.bandwidth_g2_to_g4_gbps,
@@ -99,12 +128,14 @@ impl SharedG4Store {
         if self.config.enable_g4_storage != config.enable_g4_storage
             || self.config.block_size_tokens != config.block_size_tokens
             || self.config.block_size_bytes.unwrap_or(0) != config.block_size_bytes.unwrap_or(0)
+            || self.config.block_footprint_bytes != config.block_footprint_bytes
+            || self.config.g4_capacity_bytes != config.g4_capacity_bytes
             || self.config.bandwidth_g2_to_g4_gbps != config.bandwidth_g2_to_g4_gbps
             || self.config.bandwidth_g4_to_g2_gbps != config.bandwidth_g4_to_g2_gbps
             || self.drive_mode != drive_mode
         {
             bail!(
-                "process-local shared G4 store already exists with a different shape, bandwidth, or drive mode"
+                "process-local shared G4 store already exists with a different capacity, footprint, bandwidth, or drive mode"
             );
         }
         Ok(())
@@ -119,32 +150,96 @@ impl SharedG4Store {
     }
 
     pub(crate) fn has_object(&self, hash: &SequenceHash) -> Option<usize> {
-        let objects = self.objects.lock().expect("shared G4 object map poisoned");
-        objects.get(hash).map(|record| record.size_bytes)
+        let mut catalog = self.catalog.lock().expect("shared G4 catalog poisoned");
+        catalog.clock = catalog.clock.wrapping_add(1);
+        let access = catalog.clock;
+        if let Some(record) = catalog.objects.get_mut(hash) {
+            record.last_access = access;
+            let size = record.size_bytes;
+            catalog.metrics.hits = catalog.metrics.hits.saturating_add(1);
+            Some(size)
+        } else {
+            catalog.metrics.misses = catalog.metrics.misses.saturating_add(1);
+            None
+        }
     }
 
     pub(crate) fn insert_object(&self, hash: SequenceHash, size_bytes: usize) {
-        let mut objects = self.objects.lock().expect("shared G4 object map poisoned");
-        objects.insert(hash, G4ObjectRecord { size_bytes });
+        let mut catalog = self.catalog.lock().expect("shared G4 catalog poisoned");
+        let capacity = catalog.metrics.capacity_bytes;
+        if size_bytes > capacity {
+            catalog.metrics.rejected_oversize = catalog.metrics.rejected_oversize.saturating_add(1);
+            return;
+        }
+        if let Some(existing) = catalog.objects.remove(&hash) {
+            catalog.metrics.current_bytes = catalog
+                .metrics
+                .current_bytes
+                .saturating_sub(existing.size_bytes);
+        }
+        while catalog.metrics.current_bytes.saturating_add(size_bytes) > capacity {
+            let victim = catalog
+                .objects
+                .iter()
+                .min_by_key(|(key, record)| (record.last_access, key.as_u128()))
+                .map(|(key, _)| *key);
+            let Some(victim) = victim else {
+                break;
+            };
+            if let Some(evicted) = catalog.objects.remove(&victim) {
+                catalog.metrics.current_bytes = catalog
+                    .metrics
+                    .current_bytes
+                    .saturating_sub(evicted.size_bytes);
+                catalog.metrics.evictions = catalog.metrics.evictions.saturating_add(1);
+                catalog.metrics.evicted_bytes = catalog
+                    .metrics
+                    .evicted_bytes
+                    .saturating_add(evicted.size_bytes as u64);
+            }
+        }
+        catalog.clock = catalog.clock.wrapping_add(1);
+        let last_access = catalog.clock;
+        catalog.objects.insert(
+            hash,
+            G4ObjectRecord {
+                size_bytes,
+                last_access,
+            },
+        );
+        catalog.metrics.current_bytes = catalog.metrics.current_bytes.saturating_add(size_bytes);
+        catalog.metrics.peak_bytes = catalog
+            .metrics
+            .peak_bytes
+            .max(catalog.metrics.current_bytes);
+        catalog.metrics.admissions = catalog.metrics.admissions.saturating_add(1);
     }
 
     pub(crate) fn register_pending_put(
         &self,
         transfer_id: TransferId,
         keys: Vec<SequenceHash>,
-        size_bytes: usize,
+        sizes_bytes: Vec<usize>,
     ) {
         let mut pending = self
             .pending_puts
             .lock()
             .expect("shared G4 pending put map poisoned");
-        pending.insert(transfer_id, PendingG4Put { keys, size_bytes });
+        debug_assert_eq!(keys.len(), sizes_bytes.len());
+        pending.insert(transfer_id, PendingG4Put { keys, sizes_bytes });
     }
 
     #[cfg(test)]
     pub(crate) fn object_count(&self) -> usize {
-        let objects = self.objects.lock().expect("shared G4 object map poisoned");
-        objects.len()
+        let catalog = self.catalog.lock().expect("shared G4 catalog poisoned");
+        catalog.objects.len()
+    }
+
+    pub fn metrics(&self) -> G4CacheMetrics {
+        self.catalog
+            .lock()
+            .expect("shared G4 catalog poisoned")
+            .metrics
     }
 
     pub(crate) fn drain_completions(&self, now_ms: f64, owner_id: u64) -> SharedDrainCounts {
@@ -297,15 +392,9 @@ impl SharedG4Store {
             return;
         }
 
-        let mut objects = self.objects.lock().expect("shared G4 object map poisoned");
         for pending_put in puts {
-            for key in pending_put.keys {
-                objects.insert(
-                    key,
-                    G4ObjectRecord {
-                        size_bytes: pending_put.size_bytes,
-                    },
-                );
+            for (key, size_bytes) in pending_put.keys.into_iter().zip(pending_put.sizes_bytes) {
+                self.insert_object(key, size_bytes);
             }
         }
     }
@@ -370,4 +459,68 @@ pub(crate) fn shared_g4_test_guard_blocking() -> tokio::sync::OwnedMutexGuard<()
         .blocking_lock_owned();
     SharedG4Store::reset_for_tests();
     guard
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dynamo_tokens::PositionalLineageHash;
+
+    fn key(position: u64, value: u64) -> SequenceHash {
+        PositionalLineageHash::new(value, None, position)
+    }
+
+    fn finite_config(capacity_bytes: usize) -> KvbmOffloadConfig {
+        KvbmOffloadConfig {
+            enable_g4_storage: true,
+            g4_capacity_bytes: Some(capacity_bytes),
+            block_size_bytes: Some(1),
+            ..KvbmOffloadConfig::default()
+        }
+    }
+
+    #[test]
+    fn finite_g4_uses_deterministic_lru_and_byte_accounting() {
+        let _guard = shared_g4_test_guard_blocking();
+        let store = SharedG4Store::get_or_create(&finite_config(8))
+            .expect("finite G4 config should build")
+            .expect("G4 should be enabled");
+        let oldest = key(0, 10);
+        let retained = key(1, 11);
+        let newest = key(2, 12);
+
+        store.insert_object(oldest, 4);
+        store.insert_object(retained, 4);
+        // Refresh `oldest`; the other four-byte object is now the LRU victim.
+        assert_eq!(store.has_object(&oldest), Some(4));
+        store.insert_object(newest, 4);
+
+        assert_eq!(store.has_object(&retained), None);
+        assert_eq!(store.has_object(&oldest), Some(4));
+        assert_eq!(store.has_object(&newest), Some(4));
+        let metrics = store.metrics();
+        assert_eq!(metrics.capacity_bytes, 8);
+        assert_eq!(metrics.current_bytes, 8);
+        assert_eq!(metrics.peak_bytes, 8);
+        assert_eq!(metrics.admissions, 3);
+        assert_eq!(metrics.evictions, 1);
+        assert_eq!(metrics.evicted_bytes, 4);
+        assert_eq!(metrics.rejected_oversize, 0);
+    }
+
+    #[test]
+    fn finite_g4_rejects_an_object_larger_than_the_deployment_tier() {
+        let _guard = shared_g4_test_guard_blocking();
+        let store = SharedG4Store::get_or_create(&finite_config(8))
+            .expect("finite G4 config should build")
+            .expect("G4 should be enabled");
+
+        store.insert_object(key(0, 20), 9);
+
+        assert_eq!(store.object_count(), 0);
+        let metrics = store.metrics();
+        assert_eq!(metrics.current_bytes, 0);
+        assert_eq!(metrics.admissions, 0);
+        assert_eq!(metrics.rejected_oversize, 1);
+    }
 }

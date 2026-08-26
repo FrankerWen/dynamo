@@ -292,6 +292,29 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         })
     }
 
+    /// Bytes reserved by the three fixed per-slot backing buffers. This is a
+    /// deterministic lower bound for host metadata (it intentionally excludes
+    /// hash-map buckets and the selected inactive-index implementation).
+    pub(crate) fn fixed_slot_metadata_bytes(&self) -> usize {
+        let inner = self.inner.lock();
+        inner
+            .slots
+            .capacity()
+            .saturating_mul(std::mem::size_of::<BlockSlot<T>>())
+            .saturating_add(
+                inner
+                    .free
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<BlockId>()),
+            )
+            .saturating_add(
+                inner
+                    .reset_on_release
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<bool>()),
+            )
+    }
+
     /// Store-wide default for the per-slot "reset on last drop" override.
     /// `true` makes registered blocks bypass the inactive pool on release
     /// (mirrors `release_duplicate`) unless a holder explicitly opts out

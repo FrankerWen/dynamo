@@ -47,25 +47,35 @@ pub enum HandoffOrder {
 pub struct HandoffTransferTiming {
     pub mode: KvTransferTimingMode,
     pub full_prompt_tokens: usize,
+    /// Byte-authoritative full-prompt KV footprint. Exact replay populates
+    /// this from the AIC per-logical-block footprint profile. It deliberately
+    /// coexists with the legacy scalar so destination-missing timing can keep
+    /// its historical token-linear behavior until a position-aware contract
+    /// is available for that mode.
+    pub full_prompt_bytes: Option<usize>,
     pub kv_bytes_per_token: Option<usize>,
     pub bandwidth_gb_s: Option<f64>,
 }
 
 impl HandoffTransferTiming {
     pub fn delay_ms(self, destination_missing_tokens: usize) -> Option<f64> {
-        let tokens = match self.mode {
-            KvTransferTimingMode::FullPrompt => self.full_prompt_tokens,
-            KvTransferTimingMode::DestinationMissing => destination_missing_tokens,
-        };
-        let (Some(bytes_per_token), Some(bandwidth_gb_s)) =
-            (self.kv_bytes_per_token, self.bandwidth_gb_s)
-        else {
-            return None;
+        let bandwidth_gb_s = self.bandwidth_gb_s?;
+        let bytes = match self.mode {
+            KvTransferTimingMode::FullPrompt => self.full_prompt_bytes.or_else(|| {
+                self.kv_bytes_per_token.and_then(|bytes_per_token| {
+                    self.full_prompt_tokens.checked_mul(bytes_per_token)
+                })
+            })?,
+            KvTransferTimingMode::DestinationMissing => {
+                self.kv_bytes_per_token.and_then(|bytes_per_token| {
+                    destination_missing_tokens.checked_mul(bytes_per_token)
+                })?
+            }
         };
         if bandwidth_gb_s <= 0.0 {
             return None;
         }
-        Some(tokens as f64 * bytes_per_token as f64 / (bandwidth_gb_s * 1e9) * 1000.0)
+        Some(bytes as f64 / (bandwidth_gb_s * 1e9) * 1000.0)
     }
 
     pub fn full_prompt_delay_ms(self) -> Option<f64> {
@@ -670,6 +680,26 @@ pub fn validate_transfer_timing(transfer_timing: HandoffTransferTiming) -> Resul
         && (!bandwidth_gb_s.is_finite() || bandwidth_gb_s <= 0.0)
     {
         bail!("invalid handoff transfer bandwidth {bandwidth_gb_s}");
+    }
+    if transfer_timing.bandwidth_gb_s.is_some() {
+        match transfer_timing.mode {
+            KvTransferTimingMode::FullPrompt
+                if transfer_timing.full_prompt_bytes.is_none()
+                    && transfer_timing.kv_bytes_per_token.is_none() =>
+            {
+                bail!(
+                    "handoff transfer bandwidth is configured but full-prompt KV bytes are unresolved"
+                );
+            }
+            KvTransferTimingMode::DestinationMissing
+                if transfer_timing.kv_bytes_per_token.is_none() =>
+            {
+                bail!(
+                    "destination-missing handoff timing requires kv_bytes_per_token; AIC dynamic block footprints currently support only full-prompt handoff timing"
+                );
+            }
+            _ => {}
+        }
     }
     validate_transfer_delay_ms(transfer_timing.full_prompt_delay_ms())
 }

@@ -282,6 +282,19 @@ pub struct Pipeline<Src: BlockMetadata, Dst: BlockMetadata> {
     _marker: PhantomData<Dst>,
 }
 
+impl<Src: BlockMetadata, Dst: BlockMetadata> Drop for Pipeline<Src, Dst> {
+    fn drop(&mut self) {
+        // Tokio detaches a task when its JoinHandle is merely dropped. That
+        // is appropriate for a process-long live pipeline, but deterministic
+        // replay builds fresh isolated pipelines per trial. Explicit aborts
+        // prevent those detached queue/sweeper tasks from accumulating on the
+        // shared offline executor after their engine has been discarded.
+        for handle in self._task_handles.drain(..) {
+            handle.abort();
+        }
+    }
+}
+
 impl<Src: BlockMetadata, Dst: BlockMetadata> Pipeline<Src, Dst> {
     /// Create a new pipeline with the given configuration.
     ///
@@ -658,6 +671,14 @@ pub struct ObjectPipeline<Src: BlockMetadata> {
     pub(crate) settlement: PipelineSettlementTracker,
     /// Task handles for pipeline stages
     _task_handles: Vec<JoinHandle<()>>,
+}
+
+impl<Src: BlockMetadata> Drop for ObjectPipeline<Src> {
+    fn drop(&mut self) {
+        for handle in self._task_handles.drain(..) {
+            handle.abort();
+        }
+    }
 }
 
 impl<Src: BlockMetadata> ObjectPipeline<Src> {
@@ -1566,7 +1587,15 @@ impl<Src: BlockMetadata, Dst: BlockMetadata> BlockTransferExecutor<Src, Dst> {
                 shared.dst_layout,
                 src_block_ids.clone(),
                 dst_block_ids.clone(),
-                TransferOptions::default(),
+                TransferOptions::builder()
+                    .block_positions(
+                        sequence_hashes
+                            .iter()
+                            .map(SequenceHash::position)
+                            .collect::<Vec<_>>(),
+                    )
+                    .build()
+                    .expect("block-position transfer metadata is valid"),
             ) {
                 Ok(notification) => notification,
                 Err(error) => {

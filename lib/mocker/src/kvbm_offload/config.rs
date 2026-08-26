@@ -12,12 +12,24 @@ use crate::common::protocols::MockEngineArgs;
 const DEFAULT_G1_G2_BANDWIDTH_GBPS: f64 = 14.0;
 const DEFAULT_G2_G3_BANDWIDTH_GBPS: f64 = 7.0;
 const DEFAULT_G2_G4_BANDWIDTH_GBPS: f64 = 4.0;
+/// Upper bound on derived G2 logical slots to avoid wasteful dense metadata
+/// preallocation for huge theoretical tier sizes (e.g. 17 TB / 69 KB = 246M slots).
+/// Physical admission remains strictly enforced in bytes by CapacityReservations.
+pub const DEFAULT_MAX_DERIVED_G2_SLOTS: usize = 2_000_000;
 
 #[derive(Debug, Clone)]
 pub struct KvbmOffloadConfig {
     /// Number of G2 blocks to simulate. Sets the capacity of the
     /// `BlockManager<G2>` owned by the engine.
     pub num_g2_blocks: usize,
+    /// Rank-local physical G2 byte capacity. When set, admission is enforced
+    /// against AIC-derived per-position block sizes in addition to slots.
+    pub g2_capacity_bytes: Option<usize>,
+
+    /// Optional physical resource-domain id. Scheduler ranks using the same
+    /// id share the node-level G1<->G2 directional bandwidth queues while
+    /// retaining independent G2 capacity pools.
+    pub g2_fabric_id: Option<String>,
 
     /// Tokens per logical KV block. Used as the kvbm-logical block size for
     /// G2 so its block identity matches the engine/G1 block geometry.
@@ -36,11 +48,22 @@ pub struct KvbmOffloadConfig {
     /// stage G4 hits back through G2.
     pub enable_g4_storage: bool,
 
+    /// Finite deployment-shared G4 capacity in bytes. G4 uses deterministic
+    /// LRU eviction when admitting an object would exceed this limit.
+    pub g4_capacity_bytes: Option<usize>,
+
     /// Bytes per block — used by `MockWorker` to compute transfer size
     /// from block counts. Typically `block_size_tokens * kv_bytes_per_token`.
     /// `None` means "unknown" and the worker will use `0` as a sentinel
     /// (every transfer completes instantly).
     pub block_size_bytes: Option<usize>,
+
+    /// AIC-derived incremental bytes by logical block position. When set,
+    /// this profile supersedes `block_size_bytes` for transfer timing.
+    pub block_footprint_bytes: Option<Vec<usize>>,
+
+    /// Auditable provenance for the dynamic footprint.
+    pub footprint_source: Option<String>,
 
     /// Throughput of the G1→G2 offload link in GB/s. Non-positive values
     /// mean "infinite bandwidth" (transfers complete instantly).
@@ -75,11 +98,16 @@ impl Default for KvbmOffloadConfig {
     fn default() -> Self {
         Self {
             num_g2_blocks: 100_000,
+            g2_capacity_bytes: None,
+            g2_fabric_id: None,
             block_size_tokens: 64,
             offload_batch_size: 32,
             num_g3_blocks: None,
             enable_g4_storage: false,
+            g4_capacity_bytes: None,
             block_size_bytes: None,
+            block_footprint_bytes: None,
+            footprint_source: None,
             bandwidth_g1_to_g2_gbps: DEFAULT_G1_G2_BANDWIDTH_GBPS,
             bandwidth_g2_to_g1_gbps: DEFAULT_G1_G2_BANDWIDTH_GBPS,
             bandwidth_g2_to_g3_gbps: DEFAULT_G2_G3_BANDWIDTH_GBPS,
@@ -105,7 +133,27 @@ impl KvbmOffloadConfig {
             .num_g3_blocks
             .and_then(|block_count| (block_count > 0).then_some(block_count));
         let enable_g4_storage = args.enable_g4_storage;
-        let Some(num_g2_blocks) = args.num_g2_blocks else {
+        let derived_num_g2_blocks = match (
+            args.g2_capacity_bytes,
+            args.kv_block_footprint_bytes.as_ref(),
+        ) {
+            (Some(capacity), Some(profile)) => {
+                let min_block = profile.iter().copied().min().ok_or_else(|| {
+                    anyhow::anyhow!("cannot derive G2 slots from an empty KV footprint")
+                })?;
+                let raw_slots = capacity / min_block;
+                if raw_slots == 0 {
+                    anyhow::bail!(
+                        "g2_capacity_bytes={capacity} cannot hold the smallest AIC KV block ({min_block} bytes)"
+                    );
+                }
+                // Cap logical slot materialization to a generous active bound (2M slots).
+                // Physical tier capacity is strictly bounded by CapacityReservations.
+                Some(raw_slots.min(DEFAULT_MAX_DERIVED_G2_SLOTS))
+            }
+            _ => None,
+        };
+        let Some(num_g2_blocks) = args.num_g2_blocks.or(derived_num_g2_blocks) else {
             if num_g3_blocks.is_some() || enable_g4_storage {
                 anyhow::bail!(
                     "G3/G4 offload requires num_g2_blocks because mocker stages lower tiers through G2"
@@ -116,14 +164,24 @@ impl KvbmOffloadConfig {
         if num_g2_blocks == 0 {
             return Ok(None);
         }
-        let Some(bpt) = args.kv_bytes_per_token else {
+        let has_dynamic_footprint = args
+            .kv_block_footprint_bytes
+            .as_ref()
+            .is_some_and(|profile| !profile.is_empty());
+        if args.g2_capacity_bytes.is_some() && !has_dynamic_footprint {
+            anyhow::bail!(
+                "g2_capacity_bytes requires an AIC kv_block_footprint_bytes profile; exact byte admission must not use the linear fallback"
+            );
+        }
+        let bpt = args.kv_bytes_per_token;
+        if !has_dynamic_footprint && bpt.is_none() {
             if num_g3_blocks.is_some() || enable_g4_storage {
                 anyhow::bail!(
-                    "G3/G4 offload requires kv_bytes_per_token so mocker can size lower-tier transfers"
+                    "G3/G4 offload requires an AIC kv_block_footprint_bytes profile or kv_bytes_per_token so mocker can size lower-tier transfers"
                 );
             }
             return Ok(None);
-        };
+        }
         let defaults = Self::default();
         let offload_batch_size = args
             .offload_batch_size
@@ -131,11 +189,16 @@ impl KvbmOffloadConfig {
             .unwrap_or(defaults.offload_batch_size);
         Ok(Some(Self {
             num_g2_blocks,
+            g2_capacity_bytes: args.g2_capacity_bytes,
+            g2_fabric_id: args.g2_fabric_id.clone(),
             block_size_tokens: args.block_size,
             offload_batch_size,
             num_g3_blocks,
             enable_g4_storage,
-            block_size_bytes: Some(args.block_size * bpt),
+            g4_capacity_bytes: args.g4_capacity_bytes,
+            block_size_bytes: bpt.map(|bytes| args.block_size * bytes),
+            block_footprint_bytes: args.kv_block_footprint_bytes.clone(),
+            footprint_source: args.kv_footprint_source.clone(),
             bandwidth_g1_to_g2_gbps: args
                 .bandwidth_g1_to_g2_gbps
                 .unwrap_or(defaults.bandwidth_g1_to_g2_gbps),
@@ -155,6 +218,31 @@ impl KvbmOffloadConfig {
                 .bandwidth_g4_to_g2_gbps
                 .unwrap_or(defaults.bandwidth_g4_to_g2_gbps),
         }))
+    }
+
+    pub fn block_bytes_at(&self, position: u64) -> anyhow::Result<usize> {
+        if let Some(profile) = self.block_footprint_bytes.as_ref() {
+            return profile.get(position as usize).copied().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "KV footprint profile from {:?} has no entry for logical block position {}",
+                    self.footprint_source,
+                    position
+                )
+            });
+        }
+        self.block_size_bytes
+            .ok_or_else(|| anyhow::anyhow!("offload block byte size is unresolved"))
+    }
+
+    pub fn bytes_for_positions(
+        &self,
+        positions: impl IntoIterator<Item = u64>,
+    ) -> anyhow::Result<usize> {
+        positions.into_iter().try_fold(0usize, |total, position| {
+            total
+                .checked_add(self.block_bytes_at(position)?)
+                .ok_or_else(|| anyhow::anyhow!("KV transfer byte count overflow"))
+        })
     }
 }
 
@@ -185,7 +273,8 @@ mod tests {
             .unwrap();
         let error = KvbmOffloadConfig::from_args(&args).unwrap_err();
         assert!(
-            error.to_string().contains("requires kv_bytes_per_token"),
+            error.to_string().contains("kv_block_footprint_bytes")
+                && error.to_string().contains("kv_bytes_per_token"),
             "unexpected error: {error}",
         );
     }
@@ -244,6 +333,72 @@ mod tests {
     }
 
     #[test]
+    fn from_args_threads_aic_dynamic_footprint_and_g2_byte_capacity() {
+        let args = MockEngineArgs::builder()
+            .block_size(64)
+            .num_g2_blocks(Some(10_000))
+            .g2_capacity_bytes(Some(1_000_000))
+            .kv_block_footprint_bytes(Some(vec![200_000, 220_000, 180_000]))
+            .kv_footprint_source(Some("aic:test".to_string()))
+            .build()
+            .unwrap()
+            .normalized()
+            .unwrap();
+        let cfg = KvbmOffloadConfig::from_args(&args)
+            .unwrap()
+            .expect("dynamic profile should enable G2");
+
+        assert_eq!(cfg.g2_capacity_bytes, Some(1_000_000));
+        assert_eq!(
+            cfg.block_footprint_bytes,
+            Some(vec![200_000, 220_000, 180_000])
+        );
+        assert_eq!(cfg.footprint_source.as_deref(), Some("aic:test"));
+        assert_eq!(cfg.block_size_bytes, None);
+        assert_eq!(cfg.block_bytes_at(1).unwrap(), 220_000);
+        assert_eq!(cfg.bytes_for_positions([0, 2]).unwrap(), 380_000);
+    }
+
+    #[test]
+    fn from_args_caps_derived_g2_slots_to_active_bound() {
+        let args = MockEngineArgs::builder()
+            .block_size(64)
+            .g2_capacity_bytes(Some(17_000_000_000_000)) // 17 TB
+            .kv_block_footprint_bytes(Some(vec![69_120])) // 17 TB / 69 KB = 245.9M raw slots
+            .kv_footprint_source(Some("aic:test".to_string()))
+            .build()
+            .unwrap()
+            .normalized()
+            .unwrap();
+        let cfg = KvbmOffloadConfig::from_args(&args)
+            .unwrap()
+            .expect("should build offload config");
+
+        assert_eq!(cfg.g2_capacity_bytes, Some(17_000_000_000_000));
+        assert_eq!(cfg.num_g2_blocks, DEFAULT_MAX_DERIVED_G2_SLOTS);
+    }
+
+    #[test]
+    fn from_args_rejects_g2_byte_capacity_without_aic_profile() {
+        let args = MockEngineArgs::builder()
+            .block_size(64)
+            .num_g2_blocks(Some(10_000))
+            .g2_capacity_bytes(Some(1_000_000))
+            .kv_bytes_per_token(Some(1024))
+            .build()
+            .unwrap()
+            .normalized()
+            .unwrap();
+        let error = KvbmOffloadConfig::from_args(&args).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires an AIC kv_block_footprint_bytes profile"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn from_args_threads_optional_knobs_when_set() {
         let args = MockEngineArgs::builder()
             .block_size(64)
@@ -252,6 +407,7 @@ mod tests {
             .offload_batch_size(Some(16))
             .num_g3_blocks(Some(20_000))
             .enable_g4_storage(true)
+            .g4_capacity_bytes(Some(64_000_000))
             .bandwidth_g1_to_g2_gbps(Some(8.0))
             .bandwidth_g2_to_g1_gbps(Some(12.0))
             .bandwidth_g2_to_g3_gbps(Some(3.0))
@@ -270,6 +426,7 @@ mod tests {
         assert_eq!(cfg.offload_batch_size, 16);
         assert_eq!(cfg.num_g3_blocks, Some(20_000));
         assert!(cfg.enable_g4_storage);
+        assert_eq!(cfg.g4_capacity_bytes, Some(64_000_000));
         assert_eq!(cfg.bandwidth_g1_to_g2_gbps, 8.0);
         assert_eq!(cfg.bandwidth_g2_to_g1_gbps, 12.0);
         assert_eq!(cfg.bandwidth_g2_to_g3_gbps, 3.0);
@@ -299,11 +456,13 @@ mod tests {
             .block_size(64)
             .num_g2_blocks(Some(10_000))
             .enable_g4_storage(true)
+            .g4_capacity_bytes(Some(64_000_000))
             .build()
             .unwrap();
         let error = KvbmOffloadConfig::from_args(&args).unwrap_err();
         assert!(
-            error.to_string().contains("requires kv_bytes_per_token"),
+            error.to_string().contains("kv_block_footprint_bytes")
+                && error.to_string().contains("kv_bytes_per_token"),
             "unexpected error: {error}",
         );
     }

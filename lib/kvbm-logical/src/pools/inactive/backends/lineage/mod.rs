@@ -172,10 +172,11 @@ impl LineageBackend {
     /// amortized — not a steady-state cost. The `Tick` policy's `BTreeMap`
     /// is the one structure that always churns nodes.)
     pub(crate) fn with_policy(capacity: usize, leaves: LeafPolicy) -> Self {
+        let initial_cap = capacity.min(65_536);
         Self {
-            slots: Vec::with_capacity(capacity),
+            slots: Vec::with_capacity(initial_cap),
             free_head: None,
-            index: HashMap::with_capacity_and_hasher(capacity, PairBuildHasher),
+            index: HashMap::with_capacity_and_hasher(initial_cap, PairBuildHasher),
             leaves,
             count: 0,
         }

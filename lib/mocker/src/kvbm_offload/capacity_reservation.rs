@@ -3,10 +3,13 @@
 
 //! Destination-capacity reservation helpers for mock offload pipelines.
 
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use kvbm_engine::SequenceHash;
 use kvbm_engine::offload::{
     EvalContext, OffloadPolicy, PolicyBatchFuture, PolicyFuture, sync_batch_result, sync_result,
 };
@@ -19,17 +22,201 @@ use kvbm_logical::manager::BlockManager;
 /// exposes only currently-free blocks, so accepted-but-not-yet-registered
 /// transfers need an atomic side reservation to avoid over-admitting into a
 /// shared tier.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ByteCapacityMetrics {
+    pub capacity_bytes: usize,
+    pub reserved_bytes: usize,
+    pub occupied_bytes: usize,
+    pub peak_committed_bytes: usize,
+    pub admission_rejections: u64,
+}
+
+#[derive(Debug)]
+struct ByteCapacityState {
+    profile: Arc<[usize]>,
+    pending: HashMap<SequenceHash, usize>,
+    occupied: HashMap<SequenceHash, usize>,
+    metrics: ByteCapacityMetrics,
+}
+
+#[derive(Debug)]
 pub(crate) struct CapacityReservations {
     reserved_blocks: AtomicUsize,
+    byte_state: Option<Mutex<ByteCapacityState>>,
+}
+
+impl Default for CapacityReservations {
+    fn default() -> Self {
+        Self {
+            reserved_blocks: AtomicUsize::new(0),
+            byte_state: None,
+        }
+    }
 }
 
 impl CapacityReservations {
+    pub(crate) fn with_byte_capacity(capacity_bytes: usize, profile: Arc<[usize]>) -> Self {
+        assert!(capacity_bytes > 0, "G2 byte capacity must be positive");
+        assert!(
+            !profile.is_empty() && !profile.contains(&0),
+            "G2 byte capacity requires a positive AIC block-footprint profile"
+        );
+        Self {
+            reserved_blocks: AtomicUsize::new(0),
+            byte_state: Some(Mutex::new(ByteCapacityState {
+                profile,
+                pending: HashMap::new(),
+                occupied: HashMap::new(),
+                metrics: ByteCapacityMetrics {
+                    capacity_bytes,
+                    ..ByteCapacityMetrics::default()
+                },
+            })),
+        }
+    }
+
+    pub(crate) fn uses_byte_capacity(&self) -> bool {
+        self.byte_state.is_some()
+    }
+
     pub(crate) fn reserved_blocks(&self) -> usize {
         self.reserved_blocks.load(Ordering::Acquire)
     }
 
+    pub(crate) fn byte_metrics(&self) -> Option<ByteCapacityMetrics> {
+        self.byte_state.as_ref().map(|state| {
+            state
+                .lock()
+                .expect("byte capacity reservation mutex poisoned")
+                .metrics
+        })
+    }
+
+    fn bytes_for_hash(state: &ByteCapacityState, hash: &SequenceHash) -> Option<usize> {
+        state.profile.get(hash.position() as usize).copied()
+    }
+
+    /// Reserve destination slots and physical bytes for a deterministic
+    /// prefix of hashes. Each result corresponds to one input hash; once a
+    /// capacity limit rejects an element, later elements are rejected too so
+    /// pipeline batching preserves prefix order.
+    pub(crate) fn try_reserve_hashes(
+        &self,
+        available_blocks: usize,
+        hashes: &[SequenceHash],
+    ) -> Vec<bool> {
+        let Some(byte_state) = self.byte_state.as_ref() else {
+            let reserved = self.try_reserve_up_to(available_blocks, hashes.len());
+            let mut results = vec![true; reserved];
+            results.resize(hashes.len(), false);
+            return results;
+        };
+        if hashes.is_empty() {
+            return Vec::new();
+        }
+
+        let mut state = byte_state
+            .lock()
+            .expect("byte capacity reservation mutex poisoned");
+        let mut reserved_blocks = self.reserved_blocks.load(Ordering::Acquire);
+        let mut results = Vec::with_capacity(hashes.len());
+        let mut prefix_open = true;
+        for hash in hashes {
+            let Some(bytes) = Self::bytes_for_hash(&state, hash) else {
+                state.metrics.admission_rejections =
+                    state.metrics.admission_rejections.saturating_add(1);
+                results.push(false);
+                prefix_open = false;
+                continue;
+            };
+            let duplicate = state.pending.contains_key(hash) || state.occupied.contains_key(hash);
+            let committed = state
+                .metrics
+                .reserved_bytes
+                .saturating_add(state.metrics.occupied_bytes);
+            let fits_slots = reserved_blocks < available_blocks;
+            let fits_bytes = committed
+                .checked_add(bytes)
+                .is_some_and(|next| next <= state.metrics.capacity_bytes);
+            if prefix_open && !duplicate && fits_slots && fits_bytes {
+                state.pending.insert(*hash, bytes);
+                state.metrics.reserved_bytes = state.metrics.reserved_bytes.saturating_add(bytes);
+                let committed = state
+                    .metrics
+                    .reserved_bytes
+                    .saturating_add(state.metrics.occupied_bytes);
+                state.metrics.peak_committed_bytes =
+                    state.metrics.peak_committed_bytes.max(committed);
+                reserved_blocks += 1;
+                results.push(true);
+            } else {
+                state.metrics.admission_rejections =
+                    state.metrics.admission_rejections.saturating_add(1);
+                results.push(false);
+                prefix_open = false;
+            }
+        }
+        self.reserved_blocks
+            .store(reserved_blocks, Ordering::Release);
+        results
+    }
+
+    /// Move a completed reservation into byte-accounted resident G2 state.
+    pub(crate) fn mark_published(&self, hash: SequenceHash) {
+        let Some(byte_state) = self.byte_state.as_ref() else {
+            return;
+        };
+        let mut state = byte_state
+            .lock()
+            .expect("byte capacity reservation mutex poisoned");
+        if state.occupied.contains_key(&hash) {
+            return;
+        }
+        let bytes = state
+            .pending
+            .remove(&hash)
+            .or_else(|| Self::bytes_for_hash(&state, &hash))
+            .expect("published G2 block position must exist in AIC footprint");
+        state.metrics.reserved_bytes = state.metrics.reserved_bytes.saturating_sub(bytes);
+        state.metrics.occupied_bytes = state.metrics.occupied_bytes.saturating_add(bytes);
+        state.occupied.insert(hash, bytes);
+        assert!(
+            state.metrics.occupied_bytes <= state.metrics.capacity_bytes,
+            "published G2 byte occupancy exceeded configured capacity"
+        );
+    }
+
+    pub(crate) fn mark_removed(&self, hash: SequenceHash) {
+        let Some(byte_state) = self.byte_state.as_ref() else {
+            return;
+        };
+        let mut state = byte_state
+            .lock()
+            .expect("byte capacity reservation mutex poisoned");
+        if let Some(bytes) = state.occupied.remove(&hash) {
+            state.metrics.occupied_bytes = state.metrics.occupied_bytes.saturating_sub(bytes);
+        }
+    }
+
+    pub(crate) fn release_hashes(&self, hashes: &[SequenceHash]) {
+        let Some(byte_state) = self.byte_state.as_ref() else {
+            return;
+        };
+        let mut state = byte_state
+            .lock()
+            .expect("byte capacity reservation mutex poisoned");
+        for hash in hashes {
+            if let Some(bytes) = state.pending.remove(hash) {
+                state.metrics.reserved_bytes = state.metrics.reserved_bytes.saturating_sub(bytes);
+            }
+        }
+    }
+
     pub(crate) fn try_reserve(self: &Arc<Self>, available_blocks: usize, blocks: usize) -> bool {
+        assert!(
+            self.byte_state.is_none(),
+            "byte-accounted G2 reservations must name logical block hashes"
+        );
         if blocks == 0 {
             return true;
         }
@@ -43,6 +230,10 @@ impl CapacityReservations {
     }
 
     pub(crate) fn try_reserve_up_to(&self, available_blocks: usize, blocks: usize) -> usize {
+        assert!(
+            self.byte_state.is_none(),
+            "byte-accounted G2 reservations must name logical block hashes"
+        );
         if blocks == 0 {
             return 0;
         }
@@ -88,6 +279,7 @@ impl CapacityReservations {
 pub(crate) struct CapacityReservationGuard {
     reservations: Arc<CapacityReservations>,
     blocks: usize,
+    hashes: Vec<SequenceHash>,
 }
 
 impl CapacityReservationGuard {
@@ -95,11 +287,25 @@ impl CapacityReservationGuard {
         Self {
             reservations,
             blocks,
+            hashes: Vec::new(),
+        }
+    }
+
+    pub(crate) fn with_hashes(
+        reservations: Arc<CapacityReservations>,
+        hashes: Vec<SequenceHash>,
+    ) -> Self {
+        Self {
+            blocks: hashes.len(),
+            reservations,
+            hashes,
         }
     }
 
     fn release(&mut self) {
         let blocks = std::mem::take(&mut self.blocks);
+        self.reservations.release_hashes(&self.hashes);
+        self.hashes.clear();
         self.reservations.release(blocks);
     }
 }
@@ -136,6 +342,7 @@ impl<Src: BlockMetadata, Dst: BlockMetadata> CapacityReservationPolicy<Src, Dst>
     }
 
     fn try_reserve_capacity(&self, blocks: usize) -> bool {
+        debug_assert!(!self.capacity_reservations.uses_byte_capacity());
         let available = self.dst_manager.available_blocks();
         self.capacity_reservations.try_reserve(available, blocks)
     }
@@ -148,8 +355,14 @@ impl<Src: BlockMetadata, Dst: BlockMetadata> OffloadPolicy<Src>
         "CapacityReservationPolicy"
     }
 
-    fn evaluate<'a>(&'a self, _ctx: &'a EvalContext<Src>) -> PolicyFuture<'a> {
-        sync_result(Ok(self.try_reserve_capacity(1)))
+    fn evaluate<'a>(&'a self, ctx: &'a EvalContext<Src>) -> PolicyFuture<'a> {
+        let accepted = if self.capacity_reservations.uses_byte_capacity() {
+            self.capacity_reservations
+                .try_reserve_hashes(self.dst_manager.available_blocks(), &[ctx.sequence_hash])[0]
+        } else {
+            self.try_reserve_capacity(1)
+        };
+        sync_result(Ok(accepted))
     }
 
     fn evaluate_batch<'a>(&'a self, contexts: &'a [EvalContext<Src>]) -> PolicyBatchFuture<'a> {
@@ -158,6 +371,15 @@ impl<Src: BlockMetadata, Dst: BlockMetadata> OffloadPolicy<Src>
         }
 
         let available = self.dst_manager.available_blocks();
+        if self.capacity_reservations.uses_byte_capacity() {
+            let hashes = contexts
+                .iter()
+                .map(|context| context.sequence_hash)
+                .collect::<Vec<_>>();
+            return sync_batch_result(Ok(self
+                .capacity_reservations
+                .try_reserve_hashes(available, &hashes)));
+        }
         let reserved = self
             .capacity_reservations
             .try_reserve_up_to(available, contexts.len());
@@ -219,6 +441,44 @@ mod tests {
             panic!("CapacityReservationPolicy should evaluate synchronously");
         };
         assert!(futures::executor::block_on(result).expect("policy should succeed"));
+    }
+
+    #[test]
+    fn byte_capacity_tracks_pending_and_resident_aic_footprints() {
+        let reservations =
+            CapacityReservations::with_byte_capacity(5, Arc::from(vec![2usize, 4usize]));
+        let first = PositionalLineageHash::new(10, None, 0);
+        let second = PositionalLineageHash::new(11, Some(10), 1);
+
+        assert_eq!(reservations.try_reserve_hashes(10, &[first]), vec![true]);
+        assert_eq!(reservations.reserved_blocks(), 1);
+        assert_eq!(
+            reservations.byte_metrics(),
+            Some(ByteCapacityMetrics {
+                capacity_bytes: 5,
+                reserved_bytes: 2,
+                occupied_bytes: 0,
+                peak_committed_bytes: 2,
+                admission_rejections: 0,
+            })
+        );
+
+        assert_eq!(reservations.try_reserve_hashes(10, &[second]), vec![false]);
+        reservations.mark_published(first);
+        let metrics = reservations.byte_metrics().unwrap();
+        assert_eq!(metrics.reserved_bytes, 0);
+        assert_eq!(metrics.occupied_bytes, 2);
+        assert_eq!(metrics.admission_rejections, 1);
+
+        reservations.release(1);
+        reservations.mark_removed(first);
+        assert_eq!(reservations.try_reserve_hashes(10, &[second]), vec![true]);
+        reservations.release_hashes(&[second]);
+        reservations.release(1);
+        let metrics = reservations.byte_metrics().unwrap();
+        assert_eq!(metrics.reserved_bytes, 0);
+        assert_eq!(metrics.occupied_bytes, 0);
+        assert_eq!(reservations.reserved_blocks(), 0);
     }
 
     #[test]

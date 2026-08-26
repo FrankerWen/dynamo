@@ -9,7 +9,10 @@ use uuid::Uuid;
 
 use super::ReplayMode;
 use crate::common::protocols::DirectRequest;
-use crate::loadgen::{ReplayRequestHashes, ReplayRequestPayload, WorkloadDriver};
+use crate::loadgen::{
+    AgentxReplayController, AgentxReplaySummary, AgentxRequestContext, ReplayRequestHashes,
+    ReplayRequestPayload, WorkloadDriver,
+};
 use crate::replay::offline::core::{AdmissionSource as CoreAdmissionSource, ReadyArrival};
 
 pub(in crate::replay) trait ReplayAdmissionMetadata: Sized {
@@ -74,6 +77,7 @@ impl ReplayAdmissionMetadata for KvReplayMetadata {
 enum AdmissionSource {
     Requests(VecDeque<DirectRequest>),
     Workload(WorkloadDriver),
+    Agentx(AgentxReplayController),
 }
 
 pub(in crate::replay::offline) struct AdmissionQueue<Metadata = KvReplayMetadata> {
@@ -105,12 +109,21 @@ impl<Metadata: ReplayAdmissionMetadata> AdmissionQueue<Metadata> {
         }
     }
 
+    pub(in crate::replay::offline) fn new_agentx(controller: AgentxReplayController) -> Self {
+        Self {
+            source: AdmissionSource::Agentx(controller),
+            mode: ReplayMode::Trace,
+            metadata: PhantomData,
+        }
+    }
+
     pub(in crate::replay::offline) fn mode(&self) -> ReplayMode {
         self.mode
     }
 
     pub(in crate::replay::offline) fn next_ready_time_ms(&mut self) -> Option<f64> {
         match (&self.mode, &mut self.source) {
+            (_, AdmissionSource::Agentx(controller)) => controller.next_ready_time_ms(),
             (ReplayMode::Trace, AdmissionSource::Requests(pending)) => pending
                 .front()
                 .and_then(|request| request.arrival_timestamp_ms),
@@ -132,7 +145,7 @@ impl<Metadata: ReplayAdmissionMetadata> AdmissionQueue<Metadata> {
         &mut self,
         now_ms: f64,
         cluster_in_flight: usize,
-    ) -> Result<Vec<ReadyArrival<ReplayRequestPayload, Metadata>>> {
+    ) -> Result<Vec<ReadyArrival<ReplayRequestPayload, Metadata, AgentxRequestContext>>> {
         match (&self.mode, &mut self.source) {
             (ReplayMode::Trace, AdmissionSource::Requests(pending)) => {
                 let mut ready = Vec::new();
@@ -153,6 +166,7 @@ impl<Metadata: ReplayAdmissionMetadata> AdmissionQueue<Metadata> {
                         metadata: Metadata::from_hashes(None),
                         session_id: None,
                         turn_index: None,
+                        agentx_context: None,
                     });
                 }
                 Ok(ready)
@@ -169,6 +183,7 @@ impl<Metadata: ReplayAdmissionMetadata> AdmissionQueue<Metadata> {
                         metadata: Metadata::from_hashes(ready.replay_hashes),
                         session_id,
                         turn_index,
+                        agentx_context: None,
                     }
                 })
                 .collect()),
@@ -186,6 +201,7 @@ impl<Metadata: ReplayAdmissionMetadata> AdmissionQueue<Metadata> {
                         metadata: Metadata::from_hashes(None),
                         session_id: None,
                         turn_index: None,
+                        agentx_context: None,
                     });
                     simulated_in_flight += 1;
                 }
@@ -206,10 +222,23 @@ impl<Metadata: ReplayAdmissionMetadata> AdmissionQueue<Metadata> {
                             metadata: Metadata::from_hashes(ready.replay_hashes),
                             session_id,
                             turn_index,
+                            agentx_context: None,
                         }
                     })
                     .collect())
             }
+            (_, AdmissionSource::Agentx(controller)) => Ok(controller
+                .drain_ready(now_ms)?
+                .into_iter()
+                .map(|ready| ReadyArrival {
+                    request: ready.request,
+                    arrival_time_ms: ready.arrival_time_ms,
+                    metadata: Metadata::from_hashes(ready.replay_hashes),
+                    session_id: Some(ready.session_id),
+                    turn_index: Some(ready.turn_index),
+                    agentx_context: Some(ready.context),
+                })
+                .collect()),
         }
     }
 
@@ -219,10 +248,11 @@ impl<Metadata: ReplayAdmissionMetadata> AdmissionQueue<Metadata> {
         now_ms: f64,
         rejected: bool,
     ) -> Result<()> {
-        let AdmissionSource::Workload(driver) = &mut self.source else {
-            return Ok(());
-        };
-        driver.on_terminal(uuid, now_ms, rejected)
+        match &mut self.source {
+            AdmissionSource::Workload(driver) => driver.on_terminal(uuid, now_ms, rejected),
+            AdmissionSource::Agentx(controller) => controller.on_terminal(uuid, now_ms, rejected),
+            AdmissionSource::Requests(_) => Ok(()),
+        }
     }
 
     pub(in crate::replay::offline) fn on_output_token(
@@ -230,16 +260,18 @@ impl<Metadata: ReplayAdmissionMetadata> AdmissionQueue<Metadata> {
         uuid: Uuid,
         token_id: u32,
     ) -> Result<()> {
-        let AdmissionSource::Workload(driver) = &mut self.source else {
-            return Ok(());
-        };
-        driver.on_output_token(uuid, token_id)
+        match &mut self.source {
+            AdmissionSource::Workload(driver) => driver.on_output_token(uuid, token_id),
+            AdmissionSource::Agentx(controller) => controller.on_output_token(uuid, token_id),
+            AdmissionSource::Requests(_) => Ok(()),
+        }
     }
 
     pub(in crate::replay::offline) fn is_drained(&self) -> bool {
         match &self.source {
             AdmissionSource::Requests(pending) => pending.is_empty(),
             AdmissionSource::Workload(driver) => driver.is_drained(),
+            AdmissionSource::Agentx(controller) => controller.is_drained(),
         }
     }
 
@@ -248,10 +280,31 @@ impl<Metadata: ReplayAdmissionMetadata> AdmissionQueue<Metadata> {
         matches!(self.source, AdmissionSource::Workload(_))
     }
 
+    pub(in crate::replay::offline) fn agentx_summary(&self) -> Option<AgentxReplaySummary> {
+        match &self.source {
+            AdmissionSource::Agentx(controller) => Some(controller.summary()),
+            _ => None,
+        }
+    }
+
+    pub(in crate::replay::offline) fn agentx_profile_overlap_ms(
+        &self,
+        from_ms: f64,
+        to_ms: f64,
+    ) -> Option<f64> {
+        match &self.source {
+            AdmissionSource::Agentx(controller) => {
+                Some(controller.profile_overlap_ms(from_ms, to_ms))
+            }
+            _ => None,
+        }
+    }
+
     pub(in crate::replay::offline) fn total_requests(&self) -> usize {
         match &self.source {
             AdmissionSource::Requests(pending) => pending.len(),
             AdmissionSource::Workload(driver) => driver.total_turns(),
+            AdmissionSource::Agentx(controller) => controller.total_requests_hint(),
         }
     }
 }
@@ -259,6 +312,7 @@ impl<Metadata: ReplayAdmissionMetadata> AdmissionQueue<Metadata> {
 impl<Metadata: ReplayAdmissionMetadata> CoreAdmissionSource for AdmissionQueue<Metadata> {
     type Request = ReplayRequestPayload;
     type Metadata = Metadata;
+    type Context = AgentxRequestContext;
 
     fn next_ready_time_ms(&mut self) -> Option<f64> {
         AdmissionQueue::next_ready_time_ms(self)
@@ -268,7 +322,7 @@ impl<Metadata: ReplayAdmissionMetadata> CoreAdmissionSource for AdmissionQueue<M
         &mut self,
         now_ms: f64,
         cluster_in_flight: usize,
-    ) -> Result<Vec<ReadyArrival<Self::Request, Self::Metadata>>> {
+    ) -> Result<Vec<ReadyArrival<Self::Request, Self::Metadata, Self::Context>>> {
         AdmissionQueue::drain_ready_compact(self, now_ms, cluster_in_flight)
     }
 

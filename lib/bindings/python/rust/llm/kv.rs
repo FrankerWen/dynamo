@@ -1898,6 +1898,8 @@ impl KvRouter {
                         config.backend_version(),
                         None,
                         None,
+                        None,
+                        None,
                         config.moe_tp_size(),
                         config.moe_ep_size(),
                         config.attention_dp_size(),

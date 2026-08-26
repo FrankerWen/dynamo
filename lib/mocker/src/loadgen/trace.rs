@@ -115,7 +115,11 @@ pub fn validate_trace_files(format: TraceFileFormat, paths: &[PathBuf]) -> Resul
     if paths.is_empty() {
         bail!("trace replay requires at least one trace file");
     }
-    if format != TraceFileFormat::Dynamo && paths.len() != 1 {
+    if !matches!(
+        format,
+        TraceFileFormat::Dynamo | TraceFileFormat::AgentxExactV1
+    ) && paths.len() != 1
+    {
         bail!(
             "trace_format='{}' requires exactly one trace file, got {}",
             format.as_str(),

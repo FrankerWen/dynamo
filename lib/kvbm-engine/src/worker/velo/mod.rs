@@ -60,6 +60,9 @@ struct SerializableTransferOptions {
 impl From<SerializableTransferOptions> for TransferOptions {
     fn from(opts: SerializableTransferOptions) -> Self {
         TransferOptions {
+            // Byte-accounting metadata is local to the mock scheduler and is
+            // intentionally not forwarded to a physical VELO worker.
+            block_positions: None,
             layer_range: opts.layer_range,
             nixl_write_notification: opts.nixl_write_notification,
             // bounce_buffer requires TransportManager to resolve handle to layout

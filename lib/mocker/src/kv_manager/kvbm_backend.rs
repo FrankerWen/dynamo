@@ -447,6 +447,18 @@ impl KvManager {
         self.offload_engine.is_some()
     }
 
+    #[cfg(feature = "kvbm-offload")]
+    pub(crate) fn offload_resource_snapshot(
+        &self,
+    ) -> Option<crate::kvbm_offload::OffloadEngineSnapshot> {
+        self.offload_engine.as_ref().map(|engine| {
+            engine
+                .lock()
+                .expect("offload engine mutex poisoned")
+                .resource_snapshot()
+        })
+    }
+
     /// Advance the offload engine's PS models and fire any
     /// completion sinks for drained transfers. Scheduler calls this at
     /// the top of every pass so swap-in statuses publish before the

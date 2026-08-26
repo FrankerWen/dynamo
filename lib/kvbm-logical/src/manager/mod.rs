@@ -55,6 +55,13 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
         self.store.id()
     }
 
+    /// Deterministic lower bound for host memory preallocated by fixed slot
+    /// metadata. Useful when a byte-capacity simulation derives a very large
+    /// logical slot ceiling from physical DRAM.
+    pub fn fixed_slot_metadata_bytes(&self) -> usize {
+        self.store.fixed_slot_metadata_bytes()
+    }
+
     /// Allocate `count` mutable blocks, drawing first from the reset pool
     /// and then evicting from the inactive pool if needed.
     ///

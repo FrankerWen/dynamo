@@ -38,6 +38,7 @@ pub(crate) use entrypoints::{
     simulate_trace_workload_disagg_with_scaling_policy,
     simulate_trace_workload_with_scaling_policy,
 };
+pub use entrypoints::{simulate_agentx_exact_workload, simulate_agentx_exact_workload_disagg};
 pub use evidence::{
     EnginePressureState, KvIngestBoundary, KvIngestBoundaryStats, KvIngestEvidence,
     LifecycleOperation, OfflineRuntimeEvidence, PressureEvidence, PressureKind, PressureRecord,

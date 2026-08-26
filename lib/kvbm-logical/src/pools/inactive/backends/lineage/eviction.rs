@@ -127,7 +127,7 @@ pub(crate) struct FifoPolicy {
 impl FifoPolicy {
     fn with_capacity(capacity: usize) -> Self {
         Self {
-            links: Vec::with_capacity(capacity),
+            links: Vec::with_capacity(capacity.min(65_536)),
             head: None,
             tail: None,
         }
@@ -211,7 +211,7 @@ pub(crate) struct TickPolicy {
 impl TickPolicy {
     fn with_capacity(capacity: usize) -> Self {
         Self {
-            ticks: Vec::with_capacity(capacity),
+            ticks: Vec::with_capacity(capacity.min(65_536)),
             queue: BTreeMap::new(),
             next_tick: 0,
         }

@@ -487,6 +487,39 @@ fn test_trace_smoke_reports_decode_only_tokens(#[case] router_mode: ReplayRouter
     );
 }
 
+#[rstest::rstest]
+#[case(EngineType::Vllm)]
+#[case(EngineType::Sglang)]
+fn completed_requests_retire_primary_and_handoff_state(#[case] engine_type: EngineType) {
+    let config = match engine_type {
+        EngineType::Vllm => disagg_config(),
+        EngineType::Sglang => sglang_disagg_config(),
+        EngineType::Trtllm => unreachable!(),
+    };
+    let request_count = 64;
+    let requests = (1..=request_count)
+        .map(|id| request(id, 128, 2, 0.0))
+        .collect();
+
+    let (collector, stats) =
+        run_trace_collect(&config, requests, None, 1.0, ReplayRouterMode::RoundRobin);
+    let report = collector.finish();
+
+    assert_eq!(
+        report.request_counts.completed_requests,
+        request_count as usize
+    );
+    assert_eq!(stats.request_snapshots.len(), request_count as usize);
+    assert!(
+        stats
+            .request_snapshots
+            .values()
+            .all(|snapshot| snapshot.phase == DisaggPhase::Done)
+    );
+    assert_eq!(stats.retained_request_states, 0);
+    assert_eq!(stats.retained_handoff_indexes, 0);
+}
+
 #[test]
 fn decode_terminal_retains_handoff_until_deferred_cleanup_drains() {
     let request_shapes = [
@@ -1175,6 +1208,39 @@ fn destination_missing_timing_uses_isolated_destination_cache_state() {
 }
 
 #[test]
+fn full_prompt_handoff_uses_dynamic_aic_block_bytes() {
+    for engine_type in [EngineType::Vllm, EngineType::Sglang] {
+        let mut config = match engine_type {
+            EngineType::Vllm => disagg_config(),
+            EngineType::Sglang => sglang_disagg_config(),
+            EngineType::Trtllm => unreachable!(),
+        };
+        config.num_prefill_workers = 1;
+        config.num_decode_workers = 1;
+        config.prefill_args.kv_transfer_bandwidth = Some(1.0);
+        config.prefill_args.kv_bytes_per_token = None;
+        config.prefill_args.kv_block_footprint_bytes = Some(vec![2_000_000, 3_000_000]);
+        config.prefill_args.kv_footprint_source = Some("unit:aic-dynamic".to_string());
+        config.prefill_args.kv_transfer_timing_mode = KvTransferTimingMode::FullPrompt;
+
+        let report = run_trace_with_details(
+            &config,
+            vec![request(1, 128, 1, 0.0)],
+            None,
+            ReplayRouterMode::RoundRobin,
+        );
+        let measured = &report.per_request[0];
+        let transfer_span =
+            measured.destination_activated_ms.unwrap() - measured.destination_reserved_ms.unwrap();
+
+        assert!(
+            transfer_span >= 5.0 && transfer_span - 5.0 < 1.0,
+            "{engine_type:?} dynamic footprint should charge 5 MB, observed {transfer_span} ms"
+        );
+    }
+}
+
+#[test]
 fn source_only_reuse_does_not_reduce_destination_missing_transfer() {
     for engine_type in [EngineType::Vllm, EngineType::Sglang] {
         let report = run_trace_with_details(
@@ -1252,7 +1318,10 @@ fn test_cancellation_during_transfer_ignores_retired_completion_event() {
             runtime.advance_now_ms(next);
             runtime.drain_current_timestamp().unwrap();
         }
-        assert_eq!(runtime.state(uuid).unwrap().phase, DisaggPhase::Done);
+        assert_eq!(
+            runtime.stats.request_snapshots[&uuid].phase,
+            DisaggPhase::Done
+        );
         assert_eq!(runtime.total_prefill_count(), 0);
         assert_eq!(runtime.total_decode_count(), 0);
         assert!(
@@ -1471,11 +1540,16 @@ fn canceling_worker_waiting_compact_prefill_drops_deferred_prompt() {
         .unwrap();
     runtime.drain_current_timestamp().unwrap();
 
-    assert_eq!(runtime.state(uuid).unwrap().phase, DisaggPhase::Done);
-    assert!(
-        runtime.state(uuid).unwrap().materialized_tokens().is_err(),
-        "cancellation should release the deferred request payload"
+    assert_eq!(
+        runtime.stats.request_snapshots[&uuid].phase,
+        DisaggPhase::Done
     );
+    assert!(
+        runtime.state(uuid).is_err(),
+        "cancellation should release and retire the request"
+    );
+    assert!(runtime.flow.requests.is_empty());
+    assert!(runtime.flow.requests_by_handoff.is_empty());
 }
 
 #[test]
@@ -1560,8 +1634,14 @@ fn pending_destination_booking_survives_scale_down_until_cleanup() {
         runtime.drain_current_timestamp().unwrap();
     }
 
-    assert_eq!(runtime.state(first).unwrap().phase, DisaggPhase::Done);
-    assert_eq!(runtime.state(pending).unwrap().phase, DisaggPhase::Done);
+    assert_eq!(
+        runtime.stats.request_snapshots[&first].phase,
+        DisaggPhase::Done
+    );
+    assert_eq!(
+        runtime.stats.request_snapshots[&pending].phase,
+        DisaggPhase::Done
+    );
     assert_eq!(runtime.total_decode_count(), 0);
     assert_eq!(runtime.stats.decode_router_freed_count, 1);
     let after = runtime.decode_placement.debug_snapshot(runtime.now_ms());
