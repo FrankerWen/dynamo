@@ -24,17 +24,14 @@
 //! - [`Fifo`](LeafPolicy::Fifo) — an intrusive FIFO over leaves: O(1) per
 //!   hook, **zero heap allocation in steady state** (a pre-sized link
 //!   array). A node that *re-becomes* a leaf appends at the tail.
-//! - [`Tick`](LeafPolicy::Tick) — a `BTreeMap` ordered by a monotonic
-//!   per-node insertion tick: a re-leafed node retains its *original*
-//!   position. This is the historical lineage-backend behavior and the
-//!   default. Costs O(log n) per hook and B-tree node churn — it is the
-//!   only structure here that is not pre-sized.
+//! - [`Tick`](LeafPolicy::Tick) — an indexed binary min-heap ordered by a
+//!   monotonic per-node insertion tick: a re-leafed node retains its
+//!   *original* position. This preserves the historical lineage-backend
+//!   ordering while replacing per-entry B-tree allocation with dense arrays.
 //!
 //! A frequency-tiered variant (bucket leaves by TinyLFU count, evict cold
 //! tiers first) is the planned third arm; adding it extends this enum and
 //! `on_node_inserted`'s signature (it would need the `SequenceHash`).
-
-use std::collections::BTreeMap;
 
 /// Leaf-eviction ordering strategy for `LineageBackend`. See the module docs.
 pub(crate) enum LeafPolicy {
@@ -100,7 +97,7 @@ impl LeafPolicy {
     pub(crate) fn len(&self) -> usize {
         match self {
             Self::Fifo(p) => p.len(),
-            Self::Tick(p) => p.queue.len(),
+            Self::Tick(p) => p.heap.len(),
         }
     }
 }
@@ -193,7 +190,7 @@ impl FifoPolicy {
 // Tick
 // ---------------------------------------------------------------------------
 
-/// `BTreeMap` of `(insertion_tick, slot)` ordered ascending. A node's tick
+/// Indexed min-heap of `(insertion_tick, slot)` ordered ascending. A node's tick
 /// is assigned once, at Real-ification, and survives leaf→interior→leaf
 /// transitions — so a re-leafed node returns to its original eviction
 /// position. Reproduces the historical lineage-backend ordering exactly.
@@ -201,10 +198,12 @@ pub(crate) struct TickPolicy {
     /// `ticks[idx]` is the node's insertion tick while it is `Real`, `None`
     /// once removed (so a recycled slot is re-ticked on its next insert).
     ticks: Vec<Option<u64>>,
-    /// Currently-evictable leaves, ordered by `(tick, slot)`. Ticks are
-    /// unique per node, so `slot` only keeps the key `Ord` total — it never
-    /// actually breaks a tie.
-    queue: BTreeMap<(u64, u32), ()>,
+    /// Currently-evictable leaf slot ids in a binary min-heap.
+    heap: Vec<u32>,
+    /// `positions[idx]` is the current heap offset while `idx` is a leaf.
+    /// Indexed removal avoids lazy duplicate heap entries when a node toggles
+    /// leaf/interior state repeatedly.
+    positions: Vec<Option<usize>>,
     next_tick: u64,
 }
 
@@ -212,7 +211,8 @@ impl TickPolicy {
     fn with_capacity(capacity: usize) -> Self {
         Self {
             ticks: Vec::with_capacity(capacity.min(65_536)),
-            queue: BTreeMap::new(),
+            heap: Vec::with_capacity(capacity.min(65_536)),
+            positions: Vec::with_capacity(capacity.min(65_536)),
             next_tick: 0,
         }
     }
@@ -220,6 +220,71 @@ impl TickPolicy {
     fn ensure(&mut self, idx: u32) {
         if idx as usize >= self.ticks.len() {
             self.ticks.resize(idx as usize + 1, None);
+            self.positions.resize(idx as usize + 1, None);
+        }
+    }
+
+    #[inline]
+    fn key(&self, idx: u32) -> (u64, u32) {
+        (
+            self.ticks[idx as usize].expect("TickPolicy: heap slot without insertion tick"),
+            idx,
+        )
+    }
+
+    fn swap_heap(&mut self, left: usize, right: usize) {
+        self.heap.swap(left, right);
+        self.positions[self.heap[left] as usize] = Some(left);
+        self.positions[self.heap[right] as usize] = Some(right);
+    }
+
+    fn sift_up(&mut self, mut position: usize) {
+        while position > 0 {
+            let parent = (position - 1) / 2;
+            if self.key(self.heap[parent]) <= self.key(self.heap[position]) {
+                break;
+            }
+            self.swap_heap(parent, position);
+            position = parent;
+        }
+    }
+
+    fn sift_down(&mut self, mut position: usize) {
+        loop {
+            let left = position.saturating_mul(2).saturating_add(1);
+            if left >= self.heap.len() {
+                break;
+            }
+            let right = left + 1;
+            let child = if right < self.heap.len()
+                && self.key(self.heap[right]) < self.key(self.heap[left])
+            {
+                right
+            } else {
+                left
+            };
+            if self.key(self.heap[position]) <= self.key(self.heap[child]) {
+                break;
+            }
+            self.swap_heap(position, child);
+            position = child;
+        }
+    }
+
+    fn remove_leaf(&mut self, idx: u32) {
+        let Some(position) = self.positions.get_mut(idx as usize).and_then(Option::take) else {
+            return;
+        };
+        let last = self.heap.pop().expect("TickPolicy: indexed heap underflow");
+        if position == self.heap.len() {
+            return;
+        }
+        self.heap[position] = last;
+        self.positions[last as usize] = Some(position);
+        if position > 0 && self.key(self.heap[position]) < self.key(self.heap[(position - 1) / 2]) {
+            self.sift_up(position);
+        } else {
+            self.sift_down(position);
         }
     }
 
@@ -231,29 +296,35 @@ impl TickPolicy {
     }
 
     fn on_leaf_added(&mut self, idx: u32) {
-        let tick =
-            self.ticks[idx as usize].expect("TickPolicy: on_leaf_added before on_node_inserted");
-        self.queue.insert((tick, idx), ());
+        assert!(
+            self.ticks[idx as usize].is_some(),
+            "TickPolicy: on_leaf_added before on_node_inserted"
+        );
+        debug_assert!(
+            self.positions[idx as usize].is_none(),
+            "TickPolicy: leaf {idx} added while already present"
+        );
+        let position = self.heap.len();
+        self.heap.push(idx);
+        self.positions[idx as usize] = Some(position);
+        self.sift_up(position);
     }
 
     fn on_leaf_demoted(&mut self, idx: u32) {
         // Leave `ticks[idx]` set — a later re-leafing restores this exact
         // `(tick, idx)` key, putting the node back in its original spot.
-        if let Some(tick) = self.ticks[idx as usize] {
-            self.queue.remove(&(tick, idx));
-        }
+        self.remove_leaf(idx);
     }
 
     fn on_node_removed(&mut self, idx: u32) {
         // `take()` clears the tick; the `queue.remove` is a no-op for an
         // interior node that was demoted before being removed.
-        if let Some(tick) = self.ticks[idx as usize].take() {
-            self.queue.remove(&(tick, idx));
-        }
+        self.remove_leaf(idx);
+        self.ticks[idx as usize] = None;
     }
 
     fn next_victim(&self) -> Option<u32> {
-        self.queue.first_key_value().map(|(&(_, idx), _)| idx)
+        self.heap.first().copied()
     }
 }
 

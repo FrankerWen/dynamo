@@ -679,6 +679,8 @@ struct MockEngineArgsSerde {
     kv_transfer_timing_mode: OptionalConfigValue<String>,
     num_g2_blocks: OptionalConfigValue<usize>,
     g2_capacity_bytes: OptionalConfigValue<usize>,
+    g2_slot_mode: OptionalConfigValue<String>,
+    offline_kvbm_backend: OptionalConfigValue<String>,
     g2_fabric_id: OptionalConfigValue<String>,
     g2_rank_resource_configs: OptionalConfigValue<Vec<G2RankResourceConfig>>,
     num_g3_blocks: OptionalConfigValue<usize>,
@@ -994,6 +996,17 @@ pub struct MockEngineArgs {
     #[validate(range(min = 1))]
     pub g2_capacity_bytes: Option<usize>,
 
+    /// G2 logical-slot derivation: `capped_dense` (legacy 2M cap),
+    /// `raw_derived_dense` (diagnostic only), or `sparse_byte_native`.
+    #[builder(default = "\"capped_dense\".to_string()")]
+    pub g2_slot_mode: String,
+
+    /// Offline G2 metadata backend. `reference` preserves the generic KVBM
+    /// layout; `compact` lazily materializes dense slot ids and uses sparse
+    /// hash indexes so memory follows resident/pending state.
+    #[builder(default = "\"reference\".to_string()")]
+    pub offline_kvbm_backend: String,
+
     /// Physical host-memory fabric shared by scheduler ranks. Ranks with the
     /// same non-empty id contend on one pair of G1<->G2 directional
     /// processor-sharing queues. `None` preserves the legacy rank-local
@@ -1204,6 +1217,38 @@ fn validate_mock_engine_args(args: &MockEngineArgs) -> Result<(), ValidationErro
             "native_g1_legacy_offload_conflict",
             "g1_backend=native cannot be combined with KVBM G2/G3/G4 offload; omit g1_backend to select KVBM automatically or set g1_backend=kvbm explicitly"
                 .to_string(),
+        ));
+    }
+
+    if !matches!(
+        args.g2_slot_mode.as_str(),
+        "capped_dense" | "raw_derived_dense" | "sparse_byte_native"
+    ) {
+        return Err(mock_engine_args_validation_error(
+            "invalid_g2_slot_mode",
+            format!("unsupported g2_slot_mode={:?}", args.g2_slot_mode),
+        ));
+    }
+    if !matches!(
+        args.offline_kvbm_backend.as_str(),
+        "reference" | "compact_g2_only" | "compact"
+    ) {
+        return Err(mock_engine_args_validation_error(
+            "invalid_offline_kvbm_backend",
+            format!(
+                "unsupported offline_kvbm_backend={:?}",
+                args.offline_kvbm_backend
+            ),
+        ));
+    }
+    if matches!(
+        args.offline_kvbm_backend.as_str(),
+        "compact_g2_only" | "compact"
+    ) && args.g2_slot_mode != "sparse_byte_native"
+    {
+        return Err(mock_engine_args_validation_error(
+            "compact_backend_requires_sparse_g2",
+            "compact G2 backend requires g2_slot_mode=sparse_byte_native".to_string(),
         ));
     }
 
@@ -1639,6 +1684,15 @@ impl TryFrom<MockEngineArgsSerde> for MockEngineArgs {
         if let Some(g2_capacity_bytes) = compat.g2_capacity_bytes.into_nullable() {
             builder = builder.g2_capacity_bytes(g2_capacity_bytes);
         }
+        if let Some(g2_slot_mode) = compat.g2_slot_mode.into_non_null("g2_slot_mode")? {
+            builder = builder.g2_slot_mode(g2_slot_mode);
+        }
+        if let Some(offline_kvbm_backend) = compat
+            .offline_kvbm_backend
+            .into_non_null("offline_kvbm_backend")?
+        {
+            builder = builder.offline_kvbm_backend(offline_kvbm_backend);
+        }
         if let Some(g2_fabric_id) = compat.g2_fabric_id.into_nullable() {
             builder = builder.g2_fabric_id(g2_fabric_id);
         }
@@ -1808,6 +1862,8 @@ impl MockEngineArgs {
         if let Some(fabric_id) = self.g2_fabric_id.as_mut() {
             *fabric_id = fabric_id.trim().to_string();
         }
+        self.g2_slot_mode = self.g2_slot_mode.trim().to_ascii_lowercase();
+        self.offline_kvbm_backend = self.offline_kvbm_backend.trim().to_ascii_lowercase();
         if let Some(configs) = self.g2_rank_resource_configs.as_mut() {
             for config in configs {
                 config.g2_fabric_id = config.g2_fabric_id.trim().to_string();
@@ -1895,7 +1951,11 @@ impl MockEngineArgs {
         let max_slots = crate::kvbm_offload::config::DEFAULT_MAX_DERIVED_G2_SLOTS;
         #[cfg(not(feature = "kvbm-offload"))]
         let max_slots = 2_000_000;
-        let slots = raw_slots.min(max_slots);
+        let slots = match args.g2_slot_mode.as_str() {
+            "capped_dense" => raw_slots.min(max_slots),
+            "raw_derived_dense" | "sparse_byte_native" => raw_slots,
+            other => anyhow::bail!("unsupported g2_slot_mode={other:?}"),
+        };
         args.num_g2_blocks = Some(slots);
         args.normalized()
     }

@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 
+use super::session_affinity::SessionAffinityState;
 use anyhow::{Result, anyhow};
 use rustc_hash::FxHashMap;
 use uuid::Uuid;
@@ -24,10 +25,16 @@ pub(in crate::replay::offline) struct AggregatedRoundRobin {
 pub(in crate::replay) struct AggregatedRoundRobinPlacement<Events: EngineEventBatch> {
     counter: AggregatedRoundRobin,
     workers: BTreeMap<usize, Vec<usize>>,
+    affinity: Option<SessionAffinityState>,
     events: PhantomData<Events>,
 }
 
 impl<Events: EngineEventBatch> AggregatedRoundRobinPlacement<Events> {
+    #[cfg(test)]
+    pub(in crate::replay::offline) fn has_session_affinity(&self) -> bool {
+        self.affinity.is_some()
+    }
+
     pub(in crate::replay) fn new(dp_size: u32, workers: Vec<WorkerTopology>) -> Self {
         let mut counter = AggregatedRoundRobin::new(dp_size);
         for worker in &workers {
@@ -39,8 +46,23 @@ impl<Events: EngineEventBatch> AggregatedRoundRobinPlacement<Events> {
                 .into_iter()
                 .map(|worker| (worker.worker_id, worker.scheduler_ids))
                 .collect(),
+            affinity: None,
             events: PhantomData,
         }
+    }
+
+    pub(in crate::replay::offline) fn configure_session_affinity(
+        &mut self,
+        ttl_secs: u64,
+        ranks_per_endpoint: u32,
+        seed: u64,
+    ) -> Result<()> {
+        self.affinity = Some(SessionAffinityState::new(
+            ttl_secs,
+            ranks_per_endpoint,
+            seed,
+        )?);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -62,20 +84,23 @@ where
         &mut self,
         request: &Request,
         _metadata: Self::Metadata,
-        _session_id: Option<String>,
-        _now_ms: f64,
+        session_id: Option<String>,
+        now_ms: f64,
     ) -> Result<PlacementEffects> {
         let request_id = request
             .request_id()
             .ok_or_else(|| anyhow!("round-robin placement requires a request UUID"))?;
-        let scheduler_id = self
-            .counter
-            .next(self.workers.keys().copied(), |worker_id, rank| {
-                self.workers
-                    .get(&worker_id)
-                    .and_then(|ranks| ranks.get(rank as usize))
-                    .copied()
-            });
+        let scheduler_id = if let Some(affinity) = self.affinity.as_mut() {
+            affinity.select(request_id, session_id.as_deref(), now_ms, &self.workers)?
+        } else {
+            self.counter
+                .next(self.workers.keys().copied(), |worker_id, rank| {
+                    self.workers
+                        .get(&worker_id)
+                        .and_then(|ranks| ranks.get(rank as usize))
+                        .copied()
+                })
+        };
         Ok(PlacementEffects {
             decision: PlacementDecision::Immediate(Placement {
                 request_id,
@@ -98,7 +123,10 @@ where
     }
 
     #[inline]
-    fn request_terminal(&mut self, _request_id: Uuid, _now_ms: f64) -> Result<Vec<Placement>> {
+    fn request_terminal(&mut self, request_id: Uuid, now_ms: f64) -> Result<Vec<Placement>> {
+        if let Some(affinity) = self.affinity.as_mut() {
+            affinity.complete(request_id, now_ms);
+        }
         Ok(Vec::new())
     }
 
@@ -138,10 +166,15 @@ where
 pub(in crate::replay) struct PoolRoundRobinPlacement<Events: EngineEventBatch> {
     next: usize,
     workers: BTreeMap<usize, Vec<usize>>,
+    affinity: Option<SessionAffinityState>,
     events: PhantomData<Events>,
 }
 
 impl<Events: EngineEventBatch> PoolRoundRobinPlacement<Events> {
+    pub(in crate::replay::offline) fn has_session_affinity(&self) -> bool {
+        self.affinity.is_some()
+    }
+
     pub(in crate::replay) fn new(workers: Vec<WorkerTopology>) -> Self {
         Self {
             next: 0,
@@ -149,8 +182,23 @@ impl<Events: EngineEventBatch> PoolRoundRobinPlacement<Events> {
                 .into_iter()
                 .map(|worker| (worker.worker_id, worker.scheduler_ids))
                 .collect(),
+            affinity: None,
             events: PhantomData,
         }
+    }
+
+    pub(in crate::replay::offline) fn configure_session_affinity(
+        &mut self,
+        ttl_secs: u64,
+        ranks_per_endpoint: u32,
+        seed: u64,
+    ) -> Result<()> {
+        self.affinity = Some(SessionAffinityState::new(
+            ttl_secs,
+            ranks_per_endpoint,
+            seed,
+        )?);
+        Ok(())
     }
 }
 
@@ -166,21 +214,26 @@ where
         &mut self,
         request: &Request,
         _metadata: Self::Metadata,
-        _session_id: Option<String>,
-        _now_ms: f64,
+        session_id: Option<String>,
+        now_ms: f64,
     ) -> Result<PlacementEffects> {
         let request_id = request
             .request_id()
             .ok_or_else(|| anyhow!("round-robin placement requires a request UUID"))?;
-        let active_count = self.workers.values().map(Vec::len).sum::<usize>();
-        let index = self.next % active_count;
-        let scheduler_id = self
-            .workers
-            .values()
-            .flat_map(|ranks| ranks.iter().copied())
-            .nth(index)
-            .expect("active round-robin pool must contain a scheduler");
-        self.next = index + 1;
+        let scheduler_id = if let Some(affinity) = self.affinity.as_mut() {
+            affinity.select(request_id, session_id.as_deref(), now_ms, &self.workers)?
+        } else {
+            let active_count = self.workers.values().map(Vec::len).sum::<usize>();
+            let index = self.next % active_count;
+            let scheduler_id = self
+                .workers
+                .values()
+                .flat_map(|ranks| ranks.iter().copied())
+                .nth(index)
+                .expect("active round-robin pool must contain a scheduler");
+            self.next = index + 1;
+            scheduler_id
+        };
         Ok(PlacementEffects {
             decision: PlacementDecision::Immediate(Placement {
                 request_id,
@@ -200,7 +253,10 @@ where
         false
     }
 
-    fn request_terminal(&mut self, _request_id: Uuid, _now_ms: f64) -> Result<Vec<Placement>> {
+    fn request_terminal(&mut self, request_id: Uuid, now_ms: f64) -> Result<Vec<Placement>> {
+        if let Some(affinity) = self.affinity.as_mut() {
+            affinity.complete(request_id, now_ms);
+        }
         Ok(Vec::new())
     }
 

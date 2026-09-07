@@ -3,7 +3,6 @@
 
 use std::borrow::Borrow;
 use std::collections::HashMap;
-#[cfg(any(test, feature = "bench"))]
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -19,7 +18,6 @@ use crate::scheduling::config::KvRouterConfig;
 use crate::scheduling::filter::RoutingEligibility;
 use crate::scheduling::types::{KvSchedulerError, SchedulingRequest, WorkerSelectionPolicyError};
 
-#[cfg(any(test, feature = "bench"))]
 fn softmax_sample_entries<T: Copy>(
     entries: Vec<(T, f64)>,
     temperature: f64,
@@ -105,7 +103,6 @@ pub(super) struct DefaultWorkerPicker {
     default_temperature: f64,
     // Preserve DefaultWorkerSelector's Sync contract. Zero-temperature selection never locks.
     softmax_scratch: Mutex<DefaultSoftmaxScratch>,
-    #[cfg(any(test, feature = "bench"))]
     deterministic_rng: Option<Arc<Mutex<fastrand::Rng>>>,
 }
 
@@ -127,12 +124,10 @@ impl std::fmt::Debug for DefaultWorkerSelector {
 
 impl Clone for DefaultWorkerSelector {
     fn clone(&self) -> Self {
-        #[cfg(any(test, feature = "bench"))]
         let deterministic_rng = self.picker.deterministic_rng.clone();
         Self::from_parts(
             self.kv_router_config.clone(),
             self.worker_type,
-            #[cfg(any(test, feature = "bench"))]
             deterministic_rng,
         )
     }
@@ -140,15 +135,13 @@ impl Clone for DefaultWorkerSelector {
 
 impl DefaultWorkerSelector {
     pub fn new(kv_router_config: Option<KvRouterConfig>, worker_type: &'static str) -> Self {
-        Self::from_parts(
-            kv_router_config.unwrap_or_default(),
-            worker_type,
-            #[cfg(any(test, feature = "bench"))]
-            None,
-        )
+        Self::from_parts(kv_router_config.unwrap_or_default(), worker_type, None)
     }
 
-    #[cfg(any(test, feature = "bench"))]
+    /// Construct a selector backed by a private deterministic RNG.
+    ///
+    /// This is intended for repeatable offline simulation. Live routing should use
+    /// [`Self::new`] so equal-cost workers continue to be balanced randomly.
     pub fn new_seeded(
         kv_router_config: Option<KvRouterConfig>,
         worker_type: &'static str,
@@ -164,13 +157,10 @@ impl DefaultWorkerSelector {
     fn from_parts(
         kv_router_config: KvRouterConfig,
         worker_type: &'static str,
-        #[cfg(any(test, feature = "bench"))] deterministic_rng: Option<Arc<Mutex<fastrand::Rng>>>,
+        deterministic_rng: Option<Arc<Mutex<fastrand::Rng>>>,
     ) -> Self {
-        let picker = DefaultWorkerPicker::from_parts(
-            kv_router_config.router_temperature,
-            #[cfg(any(test, feature = "bench"))]
-            deterministic_rng,
-        );
+        let picker =
+            DefaultWorkerPicker::from_parts(kv_router_config.router_temperature, deterministic_rng);
         Self {
             kv_router_config,
             worker_type,
@@ -343,11 +333,7 @@ impl<C: Borrow<KvRouterConfig>> DefaultWorkerScorer<C> {
 
 impl DefaultWorkerPicker {
     pub(super) fn new(default_temperature: f64) -> Self {
-        Self::from_parts(
-            default_temperature,
-            #[cfg(any(test, feature = "bench"))]
-            None,
-        )
+        Self::from_parts(default_temperature, None)
     }
 }
 
@@ -430,7 +416,6 @@ pub(super) fn pick_default_worker<C: WorkerConfigLike>(
         )
     };
 
-    #[cfg(any(test, feature = "bench"))]
     if let Some(rng) = &picker.deterministic_rng {
         let mut candidates = Vec::new();
         eligibility.for_each_eligible_worker_rank(workers, |worker, _| candidates.push(worker));
@@ -514,12 +499,11 @@ pub(super) fn pick_default_worker<C: WorkerConfigLike>(
 impl DefaultWorkerPicker {
     fn from_parts(
         default_temperature: f64,
-        #[cfg(any(test, feature = "bench"))] deterministic_rng: Option<Arc<Mutex<fastrand::Rng>>>,
+        deterministic_rng: Option<Arc<Mutex<fastrand::Rng>>>,
     ) -> Self {
         Self {
             default_temperature,
             softmax_scratch: Mutex::default(),
-            #[cfg(any(test, feature = "bench"))]
             deterministic_rng,
         }
     }
@@ -535,7 +519,6 @@ impl WorkerPicker for DefaultWorkerPicker {
         let temperature = context
             .router_temperature_override
             .unwrap_or(self.default_temperature);
-        #[cfg(any(test, feature = "bench"))]
         if let Some(rng) = &self.deterministic_rng {
             let mut rng = rng.lock();
             if temperature == 0.0 {

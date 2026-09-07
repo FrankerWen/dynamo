@@ -58,6 +58,10 @@ impl ReplayWorkerCore {
         self.core.is_empty()
     }
 
+    pub(crate) fn is_drained(&self) -> bool {
+        self.core.is_drained()
+    }
+
     pub(crate) fn receive(
         &mut self,
         request: crate::common::protocols::DirectRequest,
@@ -67,6 +71,10 @@ impl ReplayWorkerCore {
 
     pub(crate) fn num_requests(&self) -> usize {
         self.core.num_requests()
+    }
+
+    pub(crate) fn release_arena_for_replay(&mut self) -> Option<kvbm_logical::ArenaReleaseReport> {
+        self.core.release_arena_for_replay()
     }
 
     pub(crate) fn execute_pass(

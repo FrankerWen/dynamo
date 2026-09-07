@@ -3,7 +3,6 @@
 
 //! Destination-capacity reservation helpers for mock offload pipelines.
 
-use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -15,6 +14,7 @@ use kvbm_engine::offload::{
 };
 use kvbm_logical::blocks::BlockMetadata;
 use kvbm_logical::manager::BlockManager;
+use rustc_hash::FxHashMap;
 
 /// Shared destination-capacity reservations for lower-tier pipelines.
 ///
@@ -25,17 +25,28 @@ use kvbm_logical::manager::BlockManager;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ByteCapacityMetrics {
     pub capacity_bytes: usize,
+    pub logical_slot_capacity: usize,
     pub reserved_bytes: usize,
     pub occupied_bytes: usize,
     pub peak_committed_bytes: usize,
+    pub reserved_blocks: usize,
+    pub occupied_blocks: usize,
+    pub peak_committed_blocks: usize,
     pub admission_rejections: u64,
+    pub slot_admission_rejections: u64,
+    pub byte_admission_rejections: u64,
 }
 
 #[derive(Debug)]
 struct ByteCapacityState {
     profile: Arc<[usize]>,
-    pending: HashMap<SequenceHash, usize>,
-    occupied: HashMap<SequenceHash, usize>,
+    hash_to_id: FxHashMap<SequenceHash, u32>,
+    hashes: Vec<Option<SequenceHash>>,
+    bytes: Vec<usize>,
+    generation: Vec<u32>,
+    occupancy: Vec<u8>, // 0=free, 1=pending, 2=occupied
+    free_ids: Vec<u32>,
+    enforce_logical_slots: bool,
     metrics: ByteCapacityMetrics,
 }
 
@@ -55,7 +66,17 @@ impl Default for CapacityReservations {
 }
 
 impl CapacityReservations {
+    #[cfg(test)]
     pub(crate) fn with_byte_capacity(capacity_bytes: usize, profile: Arc<[usize]>) -> Self {
+        Self::with_byte_capacity_mode(capacity_bytes, profile, usize::MAX, false)
+    }
+
+    pub(crate) fn with_byte_capacity_mode(
+        capacity_bytes: usize,
+        profile: Arc<[usize]>,
+        logical_slot_capacity: usize,
+        enforce_logical_slots: bool,
+    ) -> Self {
         assert!(capacity_bytes > 0, "G2 byte capacity must be positive");
         assert!(
             !profile.is_empty() && !profile.contains(&0),
@@ -65,10 +86,16 @@ impl CapacityReservations {
             reserved_blocks: AtomicUsize::new(0),
             byte_state: Some(Mutex::new(ByteCapacityState {
                 profile,
-                pending: HashMap::new(),
-                occupied: HashMap::new(),
+                hash_to_id: FxHashMap::default(),
+                hashes: Vec::new(),
+                bytes: Vec::new(),
+                generation: Vec::new(),
+                occupancy: Vec::new(),
+                free_ids: Vec::new(),
+                enforce_logical_slots,
                 metrics: ByteCapacityMetrics {
                     capacity_bytes,
+                    logical_slot_capacity,
                     ..ByteCapacityMetrics::default()
                 },
             })),
@@ -94,6 +121,41 @@ impl CapacityReservations {
 
     fn bytes_for_hash(state: &ByteCapacityState, hash: &SequenceHash) -> Option<usize> {
         state.profile.get(hash.position() as usize).copied()
+    }
+
+    fn insert_dense(state: &mut ByteCapacityState, hash: SequenceHash, bytes: usize, kind: u8) {
+        let id = state.free_ids.pop().unwrap_or_else(|| {
+            let id =
+                u32::try_from(state.hashes.len()).expect("compact G2 dense hash id exhausted u32");
+            state.hashes.push(None);
+            state.bytes.push(0);
+            state.generation.push(0);
+            state.occupancy.push(0);
+            id
+        });
+        let index = id as usize;
+        state.hashes[index] = Some(hash);
+        state.bytes[index] = bytes;
+        state.generation[index] = state.generation[index].wrapping_add(1).max(1);
+        state.occupancy[index] = kind;
+        state.hash_to_id.insert(hash, id);
+    }
+
+    fn remove_dense(
+        state: &mut ByteCapacityState,
+        hash: SequenceHash,
+        expected: u8,
+    ) -> Option<usize> {
+        let id = state.hash_to_id.get(&hash).copied()?;
+        let index = id as usize;
+        if state.occupancy[index] != expected {
+            return None;
+        }
+        state.hash_to_id.remove(&hash);
+        state.hashes[index] = None;
+        state.occupancy[index] = 0;
+        state.free_ids.push(id);
+        Some(state.bytes[index])
     }
 
     /// Reserve destination slots and physical bytes for a deterministic
@@ -129,29 +191,48 @@ impl CapacityReservations {
                 prefix_open = false;
                 continue;
             };
-            let duplicate = state.pending.contains_key(hash) || state.occupied.contains_key(hash);
+            let duplicate = state.hash_to_id.contains_key(hash);
             let committed = state
                 .metrics
                 .reserved_bytes
                 .saturating_add(state.metrics.occupied_bytes);
-            let fits_slots = reserved_blocks < available_blocks;
+            let committed_blocks = state
+                .metrics
+                .reserved_blocks
+                .saturating_add(state.metrics.occupied_blocks);
+            let fits_slots = !state.enforce_logical_slots
+                || (reserved_blocks < available_blocks
+                    && committed_blocks < state.metrics.logical_slot_capacity);
             let fits_bytes = committed
                 .checked_add(bytes)
                 .is_some_and(|next| next <= state.metrics.capacity_bytes);
             if prefix_open && !duplicate && fits_slots && fits_bytes {
-                state.pending.insert(*hash, bytes);
+                Self::insert_dense(&mut state, *hash, bytes, 1);
                 state.metrics.reserved_bytes = state.metrics.reserved_bytes.saturating_add(bytes);
+                state.metrics.reserved_blocks = state.metrics.reserved_blocks.saturating_add(1);
                 let committed = state
                     .metrics
                     .reserved_bytes
                     .saturating_add(state.metrics.occupied_bytes);
                 state.metrics.peak_committed_bytes =
                     state.metrics.peak_committed_bytes.max(committed);
+                state.metrics.peak_committed_blocks = state
+                    .metrics
+                    .peak_committed_blocks
+                    .max(committed_blocks.saturating_add(1));
                 reserved_blocks += 1;
                 results.push(true);
             } else {
                 state.metrics.admission_rejections =
                     state.metrics.admission_rejections.saturating_add(1);
+                if !fits_slots {
+                    state.metrics.slot_admission_rejections =
+                        state.metrics.slot_admission_rejections.saturating_add(1);
+                }
+                if !fits_bytes {
+                    state.metrics.byte_admission_rejections =
+                        state.metrics.byte_admission_rejections.saturating_add(1);
+                }
                 results.push(false);
                 prefix_open = false;
             }
@@ -162,39 +243,62 @@ impl CapacityReservations {
     }
 
     /// Move a completed reservation into byte-accounted resident G2 state.
+    #[cfg(test)]
     pub(crate) fn mark_published(&self, hash: SequenceHash) {
-        let Some(byte_state) = self.byte_state.as_ref() else {
-            return;
-        };
-        let mut state = byte_state
-            .lock()
-            .expect("byte capacity reservation mutex poisoned");
-        if state.occupied.contains_key(&hash) {
-            return;
-        }
-        let bytes = state
-            .pending
-            .remove(&hash)
-            .or_else(|| Self::bytes_for_hash(&state, &hash))
-            .expect("published G2 block position must exist in AIC footprint");
-        state.metrics.reserved_bytes = state.metrics.reserved_bytes.saturating_sub(bytes);
-        state.metrics.occupied_bytes = state.metrics.occupied_bytes.saturating_add(bytes);
-        state.occupied.insert(hash, bytes);
-        assert!(
-            state.metrics.occupied_bytes <= state.metrics.capacity_bytes,
-            "published G2 byte occupancy exceeded configured capacity"
-        );
+        self.apply_lifecycle_batch(&[(hash, true)]);
     }
 
+    #[cfg(test)]
     pub(crate) fn mark_removed(&self, hash: SequenceHash) {
+        self.apply_lifecycle_batch(&[(hash, false)]);
+    }
+
+    /// Apply one completion wave under a single lock. The boolean is true for
+    /// publish and false for remove; caller order is retained.
+    #[cfg(test)]
+    pub(crate) fn apply_lifecycle_batch(&self, events: &[(SequenceHash, bool)]) {
+        self.apply_lifecycle_events(events.iter().copied());
+    }
+
+    /// Apply a completion wave from any ordered iterator without materializing
+    /// a temporary `(hash, published)` vector at the caller.
+    pub(crate) fn apply_lifecycle_events<I>(&self, events: I)
+    where
+        I: IntoIterator<Item = (SequenceHash, bool)>,
+    {
         let Some(byte_state) = self.byte_state.as_ref() else {
             return;
         };
         let mut state = byte_state
             .lock()
             .expect("byte capacity reservation mutex poisoned");
-        if let Some(bytes) = state.occupied.remove(&hash) {
-            state.metrics.occupied_bytes = state.metrics.occupied_bytes.saturating_sub(bytes);
+        for (hash, published) in events {
+            if published {
+                let Some(id) = state.hash_to_id.get(&hash).copied() else {
+                    continue;
+                };
+                let index = id as usize;
+                if state.occupancy[index] == 2 {
+                    continue;
+                }
+                assert_eq!(
+                    state.occupancy[index], 1,
+                    "published G2 block was not pending"
+                );
+                let bytes = state.bytes[index];
+                state.occupancy[index] = 2;
+                state.metrics.reserved_bytes = state.metrics.reserved_bytes.saturating_sub(bytes);
+                state.metrics.occupied_bytes = state.metrics.occupied_bytes.saturating_add(bytes);
+                state.metrics.reserved_blocks = state.metrics.reserved_blocks.saturating_sub(1);
+                state.metrics.occupied_blocks = state.metrics.occupied_blocks.saturating_add(1);
+                assert!(
+                    state.metrics.occupied_bytes <= state.metrics.capacity_bytes,
+                    "published G2 byte occupancy exceeded configured capacity"
+                );
+            } else if let Some(bytes) = Self::remove_dense(&mut state, hash, 2) {
+                state.metrics.occupied_bytes = state.metrics.occupied_bytes.saturating_sub(bytes);
+                state.metrics.occupied_blocks = state.metrics.occupied_blocks.saturating_sub(1);
+            }
         }
     }
 
@@ -206,8 +310,9 @@ impl CapacityReservations {
             .lock()
             .expect("byte capacity reservation mutex poisoned");
         for hash in hashes {
-            if let Some(bytes) = state.pending.remove(hash) {
+            if let Some(bytes) = Self::remove_dense(&mut state, *hash, 1) {
                 state.metrics.reserved_bytes = state.metrics.reserved_bytes.saturating_sub(bytes);
+                state.metrics.reserved_blocks = state.metrics.reserved_blocks.saturating_sub(1);
             }
         }
     }
@@ -456,10 +561,14 @@ mod tests {
             reservations.byte_metrics(),
             Some(ByteCapacityMetrics {
                 capacity_bytes: 5,
+                logical_slot_capacity: usize::MAX,
                 reserved_bytes: 2,
                 occupied_bytes: 0,
                 peak_committed_bytes: 2,
+                reserved_blocks: 1,
+                peak_committed_blocks: 1,
                 admission_rejections: 0,
+                ..ByteCapacityMetrics::default()
             })
         );
 
@@ -479,6 +588,49 @@ mod tests {
         assert_eq!(metrics.reserved_bytes, 0);
         assert_eq!(metrics.occupied_bytes, 0);
         assert_eq!(reservations.reserved_blocks(), 0);
+    }
+
+    #[test]
+    fn sparse_byte_native_ignores_dense_available_slots_but_not_bytes() {
+        let reservations = CapacityReservations::with_byte_capacity_mode(
+            5,
+            Arc::from(vec![2usize, 3usize, 4usize]),
+            2,
+            false,
+        );
+        let first = PositionalLineageHash::new(10, None, 0);
+        let second = PositionalLineageHash::new(11, Some(10), 1);
+        let third = PositionalLineageHash::new(12, Some(11), 2);
+
+        assert_eq!(
+            reservations.try_reserve_hashes(0, &[first, second]),
+            vec![true, true]
+        );
+        assert_eq!(reservations.try_reserve_hashes(0, &[third]), vec![false]);
+        let metrics = reservations.byte_metrics().unwrap();
+        assert_eq!(metrics.slot_admission_rejections, 0);
+        assert_eq!(metrics.byte_admission_rejections, 1);
+        assert_eq!(metrics.peak_committed_blocks, 2);
+        assert_eq!(metrics.peak_committed_bytes, 5);
+    }
+
+    #[test]
+    fn capped_dense_reports_slot_limited_rejection_separately() {
+        let reservations = CapacityReservations::with_byte_capacity_mode(
+            100,
+            Arc::from(vec![2usize, 3usize]),
+            1,
+            true,
+        );
+        let first = PositionalLineageHash::new(10, None, 0);
+        let second = PositionalLineageHash::new(11, Some(10), 1);
+        assert_eq!(
+            reservations.try_reserve_hashes(1, &[first, second]),
+            vec![true, false]
+        );
+        let metrics = reservations.byte_metrics().unwrap();
+        assert_eq!(metrics.slot_admission_rejections, 1);
+        assert_eq!(metrics.byte_admission_rejections, 0);
     }
 
     #[test]

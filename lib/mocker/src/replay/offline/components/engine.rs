@@ -207,6 +207,16 @@ where
         self.capture_raw = capture_raw;
     }
 
+    pub(in crate::replay::offline) fn release_arena_for_replay(
+        &mut self,
+    ) -> Vec<kvbm_logical::ArenaReleaseReport> {
+        self.workers
+            .iter_mut()
+            .filter_map(Option::as_mut)
+            .filter_map(OfflineWorkerState::release_arena_for_replay)
+            .collect()
+    }
+
     fn worker(&self, rank_id: usize) -> Option<&OfflineWorkerState> {
         self.workers.get(rank_id)?.as_ref()
     }
@@ -1781,15 +1791,25 @@ mod tests {
             .update_worker(0, OfflineWorkerState::mark_busy)
             .unwrap();
         assert_eq!(engine.earliest_offload_deadline(), Some(deadline));
+        assert_eq!(
+            engine.offload_resource_snapshots()[0]
+                .2
+                .transfers
+                .g1_to_g2
+                .completed_transfers,
+            0
+        );
         let transport = engine.tick_offload_engines(deadline);
         assert!(transport.lifecycle_events.is_empty());
-        assert!(
-            transport
-                .engine_events
-                .0
-                .iter()
-                .any(|event| event.storage_tier == StorageTier::HostPinned)
-        );
+        // Offline replay intentionally drops HostPinned router objects. The
+        // completed DMA and released deadline prove transport progress while
+        // the destination must still wait for the GPU completion boundary.
+        let snapshots = engine.offload_resource_snapshots();
+        let transfer = snapshots[0].2.transfers.g1_to_g2;
+        assert_eq!(transfer.completed_transfers, 1);
+        assert_eq!(transfer.blocks, 1);
+        assert_eq!(transfer.bytes, 20_000_000);
+        assert_eq!(engine.earliest_offload_deadline(), None);
 
         let boundary = engine.on_scheduled_completion(completion).unwrap();
         assert!(boundary.lifecycle_events.iter().any(|event| matches!(

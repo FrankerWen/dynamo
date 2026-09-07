@@ -47,7 +47,7 @@ fn finish_with_replay_wall_time(
 fn use_single_runtime(num_workers: usize, dp_size: u32, router_mode: ReplayRouterMode) -> bool {
     // dp_size>1 needs one scheduler/KV pool per rank. They still share one
     // discrete-event runtime, but require the rank-aware AggRuntime path.
-    num_workers == 1 && dp_size <= 1 && router_mode != ReplayRouterMode::KvRouter
+    num_workers == 1 && dp_size <= 1 && router_mode == ReplayRouterMode::RoundRobin
 }
 
 fn offload_evidence_requested(args: &MockEngineArgs) -> bool {
@@ -65,11 +65,13 @@ fn trace_workload_driver(
     accumulate_session_deltas: bool,
 ) -> Result<WorkloadDriver> {
     match router_mode {
-        ReplayRouterMode::RoundRobin => WorkloadDriver::new_trace_without_replay_hashes(
-            trace,
-            engine_block_size,
-            accumulate_session_deltas,
-        ),
+        ReplayRouterMode::RoundRobin | ReplayRouterMode::SessionAffinity { .. } => {
+            WorkloadDriver::new_trace_without_replay_hashes(
+                trace,
+                engine_block_size,
+                accumulate_session_deltas,
+            )
+        }
         ReplayRouterMode::KvRouter if accumulate_session_deltas => {
             trace.into_delta_accumulating_trace_driver_with_block_size(engine_block_size)
         }
@@ -85,12 +87,14 @@ fn concurrency_workload_driver(
     accumulate_session_deltas: bool,
 ) -> Result<WorkloadDriver> {
     match router_mode {
-        ReplayRouterMode::RoundRobin => WorkloadDriver::new_concurrency_without_replay_hashes(
-            trace,
-            engine_block_size,
-            max_in_flight,
-            accumulate_session_deltas,
-        ),
+        ReplayRouterMode::RoundRobin | ReplayRouterMode::SessionAffinity { .. } => {
+            WorkloadDriver::new_concurrency_without_replay_hashes(
+                trace,
+                engine_block_size,
+                max_in_flight,
+                accumulate_session_deltas,
+            )
+        }
         ReplayRouterMode::KvRouter if accumulate_session_deltas => trace
             .into_delta_accumulating_concurrency_driver_with_block_size(
                 engine_block_size,
@@ -108,7 +112,7 @@ fn agentic_workload_driver(
     router_mode: ReplayRouterMode,
 ) -> Result<WorkloadDriver> {
     match router_mode {
-        ReplayRouterMode::RoundRobin => {
+        ReplayRouterMode::RoundRobin | ReplayRouterMode::SessionAffinity { .. } => {
             WorkloadDriver::new_agentic_trace_without_replay_hashes(trace, engine_block_size)
         }
         ReplayRouterMode::KvRouter => trace.into_trace_driver_with_block_size(engine_block_size),
@@ -146,10 +150,13 @@ pub fn simulate_agentx_exact_workload(
         router_mode == ReplayRouterMode::KvRouter,
     )?;
     let prepared = match router_mode {
-        ReplayRouterMode::RoundRobin => PreparedOfflineReplay::AggRoundRobin(
-            RoundRobinAggRuntime::new_round_robin_agentx(&args, controller, num_workers)?
-                .with_per_request_records(record_per_request),
-        ),
+        ReplayRouterMode::RoundRobin | ReplayRouterMode::SessionAffinity { .. } => {
+            PreparedOfflineReplay::AggRoundRobin(
+                RoundRobinAggRuntime::new_round_robin_agentx(&args, controller, num_workers)?
+                    .with_session_affinity(router_mode)?
+                    .with_per_request_records(record_per_request),
+            )
+        }
         ReplayRouterMode::KvRouter => PreparedOfflineReplay::AggKv(
             AggRuntime::new_agentx(
                 &args,
@@ -236,10 +243,13 @@ pub fn simulate_agentx_exact_workload_disagg(
         router_mode == ReplayRouterMode::KvRouter,
     )?;
     let prepared = match router_mode {
-        ReplayRouterMode::RoundRobin => PreparedOfflineReplay::DisaggRoundRobin(
-            RoundRobinDisaggRuntime::new_round_robin_agentx(&config, controller)?
-                .with_per_request_records(record_per_request),
-        ),
+        ReplayRouterMode::RoundRobin | ReplayRouterMode::SessionAffinity { .. } => {
+            PreparedOfflineReplay::DisaggRoundRobin(
+                RoundRobinDisaggRuntime::new_round_robin_agentx(&config, controller)?
+                    .with_session_affinity(router_mode)?
+                    .with_per_request_records(record_per_request),
+            )
+        }
         ReplayRouterMode::KvRouter => PreparedOfflineReplay::DisaggKv(
             DisaggRuntime::new_agentx(
                 &config,
@@ -887,11 +897,18 @@ pub(crate) fn simulate_trace_disagg_with_scaling_policy(
     let started_at = Instant::now();
     let pending = normalize_trace_requests(requests, arrival_speedup_ratio)?;
     let prepared = match router_mode {
-        ReplayRouterMode::RoundRobin => PreparedOfflineReplay::DisaggRoundRobin(
-            RoundRobinDisaggRuntime::new_round_robin(&config, pending, DisaggReplayMode::Trace)?
+        ReplayRouterMode::RoundRobin | ReplayRouterMode::SessionAffinity { .. } => {
+            PreparedOfflineReplay::DisaggRoundRobin(
+                RoundRobinDisaggRuntime::new_round_robin(
+                    &config,
+                    pending,
+                    DisaggReplayMode::Trace,
+                )?
+                .with_session_affinity(router_mode)?
                 .with_per_request_records(record_per_request)
                 .with_max_sim_time_ms(max_sim_time_ms),
-        ),
+            )
+        }
         ReplayRouterMode::KvRouter => PreparedOfflineReplay::DisaggKv(
             DisaggRuntime::new(
                 &config,
@@ -952,15 +969,18 @@ pub(crate) fn simulate_concurrency_disagg_with_scaling_policy(
     let started_at = Instant::now();
     let pending = VecDeque::from(requests);
     let prepared = match router_mode {
-        ReplayRouterMode::RoundRobin => PreparedOfflineReplay::DisaggRoundRobin(
-            RoundRobinDisaggRuntime::new_round_robin(
-                &config,
-                pending,
-                DisaggReplayMode::Concurrency { max_in_flight },
-            )?
-            .with_per_request_records(record_per_request)
-            .with_max_sim_time_ms(max_sim_time_ms),
-        ),
+        ReplayRouterMode::RoundRobin | ReplayRouterMode::SessionAffinity { .. } => {
+            PreparedOfflineReplay::DisaggRoundRobin(
+                RoundRobinDisaggRuntime::new_round_robin(
+                    &config,
+                    pending,
+                    DisaggReplayMode::Concurrency { max_in_flight },
+                )?
+                .with_session_affinity(router_mode)?
+                .with_per_request_records(record_per_request)
+                .with_max_sim_time_ms(max_sim_time_ms),
+            )
+        }
         ReplayRouterMode::KvRouter => PreparedOfflineReplay::DisaggKv(
             DisaggRuntime::new(
                 &config,
@@ -1077,15 +1097,18 @@ fn simulate_trace_workload_disagg_with_session_metadata(
         driver = driver.without_session_metadata();
     }
     let prepared = match router_mode {
-        ReplayRouterMode::RoundRobin => PreparedOfflineReplay::DisaggRoundRobin(
-            RoundRobinDisaggRuntime::new_round_robin_workload(
-                &config,
-                driver,
-                DisaggReplayMode::Trace,
-            )?
-            .with_per_request_records(record_per_request)
-            .with_max_sim_time_ms(max_sim_time_ms),
-        ),
+        ReplayRouterMode::RoundRobin | ReplayRouterMode::SessionAffinity { .. } => {
+            PreparedOfflineReplay::DisaggRoundRobin(
+                RoundRobinDisaggRuntime::new_round_robin_workload(
+                    &config,
+                    driver,
+                    DisaggReplayMode::Trace,
+                )?
+                .with_session_affinity(router_mode)?
+                .with_per_request_records(record_per_request)
+                .with_max_sim_time_ms(max_sim_time_ms),
+            )
+        }
         ReplayRouterMode::KvRouter => PreparedOfflineReplay::DisaggKv(
             DisaggRuntime::new_workload(
                 &config,
@@ -1152,15 +1175,18 @@ pub(crate) fn simulate_concurrency_workload_disagg_with_scaling_policy(
         false,
     )?;
     let prepared = match router_mode {
-        ReplayRouterMode::RoundRobin => PreparedOfflineReplay::DisaggRoundRobin(
-            RoundRobinDisaggRuntime::new_round_robin_workload(
-                &config,
-                driver,
-                DisaggReplayMode::Concurrency { max_in_flight },
-            )?
-            .with_per_request_records(record_per_request)
-            .with_max_sim_time_ms(max_sim_time_ms),
-        ),
+        ReplayRouterMode::RoundRobin | ReplayRouterMode::SessionAffinity { .. } => {
+            PreparedOfflineReplay::DisaggRoundRobin(
+                RoundRobinDisaggRuntime::new_round_robin_workload(
+                    &config,
+                    driver,
+                    DisaggReplayMode::Concurrency { max_in_flight },
+                )?
+                .with_session_affinity(router_mode)?
+                .with_per_request_records(record_per_request)
+                .with_max_sim_time_ms(max_sim_time_ms),
+            )
+        }
         ReplayRouterMode::KvRouter => PreparedOfflineReplay::DisaggKv(
             DisaggRuntime::new_workload(
                 &config,
@@ -1337,16 +1363,19 @@ fn simulate_trace_multi_with_scaling_policy(
     let args = args.normalized()?;
     let pending = normalize_trace_requests(requests, arrival_speedup_ratio)?;
     let prepared = match router_mode {
-        ReplayRouterMode::RoundRobin => PreparedOfflineReplay::AggRoundRobin(
-            RoundRobinAggRuntime::new_round_robin(
-                &args,
-                pending,
-                num_workers,
-                AggReplayMode::Trace,
-            )?
-            .with_per_request_records(record_per_request)
-            .with_max_sim_time_ms(max_sim_time_ms),
-        ),
+        ReplayRouterMode::RoundRobin | ReplayRouterMode::SessionAffinity { .. } => {
+            PreparedOfflineReplay::AggRoundRobin(
+                RoundRobinAggRuntime::new_round_robin(
+                    &args,
+                    pending,
+                    num_workers,
+                    AggReplayMode::Trace,
+                )?
+                .with_session_affinity(router_mode)?
+                .with_per_request_records(record_per_request)
+                .with_max_sim_time_ms(max_sim_time_ms),
+            )
+        }
         ReplayRouterMode::KvRouter => PreparedOfflineReplay::AggKv(
             AggRuntime::new(
                 &args,
@@ -1412,16 +1441,19 @@ fn simulate_concurrency_multi_with_scaling_policy(
     let args = args.normalized()?;
     let pending = VecDeque::from(requests);
     let prepared = match router_mode {
-        ReplayRouterMode::RoundRobin => PreparedOfflineReplay::AggRoundRobin(
-            RoundRobinAggRuntime::new_round_robin(
-                &args,
-                pending,
-                num_workers,
-                AggReplayMode::Concurrency { max_in_flight },
-            )?
-            .with_per_request_records(record_per_request)
-            .with_max_sim_time_ms(max_sim_time_ms),
-        ),
+        ReplayRouterMode::RoundRobin | ReplayRouterMode::SessionAffinity { .. } => {
+            PreparedOfflineReplay::AggRoundRobin(
+                RoundRobinAggRuntime::new_round_robin(
+                    &args,
+                    pending,
+                    num_workers,
+                    AggReplayMode::Concurrency { max_in_flight },
+                )?
+                .with_session_affinity(router_mode)?
+                .with_per_request_records(record_per_request)
+                .with_max_sim_time_ms(max_sim_time_ms),
+            )
+        }
         ReplayRouterMode::KvRouter => PreparedOfflineReplay::AggKv(
             AggRuntime::new(
                 &args,
@@ -1498,16 +1530,19 @@ fn simulate_trace_workload_multi_with_scaling_policy(
         driver = driver.without_session_metadata();
     }
     let prepared = match router_mode {
-        ReplayRouterMode::RoundRobin => PreparedOfflineReplay::AggRoundRobin(
-            RoundRobinAggRuntime::new_round_robin_workload(
-                &args,
-                driver,
-                num_workers,
-                AggReplayMode::Trace,
-            )?
-            .with_per_request_records(record_per_request)
-            .with_max_sim_time_ms(max_sim_time_ms),
-        ),
+        ReplayRouterMode::RoundRobin | ReplayRouterMode::SessionAffinity { .. } => {
+            PreparedOfflineReplay::AggRoundRobin(
+                RoundRobinAggRuntime::new_round_robin_workload(
+                    &args,
+                    driver,
+                    num_workers,
+                    AggReplayMode::Trace,
+                )?
+                .with_session_affinity(router_mode)?
+                .with_per_request_records(record_per_request)
+                .with_max_sim_time_ms(max_sim_time_ms),
+            )
+        }
         ReplayRouterMode::KvRouter => PreparedOfflineReplay::AggKv(
             AggRuntime::new_workload(
                 &args,
@@ -1541,14 +1576,17 @@ pub(crate) fn simulate_agentic_trace_workload_multi(
     let args = args.normalized()?;
     let driver = agentic_workload_driver(trace, args.block_size, router_mode)?;
     let (collector, _) = match router_mode {
-        ReplayRouterMode::RoundRobin => RoundRobinAggRuntime::new_round_robin_workload(
-            &args,
-            driver,
-            num_workers,
-            AggReplayMode::Trace,
-        )?
-        .with_per_request_records(record_per_request)
-        .run()?,
+        ReplayRouterMode::RoundRobin | ReplayRouterMode::SessionAffinity { .. } => {
+            RoundRobinAggRuntime::new_round_robin_workload(
+                &args,
+                driver,
+                num_workers,
+                AggReplayMode::Trace,
+            )?
+            .with_session_affinity(router_mode)?
+            .with_per_request_records(record_per_request)
+            .run()?
+        }
         ReplayRouterMode::KvRouter => AggRuntime::new_workload(
             &args,
             router_config,
@@ -1620,16 +1658,19 @@ fn simulate_concurrency_workload_multi_with_scaling_policy(
         accumulate_session_deltas,
     )?;
     let prepared = match router_mode {
-        ReplayRouterMode::RoundRobin => PreparedOfflineReplay::AggRoundRobin(
-            RoundRobinAggRuntime::new_round_robin_workload(
-                &args,
-                driver,
-                num_workers,
-                AggReplayMode::Concurrency { max_in_flight },
-            )?
-            .with_per_request_records(record_per_request)
-            .with_max_sim_time_ms(max_sim_time_ms),
-        ),
+        ReplayRouterMode::RoundRobin | ReplayRouterMode::SessionAffinity { .. } => {
+            PreparedOfflineReplay::AggRoundRobin(
+                RoundRobinAggRuntime::new_round_robin_workload(
+                    &args,
+                    driver,
+                    num_workers,
+                    AggReplayMode::Concurrency { max_in_flight },
+                )?
+                .with_session_affinity(router_mode)?
+                .with_per_request_records(record_per_request)
+                .with_max_sim_time_ms(max_sim_time_ms),
+            )
+        }
         ReplayRouterMode::KvRouter => PreparedOfflineReplay::AggKv(
             AggRuntime::new_workload(
                 &args,
@@ -2388,6 +2429,22 @@ mod tests {
         assert!(agentx.primer.completed > 0);
         assert!(agentx.warmup.completed > 0);
         assert!(agentx.profile.completed > 0);
+        assert_eq!(
+            agentx.hash_globalization.source_hash_id_scope,
+            "local_per_tree"
+        );
+        assert_eq!(
+            agentx.hash_globalization.runtime_hash_id_scope,
+            "global_dense_u32"
+        );
+        assert!(agentx.hash_globalization.collision_free);
+        assert!(agentx.hash_globalization.global_unique_hash_ids > 0);
+        assert!(
+            agentx
+                .hash_globalization
+                .mapping_sha256
+                .starts_with("sha256:")
+        );
         assert_eq!(
             report.request_counts.completed_requests,
             agentx.profile.completed

@@ -2769,6 +2769,7 @@ dependencies = [
  "dynamo-kv-router",
  "dynamo-tokens",
  "dynamo-truthy",
+ "fastrand",
  "futures",
  "indicatif 0.18.4",
  "kvbm-common",

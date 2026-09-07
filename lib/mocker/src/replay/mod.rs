@@ -35,6 +35,13 @@ pub use collector::{
 pub enum ReplayRouterMode {
     RoundRobin,
     KvRouter,
+    /// Seeded random endpoint selection with an idle-TTL session binding.
+    /// Ranks within each endpoint use a round-robin proxy for vLLM's internal
+    /// hybrid load balancer; this does not imply per-rank affinity.
+    SessionAffinity {
+        ttl_secs: u64,
+        ranks_per_endpoint: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

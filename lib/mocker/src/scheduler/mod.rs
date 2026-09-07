@@ -306,6 +306,13 @@ impl EngineCore {
         }
     }
 
+    pub(crate) fn release_arena_for_replay(&mut self) -> Option<kvbm_logical::ArenaReleaseReport> {
+        match self {
+            Self::Vllm(core) => core.release_arena_for_replay(),
+            Self::Sglang(_) => None,
+        }
+    }
+
     pub(crate) fn try_execute_pass(&mut self, now_ms: f64) -> anyhow::Result<EnginePassResult> {
         match self {
             Self::Vllm(core) => core.try_execute_pass(now_ms),

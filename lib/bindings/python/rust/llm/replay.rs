@@ -334,7 +334,7 @@ impl MockEngineArgs {
 #[pymethods]
 impl MockEngineArgs {
     #[new]
-    #[pyo3(signature = (engine_type="vllm", num_gpu_blocks=None, block_size=0, max_num_seqs=Some(256), max_num_batched_tokens=Some(8192), enable_prefix_caching=true, enable_chunked_prefill=true, speedup_ratio=1.0, decode_speedup_ratio=1.0, dp_size=1, startup_time=None, worker_type="aggregated", planner_profile_data=None, aic_backend=None, aic_system=None, aic_backend_version=None, aic_database_mode=None, aic_systems_path=None, aic_database_snapshot_sha256=None, aic_analytical_config=None, aic_tp_size=None, aic_model_path=None, aic_moe_tp_size=None, aic_moe_ep_size=None, aic_attention_dp_size=None, aic_nextn=None, aic_nextn_accept_rates=None, aic_mtp_seed=42, aic_gemm_dtype=None, aic_moe_dtype=None, aic_fmha_dtype=None, aic_kv_cache_dtype=None, aic_comm_dtype=None, gpu_memory_utilization=None, mem_fraction_static=None, free_gpu_memory_fraction=None, enable_local_indexer=false, bootstrap_port=None, handoff_session_timeout_ms=300000, kv_bytes_per_token=None, kv_block_footprint_bytes=None, kv_footprint_source=None, kv_transfer_bandwidth=None, kv_transfer_timing_mode="full_prompt", reasoning=None, response_replay_trace_path=None, zmq_kv_events_port=None, zmq_replay_port=None, preemption_mode="lifo", router_queue_policy=None, sglang=None, trtllm=None, num_g2_blocks=None, g2_capacity_bytes=None, g2_fabric_id=None, num_g3_blocks=None, offload_batch_size=None, bandwidth_g1_to_g2_gbps=None, bandwidth_g2_to_g1_gbps=None, bandwidth_g2_to_g3_gbps=None, bandwidth_g3_to_g2_gbps=None, enable_g4_storage=false, g4_capacity_bytes=None, bandwidth_g2_to_g4_gbps=None, bandwidth_g4_to_g2_gbps=None, max_model_len=None, g1_backend=None))]
+    #[pyo3(signature = (engine_type="vllm", num_gpu_blocks=None, block_size=0, max_num_seqs=Some(256), max_num_batched_tokens=Some(8192), enable_prefix_caching=true, enable_chunked_prefill=true, speedup_ratio=1.0, decode_speedup_ratio=1.0, dp_size=1, startup_time=None, worker_type="aggregated", planner_profile_data=None, aic_backend=None, aic_system=None, aic_backend_version=None, aic_database_mode=None, aic_systems_path=None, aic_database_snapshot_sha256=None, aic_analytical_config=None, aic_tp_size=None, aic_model_path=None, aic_moe_tp_size=None, aic_moe_ep_size=None, aic_attention_dp_size=None, aic_nextn=None, aic_nextn_accept_rates=None, aic_mtp_seed=42, aic_gemm_dtype=None, aic_moe_dtype=None, aic_fmha_dtype=None, aic_kv_cache_dtype=None, aic_comm_dtype=None, gpu_memory_utilization=None, mem_fraction_static=None, free_gpu_memory_fraction=None, enable_local_indexer=false, bootstrap_port=None, handoff_session_timeout_ms=300000, kv_bytes_per_token=None, kv_block_footprint_bytes=None, kv_footprint_source=None, kv_transfer_bandwidth=None, kv_transfer_timing_mode="full_prompt", reasoning=None, response_replay_trace_path=None, zmq_kv_events_port=None, zmq_replay_port=None, preemption_mode="lifo", router_queue_policy=None, sglang=None, trtllm=None, num_g2_blocks=None, g2_capacity_bytes=None, g2_slot_mode="capped_dense", offline_kvbm_backend="reference", g2_fabric_id=None, num_g3_blocks=None, offload_batch_size=None, bandwidth_g1_to_g2_gbps=None, bandwidth_g2_to_g1_gbps=None, bandwidth_g2_to_g3_gbps=None, bandwidth_g3_to_g2_gbps=None, enable_g4_storage=false, g4_capacity_bytes=None, bandwidth_g2_to_g4_gbps=None, bandwidth_g4_to_g2_gbps=None, max_model_len=None, g1_backend=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         engine_type: &str,
@@ -391,6 +391,8 @@ impl MockEngineArgs {
         trtllm: Option<TrtllmArgs>,
         num_g2_blocks: Option<usize>,
         g2_capacity_bytes: Option<usize>,
+        g2_slot_mode: &str,
+        offline_kvbm_backend: &str,
         g2_fabric_id: Option<String>,
         num_g3_blocks: Option<usize>,
         offload_batch_size: Option<usize>,
@@ -467,6 +469,8 @@ impl MockEngineArgs {
             .kv_transfer_timing_mode(kv_transfer_timing_mode)
             .num_g2_blocks(num_g2_blocks)
             .g2_capacity_bytes(g2_capacity_bytes)
+            .g2_slot_mode(g2_slot_mode.to_string())
+            .offline_kvbm_backend(offline_kvbm_backend.to_string())
             .g2_fabric_id(g2_fabric_id)
             .num_g3_blocks(num_g3_blocks)
             .enable_g4_storage(enable_g4_storage)
@@ -653,6 +657,16 @@ impl MockEngineArgs {
     #[getter]
     fn g2_capacity_bytes(&self) -> Option<usize> {
         self.inner.g2_capacity_bytes
+    }
+
+    #[getter]
+    fn g2_slot_mode(&self) -> String {
+        self.inner.g2_slot_mode.clone()
+    }
+
+    #[getter]
+    fn offline_kvbm_backend(&self) -> String {
+        self.inner.offline_kvbm_backend.clone()
     }
 
     #[getter]
@@ -1470,6 +1484,13 @@ pub fn run_mocker_agentx_replay(
     let capture_options = dynamo_mocker::replay::ReplayCaptureOptions {
         capture_per_request: record_per_request,
         capture_planner_details: false,
+        // Exact AgentX is a cache-keyed offline protocol.  Leaving the
+        // determinism scope at `Random` makes request UUIDs and equal-cost
+        // KV-router placement depend on process-local RNG state, so two
+        // identical Stage-2 trials can produce different per-rank KV state
+        // and latency.  The generic replay entrypoints already enter this
+        // scope; keep the dedicated AgentX entrypoint consistent with them.
+        determinism: dynamo_mocker::replay::ReplayDeterminism::CanonicalV1,
         ..Default::default()
     };
 
@@ -1500,8 +1521,11 @@ pub fn run_mocker_agentx_replay(
             )
         }
     };
-    let (report, runtime_evidence) = py
-        .allow_threads(move || dynamo_mocker::replay::with_runtime_evidence(capture_options, run));
+    let (report, runtime_evidence) = py.allow_threads(move || {
+        dynamo_mocker::replay::with_runtime_evidence(capture_options, || {
+            dynamo_mocker::replay::with_replay_determinism(capture_options.determinism, run)
+        })
+    });
     let report = report.map_err(to_pyerr)?;
     if let Some(path) = report_jsonl_path.as_ref() {
         py.allow_threads(|| write_per_request_jsonl(path, &report.per_request))
@@ -2425,8 +2449,20 @@ fn populate_missing_offload_kv_bytes_per_token(
         let min_block_bytes = profile.iter().copied().min().ok_or_else(|| {
             PyException::new_err("AIC dynamic KV block-footprint profile is empty")
         })?;
-        let derived_slots = (capacity_bytes / min_block_bytes)
-            .min(dynamo_mocker::kvbm_offload::config::DEFAULT_MAX_DERIVED_G2_SLOTS);
+        #[cfg(feature = "mocker-kvbm-offload")]
+        let max_derived_slots = dynamo_mocker::kvbm_offload::config::DEFAULT_MAX_DERIVED_G2_SLOTS;
+        #[cfg(not(feature = "mocker-kvbm-offload"))]
+        let max_derived_slots = 2_000_000;
+        let raw_slots = capacity_bytes / min_block_bytes;
+        let derived_slots = match args.g2_slot_mode.as_str() {
+            "capped_dense" => raw_slots.min(max_derived_slots),
+            "raw_derived_dense" | "sparse_byte_native" => raw_slots,
+            other => {
+                return Err(PyException::new_err(format!(
+                    "unsupported g2_slot_mode={other:?}"
+                )));
+            }
+        };
         if derived_slots == 0 {
             return Err(PyException::new_err(format!(
                 "g2_capacity_bytes={capacity_bytes} cannot hold the smallest AIC KV block ({min_block_bytes} bytes)"

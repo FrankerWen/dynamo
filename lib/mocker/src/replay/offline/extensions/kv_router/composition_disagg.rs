@@ -203,7 +203,10 @@ impl PlacementPolicy<ReplayRequestPayload> for AdaptivePoolPlacement {
 #[cfg(test)]
 impl PoolPlacement<RouterEventBatch, KvReplayMetadata> for AdaptivePoolPlacement {
     fn is_router(&self) -> bool {
-        matches!(self, Self::Kv(_))
+        match self {
+            Self::RoundRobin(policy) => policy.has_session_affinity(),
+            Self::Kv(_) => true,
+        }
     }
 }
 
@@ -218,8 +221,20 @@ impl ConfiguredPoolPlacement<RouterEventBatch, KvReplayMetadata> for AdaptivePoo
         topology: Vec<WorkerTopology>,
     ) -> Result<Self> {
         match router_mode {
-            ReplayRouterMode::RoundRobin => {
-                Ok(Self::RoundRobin(PoolRoundRobinPlacement::new(topology)))
+            ReplayRouterMode::RoundRobin | ReplayRouterMode::SessionAffinity { .. } => {
+                let mut placement = PoolRoundRobinPlacement::new(topology);
+                if let ReplayRouterMode::SessionAffinity {
+                    ttl_secs,
+                    ranks_per_endpoint,
+                } = router_mode
+                {
+                    placement.configure_session_affinity(
+                        ttl_secs,
+                        ranks_per_endpoint,
+                        crate::replay::offline::core::session_affinity::SESSION_AFFINITY_SEED,
+                    )?;
+                }
+                Ok(Self::RoundRobin(placement))
             }
             ReplayRouterMode::KvRouter => Ok(Self::Kv(KvRouterPlacement::new(
                 args,
@@ -322,7 +337,7 @@ where
         PlacementPolicyImpl: ConfiguredPoolPlacement<Observation::Batch, Metadata>,
     {
         let (prefill_router_config, decode_router_config) = match router_mode {
-            ReplayRouterMode::RoundRobin => (None, None),
+            ReplayRouterMode::RoundRobin | ReplayRouterMode::SessionAffinity { .. } => (None, None),
             ReplayRouterMode::KvRouter => (
                 Some(derive_prefill_router_config(
                     &config.prefill_args,

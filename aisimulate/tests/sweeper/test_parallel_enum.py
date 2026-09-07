@@ -158,6 +158,30 @@ def test_disagg_pairs_share_budget():
     assert any(c.prefill.shape != c.decode.shape for c in cfgs)
 
 
+def test_non_power_of_two_dep12_is_available_when_opted_in():
+    shapes = enumerate_worker_shapes(is_moe=True, backend="sglang", gpus_per_worker=12)
+    assert any(
+        shape.tp == 1
+        and shape.dp == 12
+        and shape.moe_tp == 1
+        and shape.moe_ep == 12
+        for shape in shapes
+    )
+    configs = enumerate_disagg_configs(
+        is_moe=True,
+        backend="sglang",
+        gpu_budget=72,
+        gpus_per_worker_candidates=(1, 2, 4, 8, 12, 16),
+    )
+    assert any(
+        candidate.prefill.replicas == 2
+        and candidate.prefill.shape.dp == 8
+        and candidate.decode.replicas == 1
+        and candidate.decode.shape.dp == 12
+        for candidate in configs
+    )
+
+
 def test_disagg_min_gpu_budget_full_utilization():
     cfgs = enumerate_disagg_configs(
         is_moe=True, backend="trtllm", gpu_budget=8, min_gpu_budget=8

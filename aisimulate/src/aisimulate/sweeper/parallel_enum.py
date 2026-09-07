@@ -29,7 +29,10 @@ from dataclasses import dataclass
 # GPUs-per-worker ladder (matches AIC's default num_gpu_per_worker).
 _DEFAULT_GPUS_PER_WORKER: tuple[int, ...] = (1, 2, 4, 8, 16)
 # Ladder used to enumerate tp / dp / moe_tp / moe_ep candidates within a worker.
-_DIM_LADDER: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)
+# Include non-power-of-two widths used by production AgentX shapes (notably
+# DEP12).  The default worker ladder remains conservative; callers opt into
+# those widths through ``gpus_per_worker_candidates``.
+_DIM_LADDER: tuple[int, ...] = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128)
 
 
 @dataclass(frozen=True)

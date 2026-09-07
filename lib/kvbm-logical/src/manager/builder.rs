@@ -143,6 +143,11 @@ pub struct BlockManagerConfigBuilder<T: BlockMetadata> {
     /// override via [`ImmutableBlock::set_evict_on_reset`].
     default_reset_on_release: Option<bool>,
 
+    /// Lazily materialize slot metadata as blocks are first allocated.
+    /// Logical capacity remains `block_count`; fixed memory follows the
+    /// resident/pending high-water mark instead of the theoretical ceiling.
+    lazy_slot_materialization: bool,
+
     /// Phantom data for type parameter
     _phantom: std::marker::PhantomData<T>,
 }
@@ -157,6 +162,7 @@ impl<T: BlockMetadata> Default for BlockManagerConfigBuilder<T> {
             duplication_policy: None,
             aggregator: None,
             default_reset_on_release: None,
+            lazy_slot_materialization: false,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -319,6 +325,13 @@ impl<T: BlockMetadata> BlockManagerConfigBuilder<T> {
         self
     }
 
+    /// Keep the logical block ceiling while allocating slot metadata only on
+    /// first use. Intended for byte-capacity-native offline tiers.
+    pub fn with_lazy_slot_materialization(mut self) -> Self {
+        self.lazy_slot_materialization = true;
+        self
+    }
+
     /// Validate the configuration.
     fn validate(&self) -> Result<(), String> {
         let registry = self.registry.as_ref().ok_or("registry is required")?;
@@ -447,13 +460,23 @@ impl<T: BlockMetadata> BlockManagerConfigBuilder<T> {
         };
 
         // Construct unified store
-        let store = BlockStore::new(
-            block_count,
-            block_size,
-            backend,
-            metrics.clone(),
-            self.default_reset_on_release.unwrap_or(false),
-        );
+        let store = if self.lazy_slot_materialization {
+            BlockStore::new_lazy(
+                block_count,
+                block_size,
+                backend,
+                metrics.clone(),
+                self.default_reset_on_release.unwrap_or(false),
+            )
+        } else {
+            BlockStore::new(
+                block_count,
+                block_size,
+                backend,
+                metrics.clone(),
+                self.default_reset_on_release.unwrap_or(false),
+            )
+        };
 
         // Register with aggregator if provided
         if let Some(ref aggregator) = self.aggregator {

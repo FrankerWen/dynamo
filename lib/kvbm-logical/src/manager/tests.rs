@@ -59,6 +59,70 @@ mod builder_tests {
     }
 
     #[test]
+    fn lazy_slots_preserve_logical_capacity_without_dense_preallocation() {
+        let manager = BlockManager::<TestBlockData>::builder()
+            .block_count(10_000_000)
+            .registry(BlockRegistry::new())
+            .with_hashmap_backend()
+            .with_lazy_slot_materialization()
+            .build()
+            .expect("lazy manager should build");
+
+        assert_eq!(manager.available_blocks(), 10_000_000);
+        assert_eq!(manager.materialized_slot_count(), 0);
+        assert_eq!(manager.fixed_slot_metadata_bytes(), 0);
+
+        let blocks = manager.allocate_blocks(3).expect("logical slots available");
+        assert_eq!(manager.materialized_slot_count(), 3);
+        assert!(manager.fixed_slot_metadata_bytes() < 4096);
+        drop(blocks);
+        assert_eq!(manager.available_blocks(), 10_000_000);
+        assert_eq!(manager.materialized_slot_count(), 3);
+    }
+
+    #[test]
+    fn lazy_slots_grow_before_reusing_inactive_residents() {
+        let manager = BlockManager::<TestBlockData>::builder()
+            .block_count(100)
+            .block_size(4)
+            .registry(BlockRegistry::new())
+            .with_hashmap_backend()
+            .with_lazy_slot_materialization()
+            .build()
+            .expect("lazy manager should build");
+
+        let mutable = manager.allocate_blocks(3).expect("initial allocation");
+        let completed = mutable
+            .into_iter()
+            .enumerate()
+            .map(|(index, block)| {
+                let tokens = [
+                    index as u32,
+                    100 + index as u32,
+                    200 + index as u32,
+                    300 + index as u32,
+                ];
+                block
+                    .complete(&create_token_block(&tokens))
+                    .expect("test block should complete")
+            })
+            .collect();
+        let registered = manager.register_blocks(completed);
+        assert_eq!(manager.materialized_slot_count(), 3);
+        drop(registered);
+        assert_eq!(manager.available_blocks(), 100);
+
+        // Three inactive residents are reusable, but the lazy logical arena
+        // still has 97 unmaterialized slots. A five-block allocation must
+        // materialize five fresh slots instead of evicting three residents.
+        let next = manager
+            .allocate_blocks(5)
+            .expect("logical capacity available");
+        assert_eq!(manager.materialized_slot_count(), 8);
+        drop(next);
+    }
+
+    #[test]
     fn test_builder_with_lru_backend() {
         let registry = BlockRegistry::new();
         let manager = BlockManager::<TestBlockData>::builder()

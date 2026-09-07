@@ -87,10 +87,11 @@ pub struct PipelineConfig<Src: BlockMetadata, Dst: BlockMetadata> {
     /// Setting this higher can improve throughput at the cost of memory.
     /// Default: 1 (sequential execution)
     pub max_concurrent_transfers: usize,
-    /// Whether transfer reservations must start in batch-input order.
+    /// Whether precondition outputs and transfer reservations retain
+    /// batch-input order.
     ///
-    /// This keeps concurrent transfers but removes executor scheduling from
-    /// the order in which a synchronous worker observes their reservations.
+    /// This keeps concurrent precondition waits and transfers but removes
+    /// task scheduling from the order observed by a synchronous worker.
     pub ordered_transfer_starts: bool,
     /// Pending tracker for duplicate prevention.
     ///
@@ -204,7 +205,8 @@ impl<Src: BlockMetadata, Dst: BlockMetadata> PipelineBuilder<Src, Dst> {
         self
     }
 
-    /// Preserve batch-input order for synchronous transfer reservation.
+    /// Preserve batch-input order through asynchronous preconditions and
+    /// synchronous transfer reservation.
     pub fn ordered_transfer_starts(mut self, ordered: bool) -> Self {
         self.config.ordered_transfer_starts = ordered;
         self
@@ -378,12 +380,14 @@ impl<Src: BlockMetadata, Dst: BlockMetadata> Pipeline<Src, Dst> {
         // Spawn precondition awaiter (reads from batch_rx, outputs to precond_tx)
         let awaiter_leader = leader.clone();
         let awaiter_settlement = settlement.clone();
+        let awaiter_ordered_output = config.ordered_transfer_starts;
         let precond_handle = runtime.spawn(async move {
             let awaiter = PreconditionAwaiter {
                 input_rx: batch_rx,
                 output_tx: precond_tx,
                 leader: awaiter_leader,
                 settlement: awaiter_settlement,
+                ordered_output: awaiter_ordered_output,
             };
             awaiter.run().await;
         });
@@ -758,6 +762,7 @@ impl<Src: BlockMetadata> ObjectPipeline<Src> {
                 output_tx: precond_tx,
                 leader: awaiter_leader,
                 settlement: awaiter_settlement,
+                ordered_output: false,
             };
             awaiter.run().await;
         });
@@ -1262,16 +1267,22 @@ struct PreconditionAwaiter<T: BlockMetadata> {
     output_tx: mpsc::Sender<TransferBatch<T>>,
     leader: Arc<InstanceLeader>,
     settlement: PipelineSettlementTracker,
+    /// Preserve collector order after concurrently awaiting preconditions.
+    ordered_output: bool,
 }
 
 impl<T: BlockMetadata> PreconditionAwaiter<T> {
     async fn run(mut self) {
         // NO SEMAPHORE - spawn unbounded tasks
         // Event awaiting is cheap, we must never skip awaiting a precondition
+        let mut output_predecessor = None;
         while let Some(mut batch) = self.input_rx.recv().await {
             let output_tx = self.output_tx.clone();
             let nova = self.leader.messenger().clone();
             let settlement = self.settlement.clone();
+            let mut output_order = self
+                .ordered_output
+                .then(|| OrderedPipelineGate::next(&mut output_predecessor));
 
             // Spawn task for each batch - unbounded
             tokio::spawn(async move {
@@ -1334,6 +1345,14 @@ impl<T: BlockMetadata> PreconditionAwaiter<T> {
                 // Mark precondition complete (batch-level, O(1))
                 batch.timing.mark_precondition_complete();
 
+                // Preconditions may finish in a different Tokio wake order on
+                // every run. Offline deterministic replay still awaits them
+                // concurrently, but forwards ready batches in collector order
+                // so G2 admission and residency do not depend on wall time.
+                if let Some(output_order) = &mut output_order {
+                    output_order.wait().await;
+                }
+
                 // Forward batch to transfer executor
                 let queued = QueuedBatchGuard::new(settlement);
                 if let Err(e) = output_tx.send(batch).await {
@@ -1344,6 +1363,9 @@ impl<T: BlockMetadata> PreconditionAwaiter<T> {
                     ));
                 } else {
                     queued.sent();
+                }
+                if let Some(output_order) = &mut output_order {
+                    output_order.release();
                 }
             });
         }
@@ -1388,12 +1410,12 @@ struct SharedBlockExecutorState<Dst: BlockMetadata> {
     chain_tx: Option<mpsc::Sender<ChainOutput<Dst>>>,
 }
 
-struct OrderedTransferStart {
+struct OrderedPipelineGate {
     predecessor: Option<oneshot::Receiver<()>>,
     successor: Option<oneshot::Sender<()>>,
 }
 
-impl OrderedTransferStart {
+impl OrderedPipelineGate {
     fn next(predecessor: &mut Option<oneshot::Receiver<()>>) -> Self {
         let (successor, next_predecessor) = oneshot::channel();
         Self {
@@ -1415,7 +1437,7 @@ impl OrderedTransferStart {
     }
 }
 
-impl Drop for OrderedTransferStart {
+impl Drop for OrderedPipelineGate {
     fn drop(&mut self) {
         self.release();
     }
@@ -1488,7 +1510,7 @@ impl<Src: BlockMetadata, Dst: BlockMetadata> BlockTransferExecutor<Src, Dst> {
             let mut phase = BatchPhaseGuard::starting(settlement.clone(), transfer_permit);
             let mut transfer_start = self
                 .ordered_transfer_starts
-                .then(|| OrderedTransferStart::next(&mut transfer_start_predecessor));
+                .then(|| OrderedPipelineGate::next(&mut transfer_start_predecessor));
             tokio::spawn(async move {
                 if let Some(transfer_start) = &mut transfer_start {
                     transfer_start.wait().await;
@@ -1542,7 +1564,7 @@ impl<Src: BlockMetadata, Dst: BlockMetadata> BlockTransferExecutor<Src, Dst> {
         shared: &SharedBlockExecutorState<Dst>,
         mut batch: ResolvedBatch<Src>,
         phase: &mut BatchPhaseGuard,
-        mut transfer_start: Option<&mut OrderedTransferStart>,
+        mut transfer_start: Option<&mut OrderedPipelineGate>,
     ) -> anyhow::Result<()> {
         nvtx_range!("offload::transfer");
         if batch.is_empty() {
@@ -2203,11 +2225,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordered_transfer_starts_ignore_task_schedule_order() {
+    async fn ordered_pipeline_gate_ignores_task_schedule_order() {
         let observed = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let mut predecessor = None;
         let starts = (0..3)
-            .map(|_| OrderedTransferStart::next(&mut predecessor))
+            .map(|_| OrderedPipelineGate::next(&mut predecessor))
             .collect::<Vec<_>>();
         let mut tasks = Vec::new();
 

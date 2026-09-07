@@ -44,6 +44,9 @@ Offline replay starts in `lib/mocker/src/replay/offline/mod.rs`.
   `ReadyWorkerCompletions`, and `next_timestamp`.
 - `lib/mocker/src/replay/offline/progress.rs`
   `ReplayProgress`, the indicatif-based progress bar used by the harnesses.
+  It is hidden by default; set `DYN_MOCKER_REPLAY_INNER_PROGRESS=1` explicitly
+  for a single-process diagnostic run. Multi-process Stage 2 renders only its
+  parent-level trial bar.
 - `lib/mocker/src/replay/offline/components/`
   Shared abstractions split out from the runtimes:
   - `router.rs` — `OfflineReplayRouter` (synchronous in-process router, KV + round-robin modes) and `OfflineRouterSnapshot`.

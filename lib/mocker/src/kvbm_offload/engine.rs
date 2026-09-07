@@ -15,7 +15,7 @@
 //! the caller — live replay feeds wall-clock time, offline replay feeds
 //! virtual time.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 #[cfg(feature = "replay-bench")]
 use std::cmp::Reverse;
 #[cfg(feature = "replay-bench")]
@@ -57,7 +57,7 @@ use super::KvbmDriveMode;
 use super::capacity_reservation::{
     ByteCapacityMetrics, CapacityReservationGuard, CapacityReservationPolicy, CapacityReservations,
 };
-use super::config::KvbmOffloadConfig;
+use super::config::{G2SlotMode, KvbmOffloadConfig};
 use super::coordinator::{
     DirectSwapInLease, G1ToG2Lease, G2ToG3Lease, G2ToG4Lease, LeaseState, OffloadCoordinator,
     OffloadId, StagedSwapInLease, SwapInHandle, SwapInResources, SwapInStatus, SwapInTerminal,
@@ -69,7 +69,10 @@ use super::worker::{MockWorker, TransferDirection};
 
 // Successful offline barriers wake via watch channels. The timeout is only a
 // hang guard for pipeline bugs.
-const PIPELINE_BARRIER_TIMEOUT: Duration = Duration::from_secs(1);
+// A settlement barrier may drain a large same-timestamp completion wave.  The
+// timeout is only a deadlock guard; it must not be shorter than legitimate
+// offline batch settlement under C512/C1152 load.
+const PIPELINE_BARRIER_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy)]
 enum ReservationBlocker {
@@ -304,10 +307,15 @@ pub(crate) enum G1EvictionOutcome {
 #[derive(Clone, Debug)]
 pub(crate) struct OffloadEngineSnapshot {
     pub config: KvbmOffloadConfig,
+    pub g1_backend: String,
+    pub g1_arena: kvbm_logical::BlockArenaSnapshot,
+    pub g1_resident_checksum: String,
     pub g2_capacity: Option<ByteCapacityMetrics>,
     pub g4_cache: Option<super::shared_g4::G4CacheMetrics>,
     pub transfers: super::worker::OffloadTransferMetrics,
     pub fixed_slot_metadata_bytes: usize,
+    pub materialized_g2_slots: usize,
+    pub resident_checksum: String,
 }
 
 /// In-process offload engine driving a G1→G2 pipeline over [`MockWorker`].
@@ -392,6 +400,8 @@ impl MockOffloadEngine {
             config.num_g2_blocks,
             config.block_size_tokens,
             &registry,
+            config.g2_slot_mode == G2SlotMode::SparseByteNative,
+            config.offline_kvbm_backend.uses_compact_g2(),
         ));
         // The Option keeps offline subscription after registry/G2 initialization;
         // startup lifecycle events must not consume the bounded loss-aware channel.
@@ -450,7 +460,7 @@ impl MockOffloadEngine {
         let leader = Arc::new(leader_builder.build()?);
 
         let g2_destination_reservations = Arc::new(match config.g2_capacity_bytes {
-            Some(capacity_bytes) => CapacityReservations::with_byte_capacity(
+            Some(capacity_bytes) => CapacityReservations::with_byte_capacity_mode(
                 capacity_bytes,
                 Arc::from(
                     config
@@ -458,6 +468,8 @@ impl MockOffloadEngine {
                         .clone()
                         .expect("validated G2 byte capacity requires AIC footprint"),
                 ),
+                config.num_g2_blocks,
+                config.g2_slot_mode != G2SlotMode::SparseByteNative,
             ),
             None => CapacityReservations::default(),
         });
@@ -474,7 +486,12 @@ impl MockOffloadEngine {
             .pending_tracker(g1_to_g2_pending)
             .batch_size(config.offload_batch_size)
             .max_concurrent_transfers(config.offload_batch_size)
-            .ordered_transfer_starts(cfg!(feature = "replay-bench"))
+            // Offline replay must not let Tokio task wake order decide which
+            // same-timestamp transfer enters the processor-sharing fabric
+            // first. This is a simulation semantic, not a benchmark-only
+            // convenience: run-to-run differences here change G2 residency,
+            // prefix reuse, and ultimately completed requests.
+            .ordered_transfer_starts(drive_mode == KvbmDriveMode::OfflineDeterministic)
             .build();
 
         let mut engine_builder = OffloadEngine::builder(leader.clone())
@@ -502,6 +519,7 @@ impl MockOffloadEngine {
                 // bandwidth in the mock PS model, but they pin many G2 source
                 // blocks and can starve foreground G1→G2 offloads.
                 .max_concurrent_transfers(1)
+                .ordered_transfer_starts(drive_mode == KvbmDriveMode::OfflineDeterministic)
                 .build();
             engine_builder = engine_builder
                 .with_g3_manager(g3_manager.clone())
@@ -592,6 +610,14 @@ impl MockOffloadEngine {
     }
 
     fn remember_g2_event_metadata(&self, blocks: &[G2OffloadBlock]) {
+        // The synchronous offline replay indexer currently ignores every
+        // non-GPU router event. G2 still runs its complete transfer,
+        // capacity, and lifecycle state machine below, but retaining a clone
+        // of every HostPinned event here would only create hash-table/object
+        // churn before those events are discarded at the router boundary.
+        if self.drive_mode == KvbmDriveMode::OfflineDeterministic {
+            return;
+        }
         let mut metadata = self
             .g2_event_metadata
             .lock()
@@ -635,22 +661,32 @@ impl MockOffloadEngine {
         if lifecycle_events.is_empty() {
             return Vec::new();
         }
+        // Apply the complete ordered lifecycle wave under one capacity lock.
+        // The iterator avoids one tuple allocation per event and retains the
+        // registry's create/remove order exactly.
+        self.g2_destination_reservations
+            .apply_lifecycle_events(lifecycle_events.iter().map(|event| match event {
+                LogicalKvCacheEvent::Create(hash) => (*hash, true),
+                LogicalKvCacheEvent::Remove(hash) => (*hash, false),
+            }));
+
+        if self.drive_mode == KvbmDriveMode::OfflineDeterministic {
+            return Vec::new();
+        }
 
         let mut metadata = self
             .g2_event_metadata
             .lock()
             .expect("G2 event metadata mutex poisoned");
-        let mut router_events = Vec::new();
+        let mut router_events = Vec::with_capacity(lifecycle_events.len());
         for event in lifecycle_events {
             match event {
                 LogicalKvCacheEvent::Create(plh) => {
-                    self.g2_destination_reservations.mark_published(plh);
                     if let Some(meta) = metadata.get(&plh).cloned() {
                         router_events.push(G2RouterEvent::Stored(meta));
                     }
                 }
                 LogicalKvCacheEvent::Remove(plh) => {
-                    self.g2_destination_reservations.mark_removed(plh);
                     if let Some(meta) = metadata.remove(&plh) {
                         router_events.push(G2RouterEvent::Removed {
                             seq_hash: meta.seq_hash,
@@ -1194,100 +1230,44 @@ impl MockOffloadEngine {
         self.worker.set_now_ms(now_ms);
         let g2_registrations_before = Self::tier_registrations(&self.g2_manager);
         let local_token = self.engine.settlement_token();
-        let ordered_router_events = RefCell::new(Vec::new());
+        let mut ordered_router_events = Vec::new();
         let drained = if self.drive_mode == KvbmDriveMode::OfflineDeterministic {
-            let mut local_completed_batches = 0u64;
             let expected_g2_registrations = Cell::new(g2_registrations_before);
             self.worker.drain_completions_summary_ordered(
                 now_ms,
                 |completion| {
                     if completion.direction == TransferDirection::G1ToG2 {
-                        local_completed_batches = local_completed_batches
-                            .checked_add(1)
-                            .expect("G1→G2 settlement target overflow");
-                        let mut target = SettlementTarget::new();
-                        target
-                            .add_completed_batches(PipelineLane::G1ToG2, local_completed_batches)
-                            .expect("G1→G2 settlement target overflow");
-                        self.settle_or_panic(local_token.clone(), target);
-                        expected_g2_registrations.set(Self::tier_registrations(&self.g2_manager));
+                        let target = expected_g2_registrations
+                            .get()
+                            .checked_add(
+                                u64::try_from(completion.num_blocks)
+                                    .expect("G1→G2 completion block count exceeds u64"),
+                            )
+                            .expect("G2 registration target overflow");
+                        // A logical completion wave may wake many executor
+                        // tasks. Publish each completed transfer in the
+                        // processor-sharing model's stable completion order,
+                        // then settle the whole wave once below. This retains
+                        // batched settlement without letting Tokio wake order
+                        // choose G2 block ids, eviction, or lifecycle order.
+                        assert!(
+                            self.wait_for_tier_registrations(self.g2_manager.clone(), target),
+                            "offline G1→G2 completion did not publish its registrations"
+                        );
+                        expected_g2_registrations.set(target);
                     }
-                    ordered_router_events
-                        .borrow_mut()
-                        .extend(self.translate_g2_lifecycle_events());
                 },
-                |completion| {
-                    match completion.direction {
-                        TransferDirection::G2ToG3 => {
-                            if let Some(settlement) =
-                                self.coordinator.shared_settlement(PipelineLane::G2ToG3, 1)
-                            {
-                                self.settle_or_panic(settlement.token, settlement.target);
-                            }
-                        }
-                        TransferDirection::G3ToG2 => {
-                            let target = expected_g2_registrations
-                                .get()
-                                .checked_add(
-                                    u64::try_from(completion.num_blocks)
-                                        .expect("G3→G2 block count exceeds u64"),
-                                )
-                                .expect("G2 registration target overflow");
-                            expected_g2_registrations.set(target);
-                            assert!(
-                                self.wait_for_tier_registrations(self.g2_manager.clone(), target,),
-                                "offline G3→G2 completion did not publish its G2 registrations"
-                            );
-                            expected_g2_registrations
-                                .set(Self::tier_registrations(&self.g2_manager));
-                        }
-                        _ => unreachable!("shared G3 completion used an unexpected direction"),
-                    }
-                    ordered_router_events
-                        .borrow_mut()
-                        .extend(self.translate_g2_lifecycle_events());
-                },
-                |completion| {
-                    match completion.direction {
-                        TransferDirection::G2ToG4 => {
-                            if let Some(settlement) =
-                                self.coordinator.shared_settlement(PipelineLane::G2ToG4, 1)
-                            {
-                                self.settle_or_panic(settlement.token, settlement.target);
-                            }
-                        }
-                        TransferDirection::G4ToG2 => {
-                            let target = expected_g2_registrations
-                                .get()
-                                .checked_add(
-                                    u64::try_from(completion.num_blocks)
-                                        .expect("G4→G2 block count exceeds u64"),
-                                )
-                                .expect("G2 registration target overflow");
-                            expected_g2_registrations.set(target);
-                            assert!(
-                                self.wait_for_tier_registrations(self.g2_manager.clone(), target,),
-                                "offline G4→G2 completion did not publish its G2 registrations"
-                            );
-                            expected_g2_registrations
-                                .set(Self::tier_registrations(&self.g2_manager));
-                        }
-                        _ => unreachable!("shared G4 completion used an unexpected direction"),
-                    }
-                    ordered_router_events
-                        .borrow_mut()
-                        .extend(self.translate_g2_lifecycle_events());
-                },
+                |_| {},
+                |_| {},
             )
         } else {
             self.worker.drain_completions_summary(now_ms)
         };
-        let mut ordered_router_events = ordered_router_events.into_inner();
         let offload_drained = drained.local.offload_transfers;
         let offload_drained_blocks = drained.local.offload_blocks;
         let shared_g3 = drained.shared_g3.counts;
         let shared_g4 = drained.shared_g4.counts;
-        if self.drive_mode == KvbmDriveMode::Live && offload_drained > 0 {
+        if offload_drained > 0 {
             let mut target = SettlementTarget::new();
             target
                 .add_completed_batches(
@@ -1297,19 +1277,17 @@ impl MockOffloadEngine {
                 .expect("G1→G2 settlement target overflow");
             self.settle_or_panic(local_token, target);
         }
-        if self.drive_mode == KvbmDriveMode::Live {
-            if let Some(settlement) = self
-                .coordinator
-                .shared_settlement(PipelineLane::G2ToG3, shared_g3.offload_transfers)
-            {
-                self.settle_or_panic(settlement.token, settlement.target);
-            }
-            if let Some(settlement) = self
-                .coordinator
-                .shared_settlement(PipelineLane::G2ToG4, shared_g4.offload_transfers)
-            {
-                self.settle_or_panic(settlement.token, settlement.target);
-            }
+        if let Some(settlement) = self
+            .coordinator
+            .shared_settlement(PipelineLane::G2ToG3, shared_g3.offload_transfers)
+        {
+            self.settle_or_panic(settlement.token, settlement.target);
+        }
+        if let Some(settlement) = self
+            .coordinator
+            .shared_settlement(PipelineLane::G2ToG4, shared_g4.offload_transfers)
+        {
+            self.settle_or_panic(settlement.token, settlement.target);
         }
 
         let current_shared_g3_onboard_blocks = shared_g3
@@ -1320,6 +1298,20 @@ impl MockOffloadEngine {
             .saturating_sub(drained.shared_g4.deferred_onboard_blocks);
         let g2_publish_blocks =
             current_shared_g3_onboard_blocks.saturating_add(current_shared_g4_onboard_blocks);
+
+        if self.drive_mode == KvbmDriveMode::OfflineDeterministic && g2_publish_blocks > 0 {
+            let total_wave_publish_blocks =
+                offload_drained_blocks.saturating_add(g2_publish_blocks);
+            let target = g2_registrations_before
+                .checked_add(
+                    u64::try_from(total_wave_publish_blocks).expect("G2 publish count exceeds u64"),
+                )
+                .expect("G2 registration target overflow");
+            assert!(
+                self.wait_for_tier_registrations(self.g2_manager.clone(), target),
+                "offline completion wave did not publish all G2 registrations"
+            );
+        }
 
         // Offline replay has an attached kvbm-engine executor. Once drain
         // fires transfer awaiters, give those
@@ -1758,12 +1750,24 @@ impl MockOffloadEngine {
     }
 
     pub(crate) fn resource_snapshot(&self) -> OffloadEngineSnapshot {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"mocker-g2-resident-v1\0");
+        for hash in self.g2_manager.resident_sequence_hashes() {
+            hasher.update(&hash.as_u128().to_le_bytes());
+        }
         OffloadEngineSnapshot {
             config: self.config.clone(),
+            // Filled by the owning G1 manager, which is deliberately outside
+            // the offload engine to avoid a reference cycle.
+            g1_backend: "unattached".to_string(),
+            g1_arena: kvbm_logical::BlockArenaSnapshot::default(),
+            g1_resident_checksum: String::new(),
             g2_capacity: self.g2_byte_capacity_metrics(),
             g4_cache: self.g4_cache_metrics(),
             transfers: self.worker.transfer_metrics(),
             fixed_slot_metadata_bytes: self.g2_manager.fixed_slot_metadata_bytes(),
+            materialized_g2_slots: self.g2_manager.materialized_slot_count(),
+            resident_checksum: hasher.finalize().to_hex().to_string(),
         }
     }
 
@@ -1971,13 +1975,25 @@ fn build_g2_block_manager(
     block_count: usize,
     block_size_tokens: usize,
     registry: &BlockRegistry,
+    sparse_byte_native: bool,
+    compact: bool,
 ) -> BlockManager<G2> {
-    BlockManager::<G2>::builder()
+    let builder = BlockManager::<G2>::builder()
         .block_count(block_count)
         .block_size(block_size_tokens)
         .registry(registry.clone())
-        .duplication_policy(BlockDuplicationPolicy::Reject)
-        .with_lineage_backend()
+        .duplication_policy(BlockDuplicationPolicy::Reject);
+    let builder = if sparse_byte_native {
+        let builder = builder.with_hashmap_backend();
+        if compact {
+            builder.with_lazy_slot_materialization()
+        } else {
+            builder
+        }
+    } else {
+        builder.with_lineage_backend()
+    };
+    builder
         .build()
         .expect("BlockManager<G2> should build with valid config")
 }
@@ -2083,6 +2099,63 @@ mod tests {
         assert!(!engine.engine.has_g2_to_g3());
         assert!(!engine.engine.has_g2_to_g4());
         assert_eq!(engine.earliest_pending_deadline(), None);
+    }
+
+    #[tokio::test]
+    async fn offline_g2_lifecycle_updates_capacity_without_router_objects() {
+        use dynamo_tokens::PositionalLineageHash;
+
+        let config = KvbmOffloadConfig {
+            num_g2_blocks: 1,
+            g2_slot_mode: G2SlotMode::SparseByteNative,
+            g2_capacity_bytes: Some(8),
+            block_footprint_bytes: Some(vec![8]),
+            ..Default::default()
+        };
+        let engine =
+            MockOffloadEngine::new_with_drive_mode(config, KvbmDriveMode::OfflineDeterministic)
+                .await
+                .expect("offline construction should succeed");
+        let plh = PositionalLineageHash::new(42, None, 0);
+        let (_source_manager, source_slots) = allocate_g1_slots(1);
+        engine.remember_g2_event_metadata(&[G2OffloadBlock {
+            block_id: source_slots[0].block_id(),
+            plh,
+            metadata: G2BlockEventMetadata {
+                seq_hash: 42,
+                parent_hash: None,
+                local_hash: None,
+                token_ids: Some(vec![1, 2, 3, 4]),
+            },
+        }]);
+        assert!(
+            engine
+                .g2_event_metadata
+                .lock()
+                .expect("G2 event metadata mutex poisoned")
+                .is_empty(),
+            "offline replay must not retain HostPinned router metadata"
+        );
+
+        assert_eq!(
+            engine
+                .g2_destination_reservations
+                .try_reserve_hashes(engine.g2_manager.available_blocks(), &[plh]),
+            vec![true]
+        );
+        register_test_block(engine.g2_manager(), plh);
+        assert!(
+            engine.translate_g2_lifecycle_events().is_empty(),
+            "offline replay indexer discards HostPinned events at its boundary"
+        );
+        let metrics = engine
+            .g2_destination_reservations
+            .byte_metrics()
+            .expect("byte capacity metrics should be configured");
+        assert_eq!(metrics.reserved_blocks, 0);
+        assert_eq!(metrics.occupied_blocks, 1);
+        assert_eq!(metrics.reserved_bytes, 0);
+        assert_eq!(metrics.occupied_bytes, 8);
     }
 
     #[test]

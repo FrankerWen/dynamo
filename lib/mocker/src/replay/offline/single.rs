@@ -333,6 +333,11 @@ impl SingleRuntime {
         }
 
         self.progress.finish();
+        if self.worker.is_drained() {
+            if let Some(report) = self.worker.release_arena_for_replay() {
+                self.collector.add_replay_arena_releases([report]);
+            }
+        }
         Ok(self.collector)
     }
 }

@@ -13,8 +13,8 @@ use dynamo_kv_router::config::KvRouterConfig;
 #[cfg(test)]
 pub(in crate::replay) use dynamo_kv_router::config::RouterQueuePolicy;
 use dynamo_kv_router::protocols::{
-    BlockHashOptions, OverlapScores, PrefillLoadHint, RouterEvent, RoutingConstraints,
-    WorkerConfigLike, WorkerId, WorkerWithDpRank, compute_block_hash_for_seq,
+    BlockHashOptions, KvCacheEventError, OverlapScores, PrefillLoadHint, RouterEvent,
+    RoutingConstraints, WorkerConfigLike, WorkerId, WorkerWithDpRank, compute_block_hash_for_seq,
 };
 use dynamo_kv_router::queue::DEFAULT_MAX_BATCHED_TOKENS;
 use dynamo_kv_router::scheduling::{
@@ -43,8 +43,8 @@ use crate::replay::offline::core::{
 };
 use crate::replay::offline::extensions::kv_events::RouterEventBatch;
 use crate::replay::router_shared::{
-    ReplayNoopPublisher, ReplayWorkerConfig, replay_router_config, replay_selector, replay_slots,
-    replay_worker_config, replay_workers_with_configs,
+    ReplayNoopPublisher, ReplayWorkerConfig, offline_replay_selector, replay_router_config,
+    replay_slots, replay_worker_config, replay_workers_with_configs,
 };
 use crate::replay::{ReplayPrefillLoadEstimator, ReplayRouterMode};
 
@@ -62,12 +62,25 @@ pub(in crate::replay::offline) use composition_disagg::{
 pub enum CanonicalReplayRouterMode {
     RoundRobin,
     KvRouter,
+    SessionAffinity,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CanonicalSessionAffinity {
+    pub ttl_secs: u64,
+    pub ranks_per_endpoint: u32,
+    pub random_seed: u64,
+    pub decode_seed_xor: u64,
+    pub ttl_clock: &'static str,
+    pub local_rank_policy: &'static str,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct CanonicalRouterMetadata {
     pub mode: CanonicalReplayRouterMode,
     pub config: Option<KvRouterConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_affinity: Option<CanonicalSessionAffinity>,
 }
 
 pub(in crate::replay) fn validate_canonical_router_config(config: &KvRouterConfig) -> Result<()> {
@@ -133,14 +146,34 @@ pub fn canonical_router_metadata(
             "canonical replay does not support router_policy_config"
         );
     }
-    let (mode, config) = match mode {
-        ReplayRouterMode::RoundRobin => (CanonicalReplayRouterMode::RoundRobin, None),
+    let (mode, config, session_affinity) = match mode {
+        ReplayRouterMode::RoundRobin => (CanonicalReplayRouterMode::RoundRobin, None, None),
         ReplayRouterMode::KvRouter => (
             CanonicalReplayRouterMode::KvRouter,
             Some(config.cloned().unwrap_or_default()),
+            None,
+        ),
+        ReplayRouterMode::SessionAffinity {
+            ttl_secs,
+            ranks_per_endpoint,
+        } => (
+            CanonicalReplayRouterMode::SessionAffinity,
+            None,
+            Some(CanonicalSessionAffinity {
+                ttl_secs,
+                ranks_per_endpoint,
+                random_seed: crate::replay::offline::core::session_affinity::SESSION_AFFINITY_SEED,
+                decode_seed_xor: 0xDEC0_DE,
+                ttl_clock: "simulated_completion_time_with_active_leases",
+                local_rank_policy: "round_robin_proxy_not_live_vllm_load_balancer",
+            }),
         ),
     };
-    Ok(CanonicalRouterMetadata { mode, config })
+    Ok(CanonicalRouterMetadata {
+        mode,
+        config,
+        session_affinity,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,7 +257,16 @@ impl SyncReplayIndexer {
         if !event.storage_tier.is_gpu() {
             return Ok(());
         }
-        self.tree.apply_event(event).map_err(Into::into)
+        match self.tree.apply_event(event) {
+            Ok(()) => Ok(()),
+            // Replay can observe remove/store events after a worker-local
+            // index has already advanced. These are recoverable stale-event
+            // races in the production indexer and must not fail a trial.
+            Err(KvCacheEventError::ParentBlockNotFound | KvCacheEventError::BlockNotFound) => {
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     #[cfg(test)]
@@ -514,7 +556,7 @@ impl OfflineReplayRouter {
         let worker_config_template = replay_worker_config(args);
         let workers_with_configs = replay_workers_with_configs(args, num_workers);
         let slots = replay_slots(args, &workers_with_configs);
-        let selector = replay_selector(&config);
+        let selector = offline_replay_selector(&config);
         let profile = config
             .configured_policy_profile()
             .map_err(anyhow::Error::from)?;
@@ -1038,8 +1080,8 @@ mod tests {
     use dynamo_kv_router::config::{KvRouterConfig, RouterPrefillLoadModel, RouterQueuePolicy};
     use dynamo_kv_router::protocols::{
         BlockHashOptions, ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData,
-        KvCacheStoreData, KvCacheStoredBlockData, LocalBlockHash, RouterEvent, StorageTier,
-        WorkerId,
+        KvCacheRemoveData, KvCacheStoreData, KvCacheStoredBlockData, LocalBlockHash, RouterEvent,
+        StorageTier, WorkerId,
     };
     use dynamo_kv_router::{PrefillLoadEstimator, TrackingHashAlgorithm};
     use rustc_hash::FxHashMap;
@@ -1164,6 +1206,77 @@ mod tests {
         )
     }
 
+    fn stored_event_with_parent(
+        worker_id: WorkerId,
+        event_id: u64,
+        parent_hash: u64,
+        tokens_hash: u64,
+    ) -> RouterEvent {
+        RouterEvent::new(
+            worker_id,
+            KvCacheEvent {
+                event_id,
+                data: KvCacheEventData::Stored(KvCacheStoreData {
+                    parent_hash: Some(ExternalSequenceBlockHash(parent_hash)),
+                    start_position: None,
+                    blocks: vec![KvCacheStoredBlockData {
+                        block_hash: ExternalSequenceBlockHash(event_id),
+                        tokens_hash: LocalBlockHash(tokens_hash),
+                        mm_extra_info: None,
+                    }],
+                }),
+                dp_rank: 0,
+            },
+        )
+    }
+
+    fn removed_event(worker_id: WorkerId, event_id: u64, block_hash: u64) -> RouterEvent {
+        RouterEvent::new(
+            worker_id,
+            KvCacheEvent {
+                event_id,
+                data: KvCacheEventData::Removed(KvCacheRemoveData {
+                    block_hashes: vec![ExternalSequenceBlockHash(block_hash)],
+                }),
+                dp_rank: 0,
+            },
+        )
+    }
+
+    #[test]
+    fn offline_router_uses_repeatable_tie_breaking() {
+        let config = KvRouterConfig {
+            router_temperature: 0.0,
+            ..KvRouterConfig::default()
+        };
+        let mut first =
+            OfflineReplayRouter::new(&replay_args(), Some(config.clone()), None, 3).unwrap();
+        let mut second = OfflineReplayRouter::new(&replay_args(), Some(config), None, 3).unwrap();
+
+        for request_id in 1..=64 {
+            let request = request(request_id, request_id as u32);
+            let first_worker = first
+                .on_request_arrival(&request, None, request_id as f64)
+                .unwrap()
+                .admissions[0]
+                .worker_idx;
+            let second_worker = second
+                .on_request_arrival(&request, None, request_id as f64)
+                .unwrap()
+                .admissions[0]
+                .worker_idx;
+            assert_eq!(first_worker, second_worker);
+
+            let uuid = Uuid::from_u128(request_id);
+            first
+                .on_request_completed(uuid, request_id as f64 + 0.5)
+                .unwrap();
+            second
+                .on_request_completed(uuid, request_id as f64 + 0.5)
+                .unwrap();
+        }
+    }
+
     #[test]
     fn session_identity_reaches_scheduling_request() {
         let router = OfflineReplayRouter::new(&replay_args(), None, None, 1).unwrap();
@@ -1235,6 +1348,83 @@ mod tests {
             .apply_event(store_event(7, 2, 101, StorageTier::Device))
             .unwrap();
         assert_eq!(indexer.debug_snapshot().total_cached_blocks, 1);
+    }
+
+    #[test]
+    fn stale_router_events_do_not_abort_offline_replay() {
+        let mut indexer = SyncReplayIndexer::new(64);
+
+        indexer
+            .apply_event(store_event(7, 1, 101, StorageTier::Device))
+            .unwrap();
+
+        // The parent was evicted from this worker's local lookup before the
+        // suffix event arrived. The event is stale but replay must continue.
+        indexer
+            .apply_event(stored_event_with_parent(7, 2, 999, 202))
+            .unwrap();
+        assert_eq!(indexer.debug_snapshot().total_cached_blocks, 1);
+
+        // Likewise, duplicate/late removes are recoverable and must not
+        // prevent a later valid store from being indexed.
+        indexer.apply_event(removed_event(7, 3, 999)).unwrap();
+        indexer
+            .apply_event(store_event(7, 4, 404, StorageTier::Device))
+            .unwrap();
+        assert_eq!(indexer.debug_snapshot().total_cached_blocks, 2);
+    }
+
+    #[test]
+    fn non_recoverable_router_event_errors_still_fail_replay() {
+        let mut indexer = SyncReplayIndexer::new(64);
+        let self_referencing = RouterEvent::new(
+            7,
+            KvCacheEvent {
+                event_id: 1,
+                data: KvCacheEventData::Stored(KvCacheStoreData {
+                    parent_hash: Some(ExternalSequenceBlockHash(1)),
+                    start_position: None,
+                    blocks: vec![KvCacheStoredBlockData {
+                        block_hash: ExternalSequenceBlockHash(1),
+                        tokens_hash: LocalBlockHash(101),
+                        mm_extra_info: None,
+                    }],
+                }),
+                dp_rank: 0,
+            },
+        );
+
+        assert!(indexer.apply_event(self_referencing).is_err());
+    }
+
+    #[test]
+    fn globalized_workflow_hashes_do_not_create_cross_workflow_router_overlap() {
+        let mut indexer = SyncReplayIndexer::new(64);
+        // AgentX compilation has already proven that distinct global ids
+        // materialize distinct token blocks. Exercise the router boundary
+        // directly with one block from each workflow namespace.
+        let left_tokens = vec![0; 64];
+        let right_tokens = vec![1; 64];
+        let left_hashes = ReplayRequestHashes::from_tokens(&left_tokens, 64);
+        let right_hashes = ReplayRequestHashes::from_tokens(&right_tokens, 64);
+
+        indexer
+            .apply_event(store_event(
+                7,
+                1,
+                left_hashes.local_block_hashes[0].0,
+                StorageTier::Device,
+            ))
+            .unwrap();
+
+        let same_workflow = indexer.find_matches_for_hashes(left_hashes.local_block_hashes.clone());
+        assert_eq!(same_workflow.scores.values().copied().max(), Some(1));
+
+        let other_workflow = indexer.find_matches_for_hashes(right_hashes.local_block_hashes);
+        assert!(
+            other_workflow.scores.values().all(|score| *score == 0),
+            "globally distinct workflow ids must not create KV-router prefix affinity"
+        );
     }
 
     #[test]

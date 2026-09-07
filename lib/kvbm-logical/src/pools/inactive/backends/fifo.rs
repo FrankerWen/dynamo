@@ -3,26 +3,26 @@
 
 //! FIFO reuse policy for inactive registered blocks.
 //!
-//! Allocates blocks in first-in-first-out order using a monotonic counter.
-//! Uses BTreeMap for O(log n) insertion/removal with priority key ordering.
+//! The queue is intrusive over dense `BlockId`s. This keeps insert, remove,
+//! and eviction O(1) without a per-entry `HashMap`/`BTreeMap` node. The only
+//! backing storage is a set of parallel vectors that grows to the largest
+//! materialized block id.
 
 #![allow(dead_code)]
 
 use super::reuse_policy::*;
 
-use std::collections::{BTreeMap, HashMap};
-
 use super::{BlockId, InactiveBlock};
-
-/// Monotonic sequence number used as priority key for FIFO ordering.
-pub type PriorityKey = u64;
 
 /// FIFO reuse policy
 #[derive(Debug)]
 pub(crate) struct FifoReusePolicy {
-    keys: HashMap<BlockId, PriorityKey>,
-    blocks: BTreeMap<PriorityKey, InactiveBlock>,
-    next_seq: u64,
+    blocks: Vec<Option<InactiveBlock>>,
+    previous: Vec<Option<BlockId>>,
+    next: Vec<Option<BlockId>>,
+    head: Option<BlockId>,
+    tail: Option<BlockId>,
+    count: usize,
 }
 
 impl Default for FifoReusePolicy {
@@ -34,58 +34,74 @@ impl Default for FifoReusePolicy {
 impl FifoReusePolicy {
     pub fn new() -> Self {
         Self {
-            keys: HashMap::new(),
-            blocks: BTreeMap::new(),
-            next_seq: 0,
+            blocks: Vec::new(),
+            previous: Vec::new(),
+            next: Vec::new(),
+            head: None,
+            tail: None,
+            count: 0,
         }
+    }
+
+    fn ensure_slot(&mut self, block_id: BlockId) {
+        let required = block_id.saturating_add(1);
+        if self.blocks.len() < required {
+            self.blocks.resize(required, None);
+            self.previous.resize(required, None);
+            self.next.resize(required, None);
+        }
+    }
+
+    fn unlink(&mut self, block_id: BlockId) -> Option<InactiveBlock> {
+        let block = self.blocks.get_mut(block_id)?.take()?;
+        let previous = self.previous[block_id].take();
+        let next = self.next[block_id].take();
+        match previous {
+            Some(previous) => self.next[previous] = next,
+            None => self.head = next,
+        }
+        match next {
+            Some(next) => self.previous[next] = previous,
+            None => self.tail = previous,
+        }
+        self.count = self.count.saturating_sub(1);
+        Some(block)
     }
 }
 
 impl ReusePolicy for FifoReusePolicy {
     fn insert(&mut self, inactive_block: InactiveBlock) -> Result<(), ReusePolicyError> {
-        assert!(
-            !self.keys.contains_key(&inactive_block.block_id),
-            "block already exists"
-        );
-        let priority_key = self.next_seq;
-        self.next_seq += 1;
-        self.keys.insert(inactive_block.block_id, priority_key);
-        self.blocks.insert(priority_key, inactive_block);
+        let block_id = inactive_block.block_id;
+        self.ensure_slot(block_id);
+        assert!(self.blocks[block_id].is_none(), "block already exists");
+        self.blocks[block_id] = Some(inactive_block);
+        self.previous[block_id] = self.tail;
+        self.next[block_id] = None;
+        match self.tail {
+            Some(tail) => self.next[tail] = Some(block_id),
+            None => self.head = Some(block_id),
+        }
+        self.tail = Some(block_id);
+        self.count = self.count.saturating_add(1);
         Ok(())
     }
 
     fn remove(&mut self, block_id: BlockId) -> Result<(), ReusePolicyError> {
-        let priority_key = self
-            .keys
-            .remove(&block_id)
-            .ok_or(ReusePolicyError::BlockNotFound(block_id))?;
-
-        assert!(
-            self.blocks.remove(&priority_key).is_some(),
-            "block not found"
-        );
-        Ok(())
+        self.unlink(block_id)
+            .map(|_| ())
+            .ok_or(ReusePolicyError::BlockNotFound(block_id))
     }
 
     fn next_free(&mut self) -> Option<InactiveBlock> {
-        let next_block = self.blocks.pop_first();
-        if let Some((_, block)) = next_block {
-            assert!(
-                self.keys.remove(&block.block_id).is_some(),
-                "block not found"
-            );
-            Some(block)
-        } else {
-            None
-        }
+        self.unlink(self.head?)
     }
 
     fn is_empty(&self) -> bool {
-        self.blocks.is_empty()
+        self.count == 0
     }
 
     fn len(&self) -> usize {
-        self.blocks.len()
+        self.count
     }
 }
 
@@ -295,21 +311,22 @@ mod tests {
     }
 
     #[test]
-    fn test_priority_key_ordering() {
+    fn test_intrusive_link_ordering() {
         let mut policy = FifoReusePolicy::new();
 
-        // Insert blocks — monotonic counter guarantees unique, ordered keys
+        // Insert blocks and verify the dense link vectors encode insertion
+        // order without an auxiliary tree or hash table.
         for i in 1..=5 {
             policy
                 .insert(create_inactive_block(i, i as u64 * 100))
                 .unwrap();
         }
-
-        // Verify each key is unique and strictly increasing
-        let keys: Vec<PriorityKey> = (1..=5).map(|id| *policy.keys.get(&id).unwrap()).collect();
-        for window in keys.windows(2) {
-            assert!(window[0] < window[1], "keys must be strictly increasing");
-        }
+        assert_eq!(policy.head, Some(1));
+        assert_eq!(policy.tail, Some(5));
+        assert_eq!(policy.previous[1], None);
+        assert_eq!(policy.next[1], Some(2));
+        assert_eq!(policy.previous[5], Some(4));
+        assert_eq!(policy.next[5], None);
 
         // Retrieve all blocks and verify they come out in insertion order
         let mut retrieval_order: Vec<BlockId> = Vec::new();
@@ -322,25 +339,14 @@ mod tests {
     }
 
     #[test]
-    fn test_btreemap_ordering_assumption() {
-        use std::collections::BTreeMap;
-
-        // Verify our assumption about BTreeMap ordering with u64 keys
-        let mut map = BTreeMap::new();
-
-        // Insert keys in non-sorted order
-        map.insert(100u64, "hundred");
-        map.insert(10u64, "ten");
-        map.insert(50u64, "fifty");
-        map.insert(1u64, "one");
-        map.insert(200u64, "two_hundred");
-
-        // pop_first should return the smallest key first
-        assert_eq!(map.pop_first(), Some((1, "one")));
-        assert_eq!(map.pop_first(), Some((10, "ten")));
-        assert_eq!(map.pop_first(), Some((50, "fifty")));
-        assert_eq!(map.pop_first(), Some((100, "hundred")));
-        assert_eq!(map.pop_first(), Some((200, "two_hundred")));
-        assert_eq!(map.pop_first(), None);
+    fn test_dense_vectors_grow_to_largest_materialized_id() {
+        let mut policy = FifoReusePolicy::new();
+        policy.insert(create_inactive_block(3, 300)).unwrap();
+        policy.insert(create_inactive_block(100, 10_000)).unwrap();
+        assert_eq!(policy.blocks.len(), 101);
+        assert_eq!(policy.previous.len(), 101);
+        assert_eq!(policy.next.len(), 101);
+        assert_eq!(policy.next_free().unwrap().block_id, 3);
+        assert_eq!(policy.next_free().unwrap().block_id, 100);
     }
 }

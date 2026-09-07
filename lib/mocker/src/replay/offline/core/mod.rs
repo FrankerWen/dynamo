@@ -10,6 +10,7 @@ use anyhow::Result;
 use uuid::Uuid;
 
 pub(crate) mod round_robin;
+pub(crate) mod session_affinity;
 
 pub(crate) trait RequestIdentity {
     fn request_id(&self) -> Option<Uuid>;

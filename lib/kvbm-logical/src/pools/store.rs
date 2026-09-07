@@ -42,6 +42,7 @@ use crate::blocks::{
     BlockDuplicationPolicy, BlockMetadata, CompleteBlock, ImmutableBlockInner, MutableBlock,
     SequenceHash,
 };
+use crate::manager::{ArenaReleaseReport, BlockArenaSnapshot};
 use crate::metrics::BlockPoolMetrics;
 use crate::registry::BlockRegistrationHandle;
 
@@ -184,7 +185,8 @@ pub(crate) struct BlockSlot<T: BlockMetadata> {
 
 /// Inner state of a `BlockStore` — protected by a single mutex.
 pub(crate) struct BlockStoreInner<T: BlockMetadata> {
-    /// `slots[block_id]` — created at construction, never grows.
+    /// `slots[block_id]` — dense materialized slot metadata. In lazy mode the
+    /// vector grows monotonically as logical capacity is consumed.
     slots: Vec<BlockSlot<T>>,
     /// Free list (reset pool). FIFO.
     free: VecDeque<BlockId>,
@@ -196,7 +198,8 @@ pub(crate) struct BlockStoreInner<T: BlockMetadata> {
     /// already a content hash.
     active_by_hash: SeqHashMap<BlockId>,
     /// Per-slot "reset on last drop" override, indexed by `BlockId`.
-    /// Length is fixed to `total_blocks` at construction.
+    /// In eager mode this is sized to `total_blocks`; in lazy mode it grows
+    /// alongside the materialized slot arena.
     ///
     /// Written by [`crate::blocks::ImmutableBlock::set_evict_on_reset`]
     /// (which acquires this same mutex for the write); read by
@@ -233,6 +236,7 @@ pub(crate) struct BlockStore<T: BlockMetadata> {
     /// holders can still override per-block via
     /// `ImmutableBlock::set_evict_on_reset`.
     default_reset_on_release: bool,
+    lazy_slot_materialization: bool,
     /// Test-only hook to deterministically widen the
     /// "Arc strong=0 but `release_primary` not yet run" race window.
     /// `release_primary` acquires this gate *before* taking the store
@@ -262,16 +266,55 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         metrics: Arc<BlockPoolMetrics>,
         default_reset_on_release: bool,
     ) -> Arc<Self> {
-        let mut slots = Vec::with_capacity(total_blocks);
-        let mut free = VecDeque::with_capacity(total_blocks);
-        for i in 0..total_blocks {
+        Self::new_with_materialization(
+            total_blocks,
+            block_size,
+            inactive,
+            metrics,
+            default_reset_on_release,
+            false,
+        )
+    }
+
+    /// Construct a logical-capacity store without preallocating per-slot
+    /// metadata. Slot ids remain dense and stable; vectors grow only as a
+    /// previously unseen slot is allocated.
+    pub(crate) fn new_lazy(
+        total_blocks: usize,
+        block_size: usize,
+        inactive: Box<dyn InactiveIndex>,
+        metrics: Arc<BlockPoolMetrics>,
+        default_reset_on_release: bool,
+    ) -> Arc<Self> {
+        Self::new_with_materialization(
+            total_blocks,
+            block_size,
+            inactive,
+            metrics,
+            default_reset_on_release,
+            true,
+        )
+    }
+
+    fn new_with_materialization(
+        total_blocks: usize,
+        block_size: usize,
+        inactive: Box<dyn InactiveIndex>,
+        metrics: Arc<BlockPoolMetrics>,
+        default_reset_on_release: bool,
+        lazy: bool,
+    ) -> Arc<Self> {
+        let initial = if lazy { 0 } else { total_blocks };
+        let mut slots = Vec::with_capacity(initial);
+        let mut free = VecDeque::with_capacity(initial);
+        for i in 0..initial {
             slots.push(BlockSlot {
                 block_size,
                 state: SlotState::Reset,
             });
             free.push_back(i);
         }
-        let reset_on_release = vec![default_reset_on_release; total_blocks];
+        let reset_on_release = vec![default_reset_on_release; initial];
         Arc::new(Self {
             id: crate::ManagerId::next(),
             inner: Mutex::new(BlockStoreInner {
@@ -285,6 +328,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
             total_blocks,
             metrics,
             default_reset_on_release,
+            lazy_slot_materialization: lazy,
             #[cfg(test)]
             release_primary_gate: Mutex::new(()),
             #[cfg(test)]
@@ -313,6 +357,87 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
                     .capacity()
                     .saturating_mul(std::mem::size_of::<bool>()),
             )
+    }
+
+    pub(crate) fn materialized_slot_count(&self) -> usize {
+        self.inner.lock().slots.len()
+    }
+
+    pub(crate) fn arena_snapshot(&self) -> BlockArenaSnapshot {
+        let inner = self.inner.lock();
+        let mut snapshot = BlockArenaSnapshot {
+            logical_slots: self.total_blocks,
+            materialized_slots: inner.slots.len(),
+            unmaterialized_slots: self.unmaterialized_slots(&inner),
+            fixed_slot_metadata_bytes: inner
+                .slots
+                .capacity()
+                .saturating_mul(std::mem::size_of::<BlockSlot<T>>())
+                .saturating_add(
+                    inner
+                        .free
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<BlockId>()),
+                )
+                .saturating_add(
+                    inner
+                        .reset_on_release
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<bool>()),
+                ),
+            ..BlockArenaSnapshot::default()
+        };
+        for slot in &inner.slots {
+            match slot.state {
+                SlotState::Reset => snapshot.reset_slots += 1,
+                SlotState::Mutable => snapshot.mutable_slots += 1,
+                SlotState::Staged { .. } => snapshot.staged_slots += 1,
+                SlotState::Primary { .. } => snapshot.primary_slots += 1,
+                SlotState::Duplicate { .. } => snapshot.duplicate_slots += 1,
+                SlotState::Inactive { .. } => snapshot.inactive_slots += 1,
+            }
+        }
+        snapshot
+    }
+
+    pub(crate) fn resident_sequence_hashes(&self) -> Vec<SequenceHash> {
+        let inner = self.inner.lock();
+        let mut hashes = inner
+            .slots
+            .iter()
+            .filter_map(|slot| match &slot.state {
+                SlotState::Primary { seq_hash, .. }
+                | SlotState::Duplicate { seq_hash, .. }
+                | SlotState::Inactive { seq_hash, .. } => Some(*seq_hash),
+                SlotState::Reset | SlotState::Mutable | SlotState::Staged { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        hashes.sort_by_key(SequenceHash::as_u128);
+        hashes
+    }
+
+    fn unmaterialized_slots(&self, inner: &BlockStoreInner<T>) -> usize {
+        if self.lazy_slot_materialization {
+            self.total_blocks.saturating_sub(inner.slots.len())
+        } else {
+            0
+        }
+    }
+
+    fn materialize_reset_slots(&self, inner: &mut BlockStoreInner<T>, requested: usize) {
+        let count = requested.min(self.unmaterialized_slots(inner));
+        let start = inner.slots.len();
+        inner.slots.reserve(count);
+        inner.reset_on_release.reserve(count);
+        for offset in 0..count {
+            let block_id = start + offset;
+            inner.slots.push(BlockSlot {
+                block_size: self.block_size,
+                state: SlotState::Reset,
+            });
+            inner.reset_on_release.push(self.default_reset_on_release);
+            inner.free.push_back(block_id);
+        }
     }
 
     /// Store-wide default for the per-slot "reset on last drop" override.
@@ -372,7 +497,8 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
     }
 
     pub(crate) fn reset_len(&self) -> usize {
-        self.inner.lock().free.len()
+        let inner = self.inner.lock();
+        inner.free.len() + self.unmaterialized_slots(&inner)
     }
 
     pub(crate) fn inactive_len(&self) -> usize {
@@ -385,7 +511,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
     /// twice, inflating the total above `total_blocks`).
     pub(crate) fn available_len(&self) -> usize {
         let inner = self.inner.lock();
-        inner.free.len() + inner.inactive.len()
+        inner.free.len() + inner.inactive.len() + self.unmaterialized_slots(&inner)
     }
 
     pub(crate) fn has_inactive(&self, seq_hash: SequenceHash) -> bool {
@@ -402,6 +528,8 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
     /// Returns however many were available (no eviction).
     pub(crate) fn allocate_reset_blocks(self: &Arc<Self>, count: usize) -> Vec<MutableBlock<T>> {
         let mut inner = self.inner.lock();
+        let missing = count.saturating_sub(inner.free.len());
+        self.materialize_reset_slots(&mut inner, missing);
         let take = std::cmp::min(count, inner.free.len());
         let mut out = Vec::with_capacity(take);
         for _ in 0..take {
@@ -431,9 +559,20 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
             return Some((Vec::new(), Vec::new()));
         }
         let mut inner = self.inner.lock();
-        if inner.free.len() + inner.inactive.len() < count {
+        if inner.free.len() + inner.inactive.len() + self.unmaterialized_slots(&inner) < count {
             return None;
         }
+        // A lazy store has a logical slot ceiling larger than its current
+        // materialized arena.  Grow into that unmaterialized capacity before
+        // evicting an inactive resident; otherwise every allocation after the
+        // first wave would recycle the small inactive set and the compact
+        // backend would acquire an accidental "active concurrency" slot cap.
+        let missing_reset = if self.lazy_slot_materialization {
+            count.saturating_sub(inner.free.len())
+        } else {
+            count.saturating_sub(inner.free.len() + inner.inactive.len())
+        };
+        self.materialize_reset_slots(&mut inner, missing_reset);
 
         let from_reset = std::cmp::min(count, inner.free.len());
         let from_inactive = count - from_reset;
@@ -527,6 +666,69 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
             h.mark_absent::<T>();
         }
         out
+    }
+
+    /// Release all backing arena storage after an offline replay has drained.
+    ///
+    /// A normal `BlockStore` keeps its dense slot arena for the lifetime of the
+    /// manager. That is useful for a serving process, but it makes a completed
+    /// high-capacity replay pay a large serial destructor cost. The replay
+    /// owner calls this only after all request guards and offload work are
+    /// drained, so resetting the arena is semantically equivalent to tearing
+    /// down the manager while allowing the surrounding scheduler object to be
+    /// reused.
+    pub(crate) fn release_arena_for_replay(&self) -> ArenaReleaseReport {
+        let started_at = std::time::Instant::now();
+        let metrics = self.metrics.snapshot();
+        assert_eq!(
+            metrics.inflight_mutable, 0,
+            "replay arena release requires zero mutable leases"
+        );
+        assert_eq!(
+            metrics.inflight_immutable, 0,
+            "replay arena release requires zero immutable leases"
+        );
+        let before = self.arena_snapshot();
+        assert_eq!(
+            before.mutable_slots
+                + before.staged_slots
+                + before.primary_slots
+                + before.duplicate_slots,
+            0,
+            "replay arena release requires every materialized slot to be reset or inactive"
+        );
+
+        let (slots, inactive_handles) = {
+            let mut inner = self.inner.lock();
+            assert!(
+                inner.active_by_hash.is_empty(),
+                "replay arena release requires an empty active hash index"
+            );
+            let inactive = inner.inactive.allocate_all();
+            let mut handles = Vec::with_capacity(inactive.len());
+            for (_seq_hash, block_id) in inactive {
+                let state = std::mem::replace(&mut inner.slots[block_id].state, SlotState::Reset);
+                if let SlotState::Inactive { handle, .. } = state {
+                    handles.push(handle);
+                } else {
+                    panic!("inactive index referenced non-inactive slot {block_id}");
+                }
+            }
+            inner.free.clear();
+            inner.reset_on_release.clear();
+            (std::mem::take(&mut inner.slots), handles)
+        };
+
+        // Presence attachments use their own lock and must be updated outside
+        // the store mutex. The handles are then dropped in one batch.
+        for handle in inactive_handles {
+            handle.mark_absent::<T>();
+        }
+        drop(slots);
+        ArenaReleaseReport {
+            before,
+            wall_time_us: u64::try_from(started_at.elapsed().as_micros()).unwrap_or(u64::MAX),
+        }
     }
 
     /// Promote inactive slots to `Primary`, building fresh

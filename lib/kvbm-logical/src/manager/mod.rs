@@ -25,6 +25,30 @@ use crate::metrics::BlockPoolMetrics;
 use crate::pools::{BlockDuplicationPolicy, BlockStore, SequenceHash};
 use crate::registry::BlockRegistry;
 
+/// Coherent slot-state snapshot used by offline replay telemetry and teardown
+/// validation. `unmaterialized` represents logical reset capacity that has no
+/// backing metadata in a lazy store.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BlockArenaSnapshot {
+    pub logical_slots: usize,
+    pub materialized_slots: usize,
+    pub unmaterialized_slots: usize,
+    pub reset_slots: usize,
+    pub mutable_slots: usize,
+    pub staged_slots: usize,
+    pub primary_slots: usize,
+    pub duplicate_slots: usize,
+    pub inactive_slots: usize,
+    pub fixed_slot_metadata_bytes: usize,
+}
+
+/// Result of the replay-only bulk arena release.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ArenaReleaseReport {
+    pub before: BlockArenaSnapshot,
+    pub wall_time_us: u64,
+}
+
 /// Manages the full block lifecycle over the unified [`BlockStore`].
 ///
 /// Construct via [`BlockManager::builder()`].
@@ -62,6 +86,21 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
         self.store.fixed_slot_metadata_bytes()
     }
 
+    /// Number of dense slot ids whose metadata has actually been materialized.
+    pub fn materialized_slot_count(&self) -> usize {
+        self.store.materialized_slot_count()
+    }
+
+    /// Stable sorted resident hash snapshot for reference/compact differential checks.
+    pub fn resident_sequence_hashes(&self) -> Vec<SequenceHash> {
+        self.store.resident_sequence_hashes()
+    }
+
+    /// Coherent materialized G1/G2 slot state for offline diagnostics.
+    pub fn arena_snapshot(&self) -> BlockArenaSnapshot {
+        self.store.arena_snapshot()
+    }
+
     /// Allocate `count` mutable blocks, drawing first from the reset pool
     /// and then evicting from the inactive pool if needed.
     ///
@@ -94,6 +133,14 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
         }
 
         Ok(())
+    }
+
+    /// Drop dense slot metadata after a completed offline replay.
+    ///
+    /// This is intentionally not part of the serving lifecycle: callers must
+    /// invoke it only after all block guards and pending transfers are gone.
+    pub fn release_arena_for_replay(&self) -> ArenaReleaseReport {
+        self.store.release_arena_for_replay()
     }
 
     /// Register a batch of completed blocks.

@@ -17,11 +17,71 @@ const DEFAULT_G2_G4_BANDWIDTH_GBPS: f64 = 4.0;
 /// Physical admission remains strictly enforced in bytes by CapacityReservations.
 pub const DEFAULT_MAX_DERIVED_G2_SLOTS: usize = 2_000_000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum G2SlotMode {
+    CappedDense,
+    RawDerivedDense,
+    SparseByteNative,
+}
+
+impl G2SlotMode {
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "capped_dense" => Ok(Self::CappedDense),
+            "raw_derived_dense" => Ok(Self::RawDerivedDense),
+            "sparse_byte_native" => Ok(Self::SparseByteNative),
+            other => anyhow::bail!("unsupported g2_slot_mode={other:?}"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CappedDense => "capped_dense",
+            Self::RawDerivedDense => "raw_derived_dense",
+            Self::SparseByteNative => "sparse_byte_native",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OfflineKvbmBackend {
+    Reference,
+    /// Diagnostic A/B mode: reference G1 plus compact sparse/lazy G2.
+    CompactG2Only,
+    Compact,
+}
+
+impl OfflineKvbmBackend {
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "reference" => Ok(Self::Reference),
+            "compact_g2_only" => Ok(Self::CompactG2Only),
+            "compact" => Ok(Self::Compact),
+            other => anyhow::bail!("unsupported offline_kvbm_backend={other:?}"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reference => "reference",
+            Self::CompactG2Only => "compact_g2_only",
+            Self::Compact => "compact",
+        }
+    }
+
+    pub fn uses_compact_g2(self) -> bool {
+        matches!(self, Self::CompactG2Only | Self::Compact)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct KvbmOffloadConfig {
     /// Number of G2 blocks to simulate. Sets the capacity of the
     /// `BlockManager<G2>` owned by the engine.
     pub num_g2_blocks: usize,
+    pub raw_derived_g2_slots: Option<usize>,
+    pub g2_slot_mode: G2SlotMode,
+    pub offline_kvbm_backend: OfflineKvbmBackend,
     /// Rank-local physical G2 byte capacity. When set, admission is enforced
     /// against AIC-derived per-position block sizes in addition to slots.
     pub g2_capacity_bytes: Option<usize>,
@@ -98,6 +158,9 @@ impl Default for KvbmOffloadConfig {
     fn default() -> Self {
         Self {
             num_g2_blocks: 100_000,
+            raw_derived_g2_slots: None,
+            g2_slot_mode: G2SlotMode::CappedDense,
+            offline_kvbm_backend: OfflineKvbmBackend::Reference,
             g2_capacity_bytes: None,
             g2_fabric_id: None,
             block_size_tokens: 64,
@@ -133,7 +196,12 @@ impl KvbmOffloadConfig {
             .num_g3_blocks
             .and_then(|block_count| (block_count > 0).then_some(block_count));
         let enable_g4_storage = args.enable_g4_storage;
-        let derived_num_g2_blocks = match (
+        let g2_slot_mode = G2SlotMode::parse(&args.g2_slot_mode)?;
+        let offline_kvbm_backend = OfflineKvbmBackend::parse(&args.offline_kvbm_backend)?;
+        if offline_kvbm_backend.uses_compact_g2() && g2_slot_mode != G2SlotMode::SparseByteNative {
+            anyhow::bail!("compact G2 backend requires g2_slot_mode=sparse_byte_native");
+        }
+        let raw_derived_g2_slots = match (
             args.g2_capacity_bytes,
             args.kv_block_footprint_bytes.as_ref(),
         ) {
@@ -147,12 +215,14 @@ impl KvbmOffloadConfig {
                         "g2_capacity_bytes={capacity} cannot hold the smallest AIC KV block ({min_block} bytes)"
                     );
                 }
-                // Cap logical slot materialization to a generous active bound (2M slots).
-                // Physical tier capacity is strictly bounded by CapacityReservations.
-                Some(raw_slots.min(DEFAULT_MAX_DERIVED_G2_SLOTS))
+                Some(raw_slots)
             }
             _ => None,
         };
+        let derived_num_g2_blocks = raw_derived_g2_slots.map(|raw_slots| match g2_slot_mode {
+            G2SlotMode::CappedDense => raw_slots.min(DEFAULT_MAX_DERIVED_G2_SLOTS),
+            G2SlotMode::RawDerivedDense | G2SlotMode::SparseByteNative => raw_slots,
+        });
         let Some(num_g2_blocks) = args.num_g2_blocks.or(derived_num_g2_blocks) else {
             if num_g3_blocks.is_some() || enable_g4_storage {
                 anyhow::bail!(
@@ -189,6 +259,9 @@ impl KvbmOffloadConfig {
             .unwrap_or(defaults.offload_batch_size);
         Ok(Some(Self {
             num_g2_blocks,
+            raw_derived_g2_slots,
+            g2_slot_mode,
+            offline_kvbm_backend,
             g2_capacity_bytes: args.g2_capacity_bytes,
             g2_fabric_id: args.g2_fabric_id.clone(),
             block_size_tokens: args.block_size,
@@ -376,6 +449,52 @@ mod tests {
 
         assert_eq!(cfg.g2_capacity_bytes, Some(17_000_000_000_000));
         assert_eq!(cfg.num_g2_blocks, DEFAULT_MAX_DERIVED_G2_SLOTS);
+        assert_eq!(cfg.g2_slot_mode, G2SlotMode::CappedDense);
+        assert_eq!(cfg.raw_derived_g2_slots, Some(245_949_074));
+    }
+
+    #[test]
+    fn raw_dense_and_sparse_modes_keep_the_byte_derived_logical_ceiling() {
+        let raw_slots = 17_000_000_000_000usize / 69_120usize;
+        for (mode, backend, expected_mode, expected_backend) in [
+            (
+                "raw_derived_dense",
+                "reference",
+                G2SlotMode::RawDerivedDense,
+                OfflineKvbmBackend::Reference,
+            ),
+            (
+                "sparse_byte_native",
+                "compact_g2_only",
+                G2SlotMode::SparseByteNative,
+                OfflineKvbmBackend::CompactG2Only,
+            ),
+            (
+                "sparse_byte_native",
+                "compact",
+                G2SlotMode::SparseByteNative,
+                OfflineKvbmBackend::Compact,
+            ),
+        ] {
+            let args = MockEngineArgs::builder()
+                .block_size(64)
+                .g2_capacity_bytes(Some(17_000_000_000_000))
+                .kv_block_footprint_bytes(Some(vec![69_120]))
+                .kv_footprint_source(Some("aic:test".to_string()))
+                .g2_slot_mode(mode.to_string())
+                .offline_kvbm_backend(backend.to_string())
+                .build()
+                .unwrap()
+                .normalized()
+                .unwrap();
+            let cfg = KvbmOffloadConfig::from_args(&args)
+                .unwrap()
+                .expect("byte-native G2 should build");
+            assert_eq!(cfg.num_g2_blocks, raw_slots);
+            assert_eq!(cfg.raw_derived_g2_slots, Some(raw_slots));
+            assert_eq!(cfg.g2_slot_mode, expected_mode);
+            assert_eq!(cfg.offline_kvbm_backend, expected_backend);
+        }
     }
 
     #[test]

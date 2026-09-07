@@ -38,7 +38,7 @@ pub use integrations::{
     ApplyError, DecodeOutcome, NoopDelegate, RequestSequence, SchedulableSequence,
     SchedulableSequenceBuilder, ScheduleError, SequenceDelegate, SequenceEvent, SequenceState,
 };
-pub use manager::BlockManager;
+pub use manager::{ArenaReleaseReport, BlockArenaSnapshot, BlockManager, LineageEviction};
 pub use registry::BlockRegistry;
 pub use sequence::{
     BlockSequence, BlockSequenceError, ExternalBlockAssignments, LogicalBlockAssignmentError,

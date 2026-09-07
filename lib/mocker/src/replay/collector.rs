@@ -44,6 +44,40 @@ pub struct TraceSimulationReport {
     /// independently of protocol evidence so attach/configuration failures can
     /// fail closed without being mistaken for workload failures.
     pub offload: Option<OffloadResourceSummary>,
+    /// Replay-only bulk G1 arena release evidence. Serving never populates
+    /// this field.
+    pub replay_teardown: Option<ReplayArenaReleaseSummary>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct ReplayArenaReleaseSummary {
+    pub released_arenas: usize,
+    pub logical_slots: usize,
+    pub materialized_slots: usize,
+    pub inactive_slots: usize,
+    pub fixed_slot_metadata_bytes: usize,
+    pub total_wall_time_us: u64,
+    pub max_wall_time_us: u64,
+}
+
+impl ReplayArenaReleaseSummary {
+    fn add(&mut self, report: kvbm_logical::ArenaReleaseReport) {
+        self.released_arenas = self.released_arenas.saturating_add(1);
+        self.logical_slots = self
+            .logical_slots
+            .saturating_add(report.before.logical_slots);
+        self.materialized_slots = self
+            .materialized_slots
+            .saturating_add(report.before.materialized_slots);
+        self.inactive_slots = self
+            .inactive_slots
+            .saturating_add(report.before.inactive_slots);
+        self.fixed_slot_metadata_bytes = self
+            .fixed_slot_metadata_bytes
+            .saturating_add(report.before.fixed_slot_metadata_bytes);
+        self.total_wall_time_us = self.total_wall_time_us.saturating_add(report.wall_time_us);
+        self.max_wall_time_us = self.max_wall_time_us.max(report.wall_time_us);
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -66,13 +100,23 @@ pub struct OffloadTransferSummary {
     pub g4_to_g2: OffloadDirectionSummary,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
 pub struct G2ByteCapacitySummary {
     pub capacity_bytes: usize,
+    pub logical_slot_capacity: usize,
     pub reserved_bytes: usize,
     pub occupied_bytes: usize,
     pub peak_committed_bytes: usize,
+    pub reserved_blocks: usize,
+    pub occupied_blocks: usize,
+    pub peak_committed_blocks: usize,
+    pub slot_utilization: f64,
+    pub peak_slot_utilization: f64,
+    pub byte_utilization: f64,
+    pub peak_byte_utilization: f64,
     pub admission_rejections: u64,
+    pub slot_admission_rejections: u64,
+    pub byte_admission_rejections: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -92,7 +136,7 @@ pub struct G4CacheSummary {
     pub restore_bytes: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct OffloadRankSummary {
     pub role: String,
     pub worker_id: usize,
@@ -100,6 +144,25 @@ pub struct OffloadRankSummary {
     pub configured_g2_capacity_bytes: Option<usize>,
     pub g2_fabric_id: Option<String>,
     pub effective_num_g2_blocks: usize,
+    pub raw_derived_g2_slots: Option<usize>,
+    pub g2_slot_mode: String,
+    pub offline_kvbm_backend: String,
+    pub g1_backend: String,
+    pub g1_logical_slots: usize,
+    pub g1_materialized_slots: usize,
+    pub g1_unmaterialized_slots: usize,
+    pub g1_reset_slots: usize,
+    pub g1_mutable_slots: usize,
+    pub g1_staged_slots: usize,
+    pub g1_primary_slots: usize,
+    pub g1_duplicate_slots: usize,
+    pub g1_inactive_slots: usize,
+    pub g1_fixed_slot_metadata_bytes: usize,
+    pub g1_resident_checksum_algorithm: String,
+    pub g1_resident_checksum: String,
+    pub materialized_g2_slots: usize,
+    pub resident_checksum_algorithm: String,
+    pub resident_checksum: String,
     pub slot_derivation: String,
     pub fixed_slot_metadata_lower_bound_bytes: usize,
     pub kv_footprint_source: Option<String>,
@@ -113,7 +176,7 @@ pub struct OffloadRankSummary {
     pub transfers: OffloadTransferSummary,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct OffloadResourceSummary {
     pub requested: bool,
     pub feature_enabled: bool,
@@ -128,6 +191,9 @@ pub struct OffloadResourceSummary {
     pub effective_g2_capacity_bytes: usize,
     pub effective_num_g2_blocks: usize,
     pub fixed_slot_metadata_lower_bound_bytes: usize,
+    pub g1_materialized_slots: usize,
+    pub g1_fixed_slot_metadata_bytes: usize,
+    pub g1_backends: Vec<String>,
     pub expected_scheduler_ranks: usize,
     pub attached_scheduler_ranks: usize,
     pub operational_status: String,
@@ -207,11 +273,39 @@ impl From<crate::kvbm_offload::capacity_reservation::ByteCapacityMetrics>
     fn from(value: crate::kvbm_offload::capacity_reservation::ByteCapacityMetrics) -> Self {
         Self {
             capacity_bytes: value.capacity_bytes,
+            logical_slot_capacity: value.logical_slot_capacity,
             reserved_bytes: value.reserved_bytes,
             occupied_bytes: value.occupied_bytes,
             peak_committed_bytes: value.peak_committed_bytes,
+            reserved_blocks: value.reserved_blocks,
+            occupied_blocks: value.occupied_blocks,
+            peak_committed_blocks: value.peak_committed_blocks,
+            slot_utilization: utilization(
+                value.reserved_blocks.saturating_add(value.occupied_blocks),
+                value.logical_slot_capacity,
+            ),
+            peak_slot_utilization: utilization(
+                value.peak_committed_blocks,
+                value.logical_slot_capacity,
+            ),
+            byte_utilization: utilization(
+                value.reserved_bytes.saturating_add(value.occupied_bytes),
+                value.capacity_bytes,
+            ),
+            peak_byte_utilization: utilization(value.peak_committed_bytes, value.capacity_bytes),
             admission_rejections: value.admission_rejections,
+            slot_admission_rejections: value.slot_admission_rejections,
+            byte_admission_rejections: value.byte_admission_rejections,
         }
+    }
+}
+
+#[cfg(feature = "kvbm-offload")]
+fn utilization(value: usize, capacity: usize) -> f64 {
+    if capacity == 0 {
+        0.0
+    } else {
+        value as f64 / capacity as f64
     }
 }
 
@@ -262,6 +356,9 @@ impl OffloadResourceSummary {
         let mut effective_g2_capacity_bytes = 0usize;
         let mut effective_num_g2_blocks = 0usize;
         let mut fixed_slot_metadata_lower_bound_bytes = 0usize;
+        let mut g1_materialized_slots = 0usize;
+        let mut g1_fixed_slot_metadata_bytes = 0usize;
+        let mut g1_backends = BTreeSet::new();
         let mut transfers = OffloadTransferSummary::default();
         let mut ranks = Vec::with_capacity(snapshots.len());
         let mut all_dynamic = !snapshots.is_empty();
@@ -311,6 +408,11 @@ impl OffloadResourceSummary {
             effective_num_g2_blocks = effective_num_g2_blocks.saturating_add(config.num_g2_blocks);
             fixed_slot_metadata_lower_bound_bytes = fixed_slot_metadata_lower_bound_bytes
                 .saturating_add(snapshot.fixed_slot_metadata_bytes);
+            g1_materialized_slots =
+                g1_materialized_slots.saturating_add(snapshot.g1_arena.materialized_slots);
+            g1_fixed_slot_metadata_bytes = g1_fixed_slot_metadata_bytes
+                .saturating_add(snapshot.g1_arena.fixed_slot_metadata_bytes);
+            g1_backends.insert(snapshot.g1_backend.clone());
             let rank_transfers: OffloadTransferSummary = snapshot.transfers.into();
             transfers.add(rank_transfers);
             if let Some(g4) = snapshot.g4_cache {
@@ -323,8 +425,38 @@ impl OffloadResourceSummary {
                 configured_g2_capacity_bytes: configured_capacity,
                 g2_fabric_id: config.g2_fabric_id,
                 effective_num_g2_blocks: config.num_g2_blocks,
+                raw_derived_g2_slots: config.raw_derived_g2_slots,
+                g2_slot_mode: config.g2_slot_mode.as_str().to_string(),
+                offline_kvbm_backend: config.offline_kvbm_backend.as_str().to_string(),
+                g1_backend: snapshot.g1_backend,
+                g1_logical_slots: snapshot.g1_arena.logical_slots,
+                g1_materialized_slots: snapshot.g1_arena.materialized_slots,
+                g1_unmaterialized_slots: snapshot.g1_arena.unmaterialized_slots,
+                g1_reset_slots: snapshot.g1_arena.reset_slots,
+                g1_mutable_slots: snapshot.g1_arena.mutable_slots,
+                g1_staged_slots: snapshot.g1_arena.staged_slots,
+                g1_primary_slots: snapshot.g1_arena.primary_slots,
+                g1_duplicate_slots: snapshot.g1_arena.duplicate_slots,
+                g1_inactive_slots: snapshot.g1_arena.inactive_slots,
+                g1_fixed_slot_metadata_bytes: snapshot.g1_arena.fixed_slot_metadata_bytes,
+                g1_resident_checksum_algorithm: "blake3_sorted_sequence_hash_v1".to_string(),
+                g1_resident_checksum: snapshot.g1_resident_checksum,
+                materialized_g2_slots: snapshot.materialized_g2_slots,
+                resident_checksum_algorithm: "blake3_sorted_sequence_hash_v1".to_string(),
+                resident_checksum: snapshot.resident_checksum,
                 slot_derivation: if configured_capacity.is_some() {
-                    "floor(capacity_bytes/min_aic_block_footprint_bytes)".to_string()
+                    match config.g2_slot_mode {
+                        crate::kvbm_offload::config::G2SlotMode::CappedDense => {
+                            "min(floor(capacity_bytes/min_aic_block_footprint_bytes),2000000)"
+                        }
+                        crate::kvbm_offload::config::G2SlotMode::RawDerivedDense => {
+                            "floor(capacity_bytes/min_aic_block_footprint_bytes)"
+                        }
+                        crate::kvbm_offload::config::G2SlotMode::SparseByteNative => {
+                            "byte_capacity_native_sparse_logical_ids"
+                        }
+                    }
+                    .to_string()
                 } else {
                     "explicit_num_g2_blocks".to_string()
                 },
@@ -389,6 +521,9 @@ impl OffloadResourceSummary {
             effective_g2_capacity_bytes,
             effective_num_g2_blocks,
             fixed_slot_metadata_lower_bound_bytes,
+            g1_materialized_slots,
+            g1_fixed_slot_metadata_bytes,
+            g1_backends: g1_backends.into_iter().collect(),
             expected_scheduler_ranks,
             attached_scheduler_ranks,
             operational_status,
@@ -642,6 +777,9 @@ impl Serialize for TraceSimulationReport {
         }
         if let Some(offload) = &self.offload {
             map.serialize_entry("offload", offload)?;
+        }
+        if let Some(replay_teardown) = &self.replay_teardown {
+            map.serialize_entry("replay_teardown", replay_teardown)?;
         }
         map.serialize_entry("processed_tokens", &self.processed_tokens())?;
         map.serialize_entry("processed_tokens_per_s", &self.processed_tokens_per_s())?;
@@ -1116,6 +1254,7 @@ pub(crate) struct TraceCollector {
     decode_gpus_per_worker: usize,
     agentx_summary: Option<AgentxReplaySummary>,
     offload_summary: Option<OffloadResourceSummary>,
+    replay_teardown_summary: Option<ReplayArenaReleaseSummary>,
 }
 
 impl TraceRequestStats {
@@ -1269,6 +1408,18 @@ impl TraceCollector {
     #[cfg(feature = "kvbm-offload")]
     pub(crate) fn set_offload_summary(&mut self, summary: OffloadResourceSummary) {
         self.offload_summary = Some(summary);
+    }
+
+    pub(crate) fn add_replay_arena_releases(
+        &mut self,
+        reports: impl IntoIterator<Item = kvbm_logical::ArenaReleaseReport>,
+    ) {
+        let summary = self
+            .replay_teardown_summary
+            .get_or_insert_with(ReplayArenaReleaseSummary::default);
+        for report in reports {
+            summary.add(report);
+        }
     }
 
     /// Record that `uuid` was dispatched to `worker_idx` on the prefill pool
@@ -1645,6 +1796,7 @@ impl TraceCollector {
         let decode_gpus_per_worker = self.decode_gpus_per_worker;
         let agentx_summary = self.agentx_summary.clone();
         let offload_summary = self.offload_summary.clone();
+        let replay_teardown_summary = self.replay_teardown_summary;
         let itl_distribution = self.itl_distribution.finish();
         let output_token_throughput_per_user = self.output_token_throughput_per_user.finish();
         let requests = self.requests;
@@ -1813,6 +1965,7 @@ impl TraceCollector {
             per_request,
             agentx: agentx_summary,
             offload: offload_summary,
+            replay_teardown: replay_teardown_summary,
         }
     }
 

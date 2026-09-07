@@ -41,7 +41,6 @@ use super::{
 };
 use crate::common::protocols::{DirectRequest, ForwardPassSnapshot, MockEngineArgs, OutputSignal};
 use crate::loadgen::{AgentxReplayController, ReplayRequestPayload, WorkloadDriver};
-#[cfg(test)]
 use crate::replay::ReplayRouterMode;
 use crate::replay::{ReplayRequestPool, ReplayTerminalStatus, TraceCollector};
 use anyhow::bail;
@@ -103,7 +102,7 @@ impl<Events: EngineEventBatch> AggregatedPlacement<Events, ()>
     #[cfg(test)]
     #[inline]
     fn is_router(&self) -> bool {
-        false
+        self.has_session_affinity()
     }
 
     #[cfg(test)]
@@ -153,6 +152,24 @@ where
 }
 
 impl AggRuntimeImpl<AggregatedRoundRobinPlacement<()>, NoEngineEvents, NoReplayMetadata> {
+    pub(in crate::replay) fn with_session_affinity(
+        mut self,
+        mode: ReplayRouterMode,
+    ) -> anyhow::Result<Self> {
+        if let ReplayRouterMode::SessionAffinity {
+            ttl_secs,
+            ranks_per_endpoint,
+        } = mode
+        {
+            self.placement.configure_session_affinity(
+                ttl_secs,
+                ranks_per_endpoint,
+                super::core::session_affinity::SESSION_AFFINITY_SEED,
+            )?;
+        }
+        Ok(self)
+    }
+
     pub(in crate::replay) fn new_round_robin(
         args: &MockEngineArgs,
         pending: VecDeque<DirectRequest>,
@@ -1322,6 +1339,13 @@ where
                     true, expected, snapshots,
                 ),
             );
+        }
+        // All request and offload state is drained at this point. Release the
+        // large KVBM G1 arena before returning the collector so trial teardown
+        // does not serialize destruction of every slot in the worker process.
+        if self.engine.is_drained() {
+            let reports = self.engine.release_arena_for_replay();
+            self.collector.add_replay_arena_releases(reports);
         }
         Ok((self.collector, self.stats))
     }

@@ -177,8 +177,15 @@ fn validate_disagg_args(
         );
     }
     let attention_dp_enabled = config.prefill_args.dp_size > 1 || config.decode_args.dp_size > 1;
-    if attention_dp_enabled && router_mode != ReplayRouterMode::RoundRobin {
-        bail!("offline disaggregated attention DP only supports router_mode=round_robin");
+    if attention_dp_enabled
+        && !matches!(
+            router_mode,
+            ReplayRouterMode::RoundRobin | ReplayRouterMode::SessionAffinity { .. }
+        )
+    {
+        bail!(
+            "offline disaggregated attention DP only supports router_mode=round_robin or session_affinity"
+        );
     }
     if attention_dp_enabled && scaling_enabled {
         bail!("offline disaggregated attention DP does not support scaling_policy");
@@ -295,7 +302,7 @@ mod tests {
                 .unwrap_err();
         assert_eq!(
             router_error.to_string(),
-            "offline disaggregated attention DP only supports router_mode=round_robin"
+            "offline disaggregated attention DP only supports router_mode=round_robin or session_affinity"
         );
 
         let scaling_error = validate_offline_disagg_concurrency_args(

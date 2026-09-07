@@ -15,13 +15,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
 use uuid::Uuid;
 
 use super::trace::validate_synthesizable_prompt;
-use super::{ReplayRequestHashes, ReplayRequestPayload};
+use super::{
+    ReplayRequestHashes, ReplayRequestPayload, SYNTHETIC_OUTPUT_SEED, planned_output_token_ids,
+};
 use crate::common::protocols::DirectRequest;
 
 pub const AGENTX_EXACT_SCHEMA_VERSION: &str = "agentx_exact_v1";
@@ -221,6 +225,21 @@ pub struct AgentxExactCorpus {
 pub struct AgentxCompiledCorpus {
     trace_block_size: usize,
     trees: Arc<Vec<CompiledTree>>,
+    hash_globalization: AgentxHashGlobalizationEvidence,
+}
+
+/// Runtime-only namespace conversion. Source records stay local-per-tree so
+/// provenance and DAG inference remain exact; compiled requests use a dense
+/// global u32 namespace so equal local ids from different workflows cannot
+/// create KV-router affinity or cache identity collisions.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AgentxHashGlobalizationEvidence {
+    pub source_hash_id_scope: String,
+    pub runtime_hash_id_scope: String,
+    pub mapping_algorithm: String,
+    pub global_unique_hash_ids: u64,
+    pub mapping_sha256: String,
+    pub collision_free: bool,
 }
 
 impl AgentxExactCorpus {
@@ -288,14 +307,39 @@ impl AgentxExactCorpus {
 
     pub fn compile(self) -> Result<AgentxCompiledCorpus> {
         self.validate()?;
+        let mut next_global_hash_id = 0_u64;
+        let mut mapping_hasher = Sha256::new();
+        mapping_hasher.update(b"agentx_exact_global_dense_u32_v1\0");
         let trees = self
             .trees
             .into_iter()
-            .map(compile_tree)
+            .enumerate()
+            .map(|(tree_ordinal, tree)| {
+                compile_tree(
+                    tree,
+                    tree_ordinal,
+                    &mut next_global_hash_id,
+                    &mut mapping_hasher,
+                )
+            })
             .collect::<Result<Vec<_>>>()?;
+        let mapping_sha256 = mapping_hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         Ok(AgentxCompiledCorpus {
             trace_block_size: self.trace_block_size,
             trees: Arc::new(trees),
+            hash_globalization: AgentxHashGlobalizationEvidence {
+                source_hash_id_scope: "local_per_tree".to_string(),
+                runtime_hash_id_scope: "global_dense_u32".to_string(),
+                mapping_algorithm: "tree_source_order_then_local_id_ascending_dense_u32_v1"
+                    .to_string(),
+                global_unique_hash_ids: next_global_hash_id,
+                mapping_sha256: format!("sha256:{mapping_sha256}"),
+                collision_free: true,
+            },
         })
     }
 
@@ -1120,6 +1164,7 @@ pub struct AgentxReplaySummary {
     pub source_background_branch_count: usize,
     pub source_terminal_request_count: usize,
     pub source_zero_output_request_count: usize,
+    pub hash_globalization: AgentxHashGlobalizationEvidence,
     pub spawn_start_anchored: bool,
     pub join_terminal_gated: bool,
     pub background_terminal_gated: bool,
@@ -1472,6 +1517,8 @@ impl AgentxReplayController {
         let engine_block_size =
             u32::try_from(engine_block_size).context("engine block size does not fit in u32")?;
         ensure!(engine_block_size > 0, "engine block size must be positive");
+        let trace_block_size = corpus.trace_block_size;
+        let hash_globalization = corpus.hash_globalization;
         let compiled = corpus.trees;
         let marker_tokenizer = MarkerTokenizer::from_config(&config)?;
 
@@ -1632,6 +1679,7 @@ impl AgentxReplayController {
                         .zero_output_requests_replayed_as_one_token
                 })
                 .sum(),
+            hash_globalization,
             spawn_start_anchored: true,
             join_terminal_gated: true,
             background_terminal_gated: true,
@@ -1692,7 +1740,7 @@ impl AgentxReplayController {
         let next_tree_cursor = config.session_tree_concurrency;
         let mut controller = Self {
             corpus: compiled,
-            trace_block_size: corpus.trace_block_size,
+            trace_block_size,
             engine_block_size,
             include_replay_hashes,
             config,
@@ -2273,10 +2321,25 @@ impl AgentxReplayController {
         let hash_ids = source.hash_ids.clone();
         validate_synthesizable_prompt(source.input_length, &hash_ids, self.trace_block_size)?;
         let max_output_tokens = source.replay_max_output_tokens.min(output_limit).max(1);
+        // AgentX synthetic payloads are part of the deterministic benchmark
+        // identity. Leaving this unset delegates decode token generation to
+        // `rand::random`, which preserves lengths/timing but makes completed
+        // output-block PLHs (and therefore G1/G2 resident checksums) differ
+        // between otherwise identical replay processes. Derive an independent
+        // stream from the already-stable request UUID so dispatch order cannot
+        // perturb another request's output tokens.
+        let uuid_bits = uuid.as_u128();
+        let output_seed =
+            SYNTHETIC_OUTPUT_SEED ^ (uuid_bits as u64) ^ ((uuid_bits >> 64) as u64).rotate_left(29);
+        let mut output_rng = StdRng::seed_from_u64(output_seed);
         let request_metadata = DirectRequest {
             tokens: Vec::new(),
             max_output_tokens,
-            output_token_ids: None,
+            output_token_ids: Some(planned_output_token_ids(
+                None,
+                max_output_tokens,
+                &mut output_rng,
+            )),
             uuid: Some(uuid),
             dp_rank: 0,
             arrival_timestamp_ms: Some(now_ms),
@@ -2553,7 +2616,9 @@ impl AgentxReplayController {
             }
             let node = &lane.play.nodes[top.request_index];
             if node.status != NodeStatus::Pending
-                || node.ready_at_ms.is_none_or(|t| (t - top.ready_at_ms).abs() > 1e-9)
+                || node
+                    .ready_at_ms
+                    .is_none_or(|t| (t - top.ready_at_ms).abs() > 1e-9)
             {
                 self.ready_queue.pop();
                 continue;
@@ -2564,9 +2629,10 @@ impl AgentxReplayController {
 
     fn any_ready_pending(&self) -> bool {
         self.lanes.iter().any(|lane| {
-            lane.play.nodes.iter().any(|node| {
-                node.status == NodeStatus::Pending && node.ready_at_ms.is_some()
-            })
+            lane.play
+                .nodes
+                .iter()
+                .any(|node| node.status == NodeStatus::Pending && node.ready_at_ms.is_some())
         })
     }
 
@@ -2649,12 +2715,24 @@ impl AgentxReplayController {
     }
 }
 
-fn compile_tree(mut source: AgentxExactTreeRecord) -> Result<CompiledTree> {
-    let requests = source
+fn compile_tree(
+    mut source: AgentxExactTreeRecord,
+    tree_ordinal: usize,
+    next_global_hash_id: &mut u64,
+    mapping_hasher: &mut Sha256,
+) -> Result<CompiledTree> {
+    let mut requests = source
         .streams
         .iter()
         .flat_map(|stream| stream.requests.iter().cloned())
         .collect::<Vec<_>>();
+    globalize_tree_hash_ids(
+        &source,
+        tree_ordinal,
+        &mut requests,
+        next_global_hash_id,
+        mapping_hasher,
+    )?;
     let index = requests
         .iter()
         .enumerate()
@@ -2745,6 +2823,56 @@ fn compile_tree(mut source: AgentxExactTreeRecord) -> Result<CompiledTree> {
         spawned_by,
         terminal_indexes,
     })
+}
+
+fn globalize_tree_hash_ids(
+    source: &AgentxExactTreeRecord,
+    tree_ordinal: usize,
+    requests: &mut [AgentxRequest],
+    next_global_hash_id: &mut u64,
+    mapping_hasher: &mut Sha256,
+) -> Result<()> {
+    // A long workflow repeats its prefix lineage in many requests. Deduplicate
+    // while scanning so globalization uses O(unique ids in one tree) scratch
+    // space instead of copying every repeated lineage entry.
+    let mut unique_local_ids = HashSet::new();
+    for request in requests.iter() {
+        unique_local_ids.extend(request.hash_ids.iter().copied());
+    }
+    let mut local_ids = unique_local_ids.into_iter().collect::<Vec<_>>();
+    local_ids.sort_unstable();
+
+    mapping_hasher.update((tree_ordinal as u64).to_le_bytes());
+    mapping_hasher.update((source.tree_id.len() as u64).to_le_bytes());
+    mapping_hasher.update(source.tree_id.as_bytes());
+    mapping_hasher.update((local_ids.len() as u64).to_le_bytes());
+
+    let mut mapping = HashMap::with_capacity(local_ids.len());
+    for local_id in local_ids {
+        let global_id = u32::try_from(*next_global_hash_id).with_context(|| {
+            format!(
+                "AgentX global hash namespace exceeds u32 while compiling tree {}",
+                source.tree_id
+            )
+        })?;
+        mapping_hasher.update(local_id.to_le_bytes());
+        mapping_hasher.update(global_id.to_le_bytes());
+        ensure!(
+            mapping.insert(local_id, global_id).is_none(),
+            "duplicate local hash id after deduplication in tree {}",
+            source.tree_id
+        );
+        *next_global_hash_id = next_global_hash_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("AgentX global hash id count overflow"))?;
+    }
+
+    for request in requests {
+        for hash_id in &mut request.hash_ids {
+            *hash_id = mapping[hash_id];
+        }
+    }
+    Ok(())
 }
 
 fn build_play(
@@ -3319,6 +3447,19 @@ mod tests {
         let primer = controller.drain_ready(0.0).unwrap();
         assert_eq!(primer.len(), 1);
         assert_eq!(primer[0].context.phase, AgentxPhase::Primer);
+        let primer_output_ids = primer[0]
+            .request
+            .metadata()
+            .output_token_ids
+            .clone()
+            .expect("AgentX synthetic output tokens must be preplanned");
+        assert_eq!(primer_output_ids.len(), 1);
+        let mut twin = AgentxReplayController::new(corpus(), config(), 4, true).unwrap();
+        let twin_primer = twin.drain_ready(0.0).unwrap();
+        assert_eq!(
+            twin_primer[0].request.metadata().output_token_ids,
+            Some(primer_output_ids)
+        );
         let primer_uuid = primer[0].request.metadata().uuid.unwrap();
         controller.on_terminal(primer_uuid, 1.0, false).unwrap();
         let warmup = controller.drain_ready(1.0).unwrap();
@@ -3373,7 +3514,8 @@ mod tests {
 
     #[test]
     fn cache_bust_is_stable_inside_play_and_changes_across_plays() {
-        let tree = compile_tree(corpus().trees.remove(0)).unwrap();
+        let compiled = corpus().compile().unwrap();
+        let tree = compiled.trees[0].clone();
         let marker_tokenizer = MarkerTokenizer::Synthetic { token_count: 3 };
         let first = build_play(&tree, 0, 0, 0, None, 0.0, "bench", 0, &marker_tokenizer).unwrap();
         let second = build_play(&tree, 0, 0, 1, None, 0.0, "bench", 1, &marker_tokenizer).unwrap();
@@ -3383,6 +3525,66 @@ mod tests {
         assert_eq!(first.cache_bust_tokens.len(), 3);
         assert!(first.cache_bust_id.starts_with("[rid:"));
         assert!(first.cache_bust_id.ends_with("]\n\n"));
+    }
+
+    #[test]
+    fn corpus_compile_globalizes_equal_local_hash_ids_across_workflows() {
+        let mut source = corpus();
+        let mut second = source.trees[0].clone();
+        second.tree_id = "tree-1".to_string();
+        second.source_workflow_id = "workflow-1".to_string();
+        second.source_index = 1;
+        second.hash_namespace = "tree-1".to_string();
+        source.trees.push(second);
+
+        let compiled = source.clone().compile().unwrap();
+        let repeated_in_first = compiled.trees[0].requests[0].hash_ids[0];
+        assert_eq!(repeated_in_first, compiled.trees[0].requests[1].hash_ids[0]);
+        assert_ne!(
+            repeated_in_first, compiled.trees[1].requests[0].hash_ids[0],
+            "equal source-local ids from different workflows must not share runtime identity"
+        );
+        assert_eq!(compiled.hash_globalization.global_unique_hash_ids, 4);
+        assert_eq!(
+            compiled.hash_globalization.runtime_hash_id_scope,
+            "global_dense_u32"
+        );
+        assert!(compiled.hash_globalization.collision_free);
+
+        let left_tokens = crate::loadgen::trace::synthesize_trace_tokens(
+            compiled.trees[0].requests[1].input_length,
+            &compiled.trees[0].requests[1].hash_ids,
+            compiled.trace_block_size,
+        )
+        .unwrap();
+        let right_tokens = crate::loadgen::trace::synthesize_trace_tokens(
+            compiled.trees[1].requests[1].input_length,
+            &compiled.trees[1].requests[1].hash_ids,
+            compiled.trace_block_size,
+        )
+        .unwrap();
+        let left_hashes = ReplayRequestHashes::from_tokens(&left_tokens, 4);
+        let right_hashes = ReplayRequestHashes::from_tokens(&right_tokens, 4);
+        assert!(
+            left_hashes
+                .local_block_hashes
+                .iter()
+                .all(|hash| !right_hashes.local_block_hashes.contains(hash)),
+            "KV-router local overlap hashes must be disjoint across workflows"
+        );
+        assert!(
+            left_hashes
+                .sequence_hashes
+                .iter()
+                .all(|hash| !right_hashes.sequence_hashes.contains(hash)),
+            "KV cache sequence identities must be disjoint across workflows"
+        );
+
+        let recompiled = source.compile().unwrap();
+        assert_eq!(
+            compiled.hash_globalization, recompiled.hash_globalization,
+            "global mapping and provenance must be deterministic"
+        );
     }
 
     #[test]
@@ -3618,8 +3820,7 @@ mod tests {
         protocol.trajectory_start_min_ratio = 0.0;
         protocol.trajectory_start_max_ratio = 0.0;
         protocol.profile_duration_s = 100.0;
-        let mut controller =
-            AgentxReplayController::new(corpus(), protocol, 4, true).unwrap();
+        let mut controller = AgentxReplayController::new(corpus(), protocol, 4, true).unwrap();
         controller.phase = AgentxPhase::Profile;
         controller.summary.phase = AgentxPhase::Profile;
         controller.profile_start_ms = Some(0.0);

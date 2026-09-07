@@ -363,6 +363,9 @@ impl ReplayRouter {
         num_workers: usize,
     ) -> Result<Self> {
         Ok(match mode {
+            ReplayRouterMode::SessionAffinity { .. } => {
+                anyhow::bail!("session_affinity replay routing only supports offline replay")
+            }
             ReplayRouterMode::RoundRobin => Self::RoundRobin(RoundRobinRouter::default()),
             ReplayRouterMode::KvRouter => Self::Kv(KvReplayRouter::new(
                 args,

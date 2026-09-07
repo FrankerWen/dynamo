@@ -107,12 +107,14 @@ pub(super) fn replay_slots(
 }
 
 pub(super) fn replay_selector(config: &KvRouterConfig) -> DefaultWorkerSelector {
-    #[cfg(feature = "replay-bench")]
-    if super::canonical_replay_active() {
-        return DefaultWorkerSelector::new_seeded(Some(config.clone()), "replay", 0xD1A0_5EED);
-    }
-
     DefaultWorkerSelector::new(Some(config.clone()), "replay")
+}
+
+/// Use a private, fixed RNG for offline replay so routing outcomes do not depend on
+/// process-global RNG state or hash-map iteration order. Online replay intentionally
+/// keeps the live selector's randomized tie breaking through [`replay_selector`].
+pub(super) fn offline_replay_selector(config: &KvRouterConfig) -> DefaultWorkerSelector {
+    DefaultWorkerSelector::new_seeded(Some(config.clone()), "replay", 0xD1A0_5EED)
 }
 
 pub(crate) fn replay_router_config(

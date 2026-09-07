@@ -301,6 +301,7 @@ pub struct KvManager {
     /// Changes whenever modeled G1 allocability increases. Immediate retry
     /// witnesses must name the current generation and a positive slot delta.
     capacity_generation: u64,
+    offline_backend_label: &'static str,
 }
 
 impl KvManager {
@@ -326,6 +327,28 @@ impl KvManager {
         dp_rank: u32,
         eviction_backend: MockerEvictionBackend,
     ) -> Self {
+        Self::new_with_eviction_backend_and_options(
+            max_capacity,
+            block_size,
+            kv_event_publishers,
+            dp_rank,
+            eviction_backend,
+            false,
+        )
+    }
+
+    /// Construct the offline compact G1 variant. It preserves the KVBM
+    /// lifecycle, lineage-leaf eligibility, and historical Tick ordering. The
+    /// Tick queue is a dense indexed heap rather than a node-allocating tree,
+    /// and the slot arena is materialized only when a physical slot is used.
+    pub fn new_with_eviction_backend_and_options(
+        max_capacity: usize,
+        block_size: usize,
+        kv_event_publishers: KvEventPublishers,
+        dp_rank: u32,
+        eviction_backend: MockerEvictionBackend,
+        compact: bool,
+    ) -> Self {
         debug_assert!(max_capacity > 0, "max_capacity must be > 0");
 
         let mut registry_builder = BlockRegistry::builder();
@@ -350,6 +373,9 @@ impl KvManager {
         // Revisit Allow only with per-request physical ownership, duplicate-aware
         // offload metadata, and balanced duplicate Stored/Removed lifecycle events.
         mgr_builder = match eviction_backend {
+            MockerEvictionBackend::Lineage if compact => mgr_builder
+                .with_lineage_backend()
+                .with_lazy_slot_materialization(),
             MockerEvictionBackend::Lineage => mgr_builder.with_lineage_backend(),
             MockerEvictionBackend::Lru => mgr_builder.with_lru_backend(),
             MockerEvictionBackend::MultiLru => mgr_builder.with_multi_lru_backend(),
@@ -375,7 +401,26 @@ impl KvManager {
             #[cfg(feature = "kvbm-offload")]
             offload_engine: None,
             capacity_generation: 0,
+            offline_backend_label: if compact {
+                "compact_lineage_indexed_tick_lazy_v2"
+            } else {
+                match eviction_backend {
+                    MockerEvictionBackend::Lineage => "reference_lineage_tick",
+                    MockerEvictionBackend::Lru => "reference_lru",
+                    MockerEvictionBackend::MultiLru => "reference_multi_lru",
+                }
+            },
         }
+    }
+
+    /// Release replay-only G1 metadata once the scheduler has drained.
+    pub(crate) fn release_arena_for_replay(&mut self) -> kvbm_logical::ArenaReleaseReport {
+        self.active_partial.clear();
+        self.active_full.clear();
+        self.registered_blocks.clear();
+        #[cfg(feature = "kvbm-offload")]
+        self.offload_engine.take();
+        self.block_manager.release_arena_for_replay()
     }
 
     /// Install a newly acquired physical handle or merge it into an entry that
@@ -452,10 +497,19 @@ impl KvManager {
         &self,
     ) -> Option<crate::kvbm_offload::OffloadEngineSnapshot> {
         self.offload_engine.as_ref().map(|engine| {
-            engine
+            let mut snapshot = engine
                 .lock()
                 .expect("offload engine mutex poisoned")
-                .resource_snapshot()
+                .resource_snapshot();
+            snapshot.g1_backend = self.offline_backend_label.to_string();
+            snapshot.g1_arena = self.block_manager.arena_snapshot();
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"mocker-g1-resident-v1\0");
+            for hash in self.block_manager.resident_sequence_hashes() {
+                hasher.update(&hash.as_u128().to_le_bytes());
+            }
+            snapshot.g1_resident_checksum = hasher.finalize().to_hex().to_string();
+            snapshot
         })
     }
 
@@ -2213,6 +2267,17 @@ mod tests {
         KvManager::new_with_event_sink(capacity, block_size, KvEventPublishers::default(), 0)
     }
 
+    fn make_mgr_compact(capacity: usize, block_size: usize) -> KvManager {
+        KvManager::new_with_eviction_backend_and_options(
+            capacity,
+            block_size,
+            KvEventPublishers::default(),
+            0,
+            MockerEvictionBackend::Lineage,
+            true,
+        )
+    }
+
     fn expect_ready<T>(outcome: G1Acquire<T>) -> T {
         match outcome {
             G1Acquire::Ready(value) => value,
@@ -2333,6 +2398,64 @@ mod tests {
 
     fn deref_partial(mgr: &mut KvManager, uuid: Uuid) {
         mgr.process(&MoveBlock::Deref(vec![UniqueBlock::PartialBlock(uuid)]));
+    }
+
+    #[test]
+    fn compact_g1_matches_reference_without_eviction_and_bulk_releases() {
+        let mut reference = make_mgr(16, 4);
+        let mut compact = make_mgr_compact(16, 4);
+
+        for seq_hash in 1..=8 {
+            assert_eq!(
+                use_full(&mut reference, seq_hash, lineage_plh(seq_hash)),
+                use_full(&mut compact, seq_hash, lineage_plh(seq_hash))
+            );
+        }
+        for seq_hash in [2, 4, 6, 8] {
+            deref_full(&mut reference, seq_hash);
+            deref_full(&mut compact, seq_hash);
+        }
+        for seq_hash in [2, 6] {
+            assert_eq!(
+                use_full(&mut reference, seq_hash, lineage_plh(seq_hash)),
+                use_full(&mut compact, seq_hash, lineage_plh(seq_hash))
+            );
+            deref_full(&mut reference, seq_hash);
+            deref_full(&mut compact, seq_hash);
+        }
+        for seq_hash in [1, 3, 5, 7] {
+            deref_full(&mut reference, seq_hash);
+        }
+        for seq_hash in [1, 3, 5, 7] {
+            deref_full(&mut compact, seq_hash);
+        }
+
+        assert_eq!(reference.num_active_blocks(), compact.num_active_blocks());
+        assert_eq!(
+            reference.num_inactive_blocks(),
+            compact.num_inactive_blocks()
+        );
+        assert_eq!(
+            reference.block_manager.resident_sequence_hashes(),
+            compact.block_manager.resident_sequence_hashes()
+        );
+        assert_eq!(reference.block_manager.arena_snapshot().inactive_slots, 8);
+        assert_eq!(compact.block_manager.arena_snapshot().inactive_slots, 8);
+        assert_eq!(
+            reference.block_manager.arena_snapshot().materialized_slots,
+            16
+        );
+        assert_eq!(compact.block_manager.arena_snapshot().materialized_slots, 8);
+
+        let reference_release = reference.release_arena_for_replay();
+        let compact_release = compact.release_arena_for_replay();
+        assert_eq!(reference_release.before.inactive_slots, 8);
+        assert_eq!(compact_release.before.inactive_slots, 8);
+        assert_eq!(
+            reference.block_manager.arena_snapshot().materialized_slots,
+            0
+        );
+        assert_eq!(compact.block_manager.arena_snapshot().materialized_slots, 0);
     }
 
     #[test]

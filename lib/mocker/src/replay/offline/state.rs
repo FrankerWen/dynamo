@@ -452,6 +452,10 @@ impl OfflineWorkerState {
         self.core.try_execute_pass(now_ms)
     }
 
+    pub(crate) fn release_arena_for_replay(&mut self) -> Option<kvbm_logical::ArenaReleaseReport> {
+        self.core.release_arena_for_replay()
+    }
+
     #[cfg(test)]
     pub(crate) fn execute_pass_unrecorded(&mut self, now_ms: f64) -> EnginePassResult {
         self.try_execute_pass(now_ms)

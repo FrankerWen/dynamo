@@ -49,7 +49,6 @@ use crate::common::protocols::{DirectRequest, EngineType, MockEngineArgs, Output
 use crate::loadgen::{
     AgentxReplayController, ReplayRequestHashes, ReplayRequestPayload, WorkloadDriver,
 };
-#[cfg(test)]
 use crate::replay::ReplayRouterMode;
 use crate::replay::{
     OfflineDisaggReplayConfig, ReplayRequestPool, ReplayTerminalStatus, TraceCollector,
@@ -905,7 +904,7 @@ where
 impl<Events: EngineEventBatch> PoolPlacement<Events, ()> for PoolRoundRobinPlacement<Events> {
     #[inline]
     fn is_router(&self) -> bool {
-        false
+        self.has_session_affinity()
     }
 }
 
@@ -949,6 +948,30 @@ where
 }
 
 impl DisaggRuntimeImpl<PoolRoundRobinPlacement<()>, NoEngineEvents, NoReplayMetadata> {
+    pub(in crate::replay) fn with_session_affinity(
+        mut self,
+        mode: ReplayRouterMode,
+    ) -> Result<Self> {
+        if let ReplayRouterMode::SessionAffinity {
+            ttl_secs,
+            ranks_per_endpoint,
+        } = mode
+        {
+            let seed = super::core::session_affinity::SESSION_AFFINITY_SEED;
+            self.prefill_placement.configure_session_affinity(
+                ttl_secs,
+                ranks_per_endpoint,
+                seed,
+            )?;
+            self.decode_placement.configure_session_affinity(
+                ttl_secs,
+                ranks_per_endpoint,
+                seed ^ 0xDEC0_DE,
+            )?;
+        }
+        Ok(self)
+    }
+
     pub(in crate::replay) fn new_round_robin(
         config: &OfflineDisaggReplayConfig,
         pending: VecDeque<DirectRequest>,
@@ -3026,6 +3049,14 @@ where
                     true, expected, snapshots,
                 ),
             );
+        }
+        if self.prefill_engine.is_drained() {
+            let reports = self.prefill_engine.release_arena_for_replay();
+            self.collector.add_replay_arena_releases(reports);
+        }
+        if self.decode_engine.is_drained() {
+            let reports = self.decode_engine.release_arena_for_replay();
+            self.collector.add_replay_arena_releases(reports);
         }
         Ok((self.collector, self.stats))
     }

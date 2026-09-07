@@ -36,7 +36,7 @@ use crate::scheduler::{
     CapturedRouterEventBuffer, DestinationHolds, EnginePassResult, ForwardPassSnapshot,
     MockerMetrics, PendingDestinations, RemovedSource, RouterEventVisibility, SchedulerCommand,
     SchedulerCommandEffects, SchedulerCommandResult, SchedulerLifecycleEvent, SourceCompletion,
-    SourceHolds, build_fpm_snapshot, capture_router_event_sink,
+    SourceHolds, WelfordAcc, capture_router_event_sink,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -532,13 +532,14 @@ impl VllmCore {
             SpeculativeDecodeSampler::new(rates, args.aic_mtp_seed.wrapping_add(seed_offset))
         });
         Self {
-            kv_manager: G1Manager::new_with_backend_and_caching(
+            kv_manager: G1Manager::new_with_backend_and_caching_and_options(
                 args.num_gpu_blocks,
                 args.block_size,
                 kv_event_publishers,
                 dp_rank,
                 args.resolved_g1_backend(),
                 args.enable_prefix_caching,
+                args.offline_kvbm_backend == "compact",
             ),
             args,
             dp_rank,
@@ -1074,6 +1075,16 @@ impl VllmCore {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.state.is_empty()
+    }
+
+    /// Release KVBM arena metadata after a completed offline replay. The
+    /// serving path never calls this; it is a replay teardown optimization.
+    pub(crate) fn release_arena_for_replay(&mut self) -> Option<kvbm_logical::ArenaReleaseReport> {
+        debug_assert!(
+            self.is_drained(),
+            "replay arena release requires a drained core"
+        );
+        self.kv_manager.release_arena_for_replay()
     }
 
     #[allow(dead_code)]
@@ -1899,53 +1910,70 @@ impl VllmCore {
         scheduled: &FxHashMap<Uuid, ScheduledWork>,
         wall_time_secs: f64,
     ) -> ForwardPassSnapshot {
-        let scheduled_prefills = scheduled.values().filter_map(|work| {
-            (work.prompt_tokens > 0).then_some((
-                work.prompt_len as u64,
-                work.prefix_tokens as u64,
-                work.total_tokens as u64,
-            ))
-        });
+        let mut prefill_acc = WelfordAcc::default();
+        let mut decode_acc = WelfordAcc::default();
+        let mut sum_prefill_tokens: u64 = 0;
+        let mut sum_prefill_kv_tokens: u64 = 0;
 
-        let scheduled_decodes = scheduled.values().filter_map(|work| {
-            (work.prompt_tokens == 0 && !work.terminal_after_schedule)
-                .then_some(work.sequence_len as u64)
-        });
-
-        let queued_prefills = self.state.waiting.iter().filter_map(|uuid| {
-            let request = self.state.requests.get(uuid)?;
-            (matches!(request.status, RequestStatus::Waiting)
-                && !self.active_destination_handoffs.contains_request(*uuid))
-            .then_some(request.sequence.num_input_tokens() as u64)
-        });
-
-        let ordinary_queued_decodes = self.state.waiting.iter().filter_map(|uuid| {
-            let request = self.state.requests.get(uuid)?;
-            if self.active_destination_handoffs.contains_request(*uuid) {
-                return Some(request.sequence.num_input_tokens() as u64);
+        for work in scheduled.values() {
+            if work.prompt_tokens > 0 {
+                sum_prefill_tokens += work.total_tokens as u64;
+                sum_prefill_kv_tokens += work.prefix_tokens as u64;
+                prefill_acc.add(work.prompt_len as f64);
+            } else if !work.terminal_after_schedule {
+                decode_acc.add(work.sequence_len as f64);
             }
-            matches!(request.status, RequestStatus::Preempted).then_some(
-                (request.sequence.num_input_tokens() + request.sequence.generated_tokens()) as u64,
-            )
-        });
-        let preactivation_decodes = self
-            .pending_destinations
-            .payloads()
-            .map(|request| request.sequence.num_input_tokens() as u64)
-            .chain(
-                self.destination_holds
-                    .payloads()
-                    .map(|reservation| reservation.request.sequence.num_input_tokens() as u64),
-            );
-        let queued_decodes = ordinary_queued_decodes.chain(preactivation_decodes);
+        }
 
-        build_fpm_snapshot(
-            scheduled_prefills,
-            scheduled_decodes,
-            queued_prefills,
-            queued_decodes,
+        let mut queued_prefill_acc = WelfordAcc::default();
+        let mut queued_decode_acc = WelfordAcc::default();
+
+        if !self.state.waiting.is_empty() {
+            for uuid in &self.state.waiting {
+                if let Some(request) = self.state.requests.get(uuid) {
+                    if self.active_destination_handoffs.contains_request(*uuid) {
+                        queued_decode_acc.add(request.sequence.num_input_tokens() as f64);
+                    } else if matches!(request.status, RequestStatus::Waiting) {
+                        queued_prefill_acc.add(request.sequence.num_input_tokens() as f64);
+                    } else if matches!(request.status, RequestStatus::Preempted) {
+                        queued_decode_acc.add(
+                            (request.sequence.num_input_tokens()
+                                + request.sequence.generated_tokens())
+                                as f64,
+                        );
+                    }
+                }
+            }
+        }
+
+        if !self.pending_destinations.is_empty() {
+            for request in self.pending_destinations.payloads() {
+                queued_decode_acc.add(request.sequence.num_input_tokens() as f64);
+            }
+        }
+        if !self.destination_holds.is_empty() {
+            for reservation in self.destination_holds.payloads() {
+                queued_decode_acc.add(reservation.request.sequence.num_input_tokens() as f64);
+            }
+        }
+
+        ForwardPassSnapshot {
+            num_prefill_requests: prefill_acc.count,
+            sum_prefill_tokens,
+            var_prefill_length: prefill_acc.variance(),
+            sum_prefill_kv_tokens,
+            num_decode_requests: decode_acc.count,
+            sum_decode_kv_tokens: decode_acc.sum as u64,
+            var_decode_kv_tokens: decode_acc.variance(),
+            num_queued_prefill: queued_prefill_acc.count,
+            sum_queued_prefill_tokens: queued_prefill_acc.sum as u64,
+            var_queued_prefill_length: queued_prefill_acc.variance(),
+            num_queued_decode: queued_decode_acc.count,
+            sum_queued_decode_kv_tokens: queued_decode_acc.sum as u64,
+            var_queued_decode_kv_tokens: queued_decode_acc.variance(),
             wall_time_secs,
-        )
+            ..Default::default()
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

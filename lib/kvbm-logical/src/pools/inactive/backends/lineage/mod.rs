@@ -28,9 +28,9 @@
 //! # Leaf eviction ordering
 //!
 //! *Which* leaf is evicted first is delegated to a pluggable [`LeafPolicy`]
-//! (see [`eviction`]). The default is `Tick` — a `BTreeMap` keyed on a
-//! per-node insertion tick, the historical behavior, where a node that
-//! *re-becomes* a leaf returns to its original position. The `Fifo`
+//! (see [`eviction`]). The default is `Tick` — a dense indexed min-heap keyed
+//! on a per-node insertion tick, preserving the historical behavior where a
+//! node that *re-becomes* a leaf returns to its original position. The `Fifo`
 //! variant is O(1) and allocation-free but appends a re-leafed node at the
 //! tail instead; it is opt-in via `with_lineage_backend_eviction`.
 
@@ -169,8 +169,8 @@ impl LineageBackend {
     /// `total_blocks`, so sizing the slab, index, and policy to that bound
     /// means the steady-state hot path never reallocates. (Out-of-order
     /// ghosts can briefly push past `capacity`; that grows the slab once,
-    /// amortized — not a steady-state cost. The `Tick` policy's `BTreeMap`
-    /// is the one structure that always churns nodes.)
+    /// amortized — not a steady-state cost. The `Tick` policy uses dense
+    /// indexed vectors and does not allocate per leaf.)
     pub(crate) fn with_policy(capacity: usize, leaves: LeafPolicy) -> Self {
         let initial_cap = capacity.min(65_536);
         Self {

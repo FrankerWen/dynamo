@@ -139,15 +139,37 @@ impl G1Manager {
         backend: G1Backend,
         enable_prefix_caching: bool,
     ) -> Self {
+        Self::new_with_backend_and_caching_and_options(
+            max_capacity,
+            block_size,
+            kv_event_publishers,
+            dp_rank,
+            backend,
+            enable_prefix_caching,
+            false,
+        )
+    }
+
+    pub fn new_with_backend_and_caching_and_options(
+        max_capacity: usize,
+        block_size: usize,
+        kv_event_publishers: KvEventPublishers,
+        dp_rank: u32,
+        backend: G1Backend,
+        enable_prefix_caching: bool,
+        compact: bool,
+    ) -> Self {
         let backend = match backend {
-            G1Backend::Kvbm => {
-                G1ManagerBackend::Kvbm(kvbm_backend::KvManager::new_with_event_sink(
+            G1Backend::Kvbm => G1ManagerBackend::Kvbm(
+                kvbm_backend::KvManager::new_with_eviction_backend_and_options(
                     max_capacity,
                     block_size,
                     kv_event_publishers,
                     dp_rank,
-                ))
-            }
+                    MockerEvictionBackend::default(),
+                    compact,
+                ),
+            ),
             G1Backend::Native => G1ManagerBackend::Native(VllmKvManager::new_with_event_sink(
                 max_capacity,
                 block_size,
@@ -157,6 +179,13 @@ impl G1Manager {
             )),
         };
         Self { backend }
+    }
+
+    pub(crate) fn release_arena_for_replay(&mut self) -> Option<kvbm_logical::ArenaReleaseReport> {
+        match &mut self.backend {
+            G1ManagerBackend::Kvbm(manager) => Some(manager.release_arena_for_replay()),
+            G1ManagerBackend::Native(_) => None,
+        }
     }
 
     pub(crate) fn allocate_native(

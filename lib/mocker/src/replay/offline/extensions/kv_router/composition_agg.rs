@@ -210,7 +210,10 @@ impl PlacementPolicy<ReplayRequestPayload> for AdaptiveAggPlacement {
 #[cfg(test)]
 impl AggregatedPlacement<RouterEventBatch, KvReplayMetadata> for AdaptiveAggPlacement {
     fn is_router(&self) -> bool {
-        matches!(self, Self::Kv(_))
+        match self {
+            Self::RoundRobin(policy) => policy.has_session_affinity(),
+            Self::Kv(_) => true,
+        }
     }
 
     fn debug_router_snapshot(&self, now_ms: f64) -> Option<OfflineRouterSnapshot> {
@@ -232,9 +235,21 @@ impl ConfiguredAggregatedPlacement<RouterEventBatch, KvReplayMetadata> for Adapt
         topology: Vec<WorkerTopology>,
     ) -> Result<Self> {
         match router_mode {
-            ReplayRouterMode::RoundRobin => Ok(Self::RoundRobin(
-                AggregatedRoundRobinPlacement::new(args.dp_size, topology),
-            )),
+            ReplayRouterMode::RoundRobin | ReplayRouterMode::SessionAffinity { .. } => {
+                let mut placement = AggregatedRoundRobinPlacement::new(args.dp_size, topology);
+                if let ReplayRouterMode::SessionAffinity {
+                    ttl_secs,
+                    ranks_per_endpoint,
+                } = router_mode
+                {
+                    placement.configure_session_affinity(
+                        ttl_secs,
+                        ranks_per_endpoint,
+                        crate::replay::offline::core::session_affinity::SESSION_AFFINITY_SEED,
+                    )?;
+                }
+                Ok(Self::RoundRobin(placement))
+            }
             ReplayRouterMode::KvRouter => Ok(Self::Kv(KvRouterPlacement::new(
                 args,
                 router_config,
