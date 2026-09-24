@@ -1080,6 +1080,10 @@ pub struct PerRequestRoutingRecord {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PerRequestAdmissionRecord {
+    /// Replay-wide order for opt-in capacity capture, including same-time ties.
+    /// The legacy admission ordinals below are local to one request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_query_ordinal: Option<u64>,
     pub admission_ordinal: usize,
     pub pool_admission_ordinal: usize,
     pub pool: ReplayRequestPool,
@@ -1234,6 +1238,7 @@ pub(crate) struct TraceCollector {
     /// Default `false` to skip the ~100ms terminal pass + ~30MB allocation
     /// when the caller doesn't need per-request granularity.
     capture_per_request: bool,
+    next_cache_query_ordinal: u64,
     /// SLA thresholds for goodput classification. All-`None` by default, in
     /// which case `finish()` leaves `TraceSimulationReport::goodput` as `None`.
     sla: SlaThresholds,
@@ -1639,6 +1644,18 @@ impl TraceCollector {
         at_ms: f64,
         reused_input_tokens: usize,
     ) {
+        let capture = self.capture_per_request
+            && self.requests.get(&uuid).is_some_and(|stats| {
+                stats
+                    .agentx
+                    .as_ref()
+                    .is_some_and(|context| context.cache_projection.is_some())
+            });
+        let cache_query_ordinal = capture.then(|| {
+            let ordinal = self.next_cache_query_ordinal;
+            self.next_cache_query_ordinal += 1;
+            ordinal
+        });
         let Some(detail) = self.detail_mut(uuid) else {
             return;
         };
@@ -1647,6 +1664,7 @@ impl TraceCollector {
         let pool_admission_ordinal = *pool_count;
         *pool_count += 1;
         detail.admission_history.push(PerRequestAdmissionRecord {
+            cache_query_ordinal,
             admission_ordinal,
             pool_admission_ordinal,
             pool,

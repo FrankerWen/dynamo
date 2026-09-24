@@ -156,6 +156,8 @@ pub struct AgentxRequest {
 pub enum AgentxDependencyKind {
     Stream,
     Join,
+    /// Stage-0 interval-frontier edge: wait for completion without adding idle.
+    Barrier,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -705,15 +707,23 @@ fn validate_tree_topology(
                 tree.tree_id,
                 requests[index].request_id
             );
+            let authored_delay = dependency.source_end_to_start_gap_s.max(0.0);
+            let allowed_delays: &[f64] = match dependency.kind {
+                AgentxDependencyKind::Stream => &[authored_delay],
+                // Compiler 1.0 emits a terminal-relative join delay; compiler
+                // 1.1 represents joins as completion-only barriers. Preserve
+                // each DAG's explicit delay, including both existing formats.
+                AgentxDependencyKind::Join => &[0.0, authored_delay],
+                AgentxDependencyKind::Barrier => &[0.0],
+            };
             ensure!(
                 dependency.source_end_to_start_gap_s.is_finite()
                     && dependency.replay_delay_after_dependency_s.is_finite()
                     && dependency.replay_delay_after_dependency_s >= 0.0
-                    && (dependency.replay_delay_after_dependency_s
-                        - dependency.source_end_to_start_gap_s.max(0.0))
-                    .abs()
-                        <= 1.0e-9_f64
-                            .max(dependency.replay_delay_after_dependency_s.abs() * 1.0e-9),
+                    && allowed_delays.iter().any(|expected| {
+                        (dependency.replay_delay_after_dependency_s - expected).abs()
+                            <= 1.0e-9_f64.max(expected.abs() * 1.0e-9)
+                    }),
                 "tree {} request {} has an invalid dependency delay",
                 tree.tree_id,
                 requests[index].request_id
@@ -964,6 +974,10 @@ pub struct AgentxReplayConfig {
     pub benchmark_id: String,
     #[serde(default)]
     pub capture_events: bool,
+    /// Opt-in export of actual marked prompt prefixes for an external, uniform
+    /// checkpoint LRU capacity projection. This does not change native KV policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_projection_block_tokens: Option<usize>,
 }
 
 impl Default for AgentxReplayConfig {
@@ -987,12 +1001,17 @@ impl Default for AgentxReplayConfig {
             drain_grace_s: default_drain_grace_s(),
             benchmark_id: default_benchmark_id(),
             capture_events: false,
+            cache_projection_block_tokens: None,
         }
     }
 }
 
 impl AgentxReplayConfig {
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.cache_projection_block_tokens != Some(0),
+            "cache_projection_block_tokens must be positive when provided"
+        );
         ensure!(
             self.session_tree_concurrency > 0,
             "session_tree_concurrency must be positive"
@@ -1165,6 +1184,8 @@ pub struct AgentxReplaySummary {
     pub source_terminal_request_count: usize,
     pub source_zero_output_request_count: usize,
     pub hash_globalization: AgentxHashGlobalizationEvidence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_projection_block_tokens: Option<usize>,
     pub spawn_start_anchored: bool,
     pub join_terminal_gated: bool,
     pub background_terminal_gated: bool,
@@ -1233,6 +1254,44 @@ pub struct AgentxRequestContext {
     pub stream_id: String,
     pub source_request_id: String,
     pub cache_bust_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_projection: Option<AgentxCacheProjection>,
+}
+
+/// Capacity-analysis identity of complete checkpoints in the actual runtime
+/// prompt, including the per-play marker. Keys are SHA256 prefixes of little-
+/// endian u32 token ids, not raw local trace hashes or native G2 object ids.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AgentxCacheProjection {
+    pub schema: String,
+    pub block_tokens: usize,
+    pub input_tokens: usize,
+    pub prefix_keys: Vec<String>,
+}
+
+impl AgentxCacheProjection {
+    fn from_tokens(tokens: &[u32], block_tokens: usize) -> Self {
+        assert!(block_tokens > 0);
+        let mut digest = Sha256::new();
+        digest.update(b"dynosim-litehit-prefix-u32le-v1");
+        digest.update((block_tokens as u64).to_le_bytes());
+        let mut bytes = Vec::with_capacity(tokens.len().min(block_tokens).saturating_mul(4));
+        let mut prefix_keys = Vec::with_capacity(tokens.len() / block_tokens);
+        for block in tokens.chunks_exact(block_tokens) {
+            bytes.clear();
+            for token in block {
+                bytes.extend_from_slice(&token.to_le_bytes());
+            }
+            digest.update(&bytes);
+            prefix_keys.push(format!("{:x}", digest.clone().finalize()));
+        }
+        Self {
+            schema: "dynosim_litehit_prompt_v1".to_string(),
+            block_tokens,
+            input_tokens: tokens.len(),
+            prefix_keys,
+        }
+    }
 }
 
 pub(crate) struct AgentxReadyRequest {
@@ -1680,6 +1739,7 @@ impl AgentxReplayController {
                 })
                 .sum(),
             hash_globalization,
+            cache_projection_block_tokens: config.cache_projection_block_tokens,
             spawn_start_anchored: true,
             join_terminal_gated: true,
             background_terminal_gated: true,
@@ -2357,6 +2417,13 @@ impl AgentxReplayController {
         let replay_hashes = self.include_replay_hashes.then(|| {
             ReplayRequestHashes::from_tokens(&request.prompt_tokens(), self.engine_block_size)
         });
+        let mut context = context;
+        if let Some(block_tokens) = self.config.cache_projection_block_tokens {
+            context.cache_projection = Some(AgentxCacheProjection::from_tokens(
+                &request.prompt_tokens(),
+                block_tokens,
+            ));
+        }
         Ok(AgentxReadyRequest {
             request,
             arrival_time_ms: now_ms,
@@ -3005,6 +3072,7 @@ fn request_context(
         stream_id: request.stream_id.clone(),
         source_request_id: request.request_id.clone(),
         cache_bust_id: play.cache_bust_id.clone(),
+        cache_projection: None,
     }
 }
 
@@ -3231,6 +3299,125 @@ mod tests {
             drain_grace_s: 1.0,
             benchmark_id: "test".to_string(),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn litehit_projection_has_portable_prefix_identity_and_complete_blocks_only() {
+        let projection = AgentxCacheProjection::from_tokens(&[1, 2, 3, 4, 5], 2);
+        assert_eq!(projection.input_tokens, 5);
+        // Independent Python hashlib/struct golden values fix the wire contract.
+        assert_eq!(
+            projection.prefix_keys,
+            vec![
+                "5b3866a871ea2549a5539886c08133b4f3e452861249fae9602936987ec648f7".to_string(),
+                "acd05c780c6a64a5b7ef5b5c0b216709ed23a7afaeb7942e78510d8a0080826e".to_string(),
+            ]
+        );
+        let shorter = AgentxCacheProjection::from_tokens(&[1, 2, 3], 2);
+        assert_eq!(shorter.prefix_keys, projection.prefix_keys[..1]);
+        let marker_changed = AgentxCacheProjection::from_tokens(&[99, 2, 3, 4, 5], 2);
+        assert!(
+            projection
+                .prefix_keys
+                .iter()
+                .zip(marker_changed.prefix_keys)
+                .all(|(a, b)| *a != b)
+        );
+    }
+
+    #[test]
+    fn litehit_capture_preserves_controller_dispatch_and_actual_payload() {
+        let mut enabled = config();
+        enabled.cache_projection_block_tokens = Some(16);
+        let mut plain = AgentxReplayController::new(corpus(), config(), 16, false).unwrap();
+        let mut captured = AgentxReplayController::new(corpus(), enabled, 16, false).unwrap();
+        let before = plain.drain_ready(0.0).unwrap();
+        let after = captured.drain_ready(0.0).unwrap();
+        assert!(!before.is_empty());
+        assert_eq!(before.len(), after.len());
+        for (left, right) in before.iter().zip(after.iter()) {
+            assert_eq!(left.request.prompt_tokens(), right.request.prompt_tokens());
+            assert_eq!(left.request.metadata().uuid, right.request.metadata().uuid);
+            assert_eq!(left.arrival_time_ms, right.arrival_time_ms);
+            assert!(left.context.cache_projection.is_none());
+            let projection = right.context.cache_projection.as_ref().unwrap();
+            assert_eq!(projection.input_tokens, right.request.prompt_tokens().len());
+            assert_eq!(projection.prefix_keys.len(), projection.input_tokens / 16);
+            assert!(
+                !serde_json::to_value(&left.context)
+                    .unwrap()
+                    .as_object()
+                    .unwrap()
+                    .contains_key("cache_projection")
+            );
+        }
+        assert_eq!(captured.summary().cache_projection_block_tokens, Some(16));
+        assert_eq!(plain.summary().cache_projection_block_tokens, None);
+    }
+
+    #[test]
+    fn litehit_capture_rejects_zero_block_size() {
+        let mut protocol = config();
+        protocol.cache_projection_block_tokens = Some(0);
+        assert!(
+            protocol
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("cache_projection_block_tokens")
+        );
+    }
+
+    #[test]
+    fn litehit_dag_barriers_wait_for_terminal_without_replaying_source_gap() {
+        let mut tree = serde_json::to_value(&corpus().trees[0]).unwrap();
+        tree["streams"][0]["requests"][1]["dependencies"][0]["kind"] = "barrier".into();
+        tree["streams"][0]["requests"][1]["dependencies"][0]["replay_delay_after_dependency_s"] =
+            0.0.into();
+        let input = AgentxExactCorpus {
+            trace_block_size: 4,
+            trees: vec![serde_json::from_value(tree).unwrap()],
+        };
+        input.validate().unwrap();
+        let mut protocol = config();
+        protocol.trajectory_start_min_ratio = 0.0;
+        protocol.trajectory_start_max_ratio = 0.0;
+        let mut controller = AgentxReplayController::new(input, protocol, 4, false).unwrap();
+        controller.phase = AgentxPhase::Profile;
+        controller.summary.phase = AgentxPhase::Profile;
+        controller.profile_start_ms = Some(0.0);
+        controller.profile_deadline_ms = Some(10_000.0);
+        controller.primers.clear();
+        let first = controller.drain_ready(0.0).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].context.source_request_id, "a");
+        assert!(controller.drain_ready(9.0).unwrap().is_empty());
+        controller
+            .on_terminal(first[0].request.metadata().uuid.unwrap(), 10.0, false)
+            .unwrap();
+        let next = controller.drain_ready(10.0).unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].context.source_request_id, "b");
+        assert_eq!(next[0].arrival_time_ms, 10.0);
+    }
+
+    #[test]
+    fn litehit_dag_delay_validation_matches_both_compiler_contracts() {
+        for (kind, delay, valid) in [
+            (AgentxDependencyKind::Stream, 0.4, true),
+            (AgentxDependencyKind::Stream, 0.0, false),
+            (AgentxDependencyKind::Join, 0.4, true),
+            (AgentxDependencyKind::Join, 0.0, true),
+            (AgentxDependencyKind::Join, 0.2, false),
+            (AgentxDependencyKind::Barrier, 0.0, true),
+            (AgentxDependencyKind::Barrier, 0.4, false),
+        ] {
+            let mut input = corpus();
+            let edge = &mut input.trees[0].streams[0].requests[1].dependencies[0];
+            edge.kind = kind;
+            edge.replay_delay_after_dependency_s = delay;
+            assert_eq!(input.validate().is_ok(), valid, "{kind:?} {delay}");
         }
     }
 
@@ -3853,5 +4040,555 @@ mod tests {
             .expect("compiler fixture must satisfy the native exact schema");
         assert!(!corpus.trees.is_empty());
         assert!(corpus.trees.iter().any(|tree| !tree.branches.is_empty()));
+    }
+
+    #[test]
+    fn agentx_drain_grace_dual_branch_fixture() {
+        let corpus_data = test_agentx_corpus();
+        let mut protocol = config();
+        protocol.warmup_requests_per_lane = 1;
+        protocol.profile_duration_s = 1.0;
+        protocol.drain_grace_s = 1.0;
+        protocol.session_tree_concurrency = 1;
+        protocol.capture_events = true;
+
+        // Helper closure to initialize and advance controller through Primer and Warmup into Profile,
+        // and emit request `a` (completed at t=50ms) and emit request `b` (emitted at t=450ms, in-flight).
+        // Then advances to profile cutoff D.
+        let setup_to_drain = || {
+            let mut controller =
+                AgentxReplayController::new(corpus_data.clone(), protocol.clone(), 1, true)
+                    .unwrap();
+            let mut api_calls = Vec::new();
+
+            // 1. Drain primer at 0.0ms
+            api_calls.push(serde_json::json!({
+                "call": "drain_ready",
+                "time_ms": 0.0,
+                "notes": "Drain primer request"
+            }));
+            let primer = controller.drain_ready(0.0).unwrap();
+            assert_eq!(primer.len(), 1);
+            assert_eq!(primer[0].context.phase, AgentxPhase::Primer);
+            let primer_uuid = primer[0].request.metadata().uuid.unwrap();
+
+            // 2. Terminal for primer at 1.0ms
+            api_calls.push(serde_json::json!({
+                "call": "on_terminal",
+                "uuid": primer_uuid.to_string(),
+                "time_ms": 1.0,
+                "has_error": false
+            }));
+            controller.on_terminal(primer_uuid, 1.0, false).unwrap();
+
+            // 3. Drain warmup at 1.0ms
+            api_calls.push(serde_json::json!({
+                "call": "drain_ready",
+                "time_ms": 1.0,
+                "notes": "Drain warmup request"
+            }));
+            let warmup = controller.drain_ready(1.0).unwrap();
+            assert_eq!(warmup.len(), 1);
+            assert_eq!(warmup[0].context.phase, AgentxPhase::Warmup);
+            let warmup_uuid = warmup[0].request.metadata().uuid.unwrap();
+
+            // 4. Terminal for warmup at 2.0ms -> transitions to Profile!
+            api_calls.push(serde_json::json!({
+                "call": "on_terminal",
+                "uuid": warmup_uuid.to_string(),
+                "time_ms": 2.0,
+                "has_error": false
+            }));
+            controller.on_terminal(warmup_uuid, 2.0, false).unwrap();
+            assert_eq!(controller.phase, AgentxPhase::Profile);
+
+            let p_start = controller
+                .summary
+                .profile_start_ms
+                .expect("profile_start_ms must be set");
+            assert!((p_start - 2.0).abs() < 1e-6);
+            let profile_cutoff = p_start + protocol.profile_duration_s * 1000.0; // 1002.0 ms
+            let drain_deadline = profile_cutoff + protocol.drain_grace_s * 1000.0; // 2002.0 ms
+
+            // 5. Emit request `a` in Profile at 2.0ms
+            api_calls.push(serde_json::json!({
+                "call": "drain_ready",
+                "time_ms": 2.0,
+                "notes": "Emit root profile request a"
+            }));
+            let ready_a = controller.drain_ready(2.0).unwrap();
+            assert_eq!(ready_a.len(), 1);
+            assert_eq!(ready_a[0].context.phase, AgentxPhase::Profile);
+            assert_eq!(ready_a[0].context.source_request_id, "a");
+            let a_uuid = ready_a[0].request.metadata().uuid.unwrap();
+
+            // 6. Complete request `a` at 50.0ms
+            api_calls.push(serde_json::json!({
+                "call": "on_terminal",
+                "uuid": a_uuid.to_string(),
+                "time_ms": 50.0,
+                "has_error": false
+            }));
+            controller.on_terminal(a_uuid, 50.0, false).unwrap();
+
+            // 7. Request `b` depends on `a` with 400ms delay -> ready at 450.0ms
+            api_calls.push(serde_json::json!({
+                "call": "drain_ready",
+                "time_ms": 450.0,
+                "notes": "Emit dependent profile request b"
+            }));
+            let ready_b = controller.drain_ready(450.0).unwrap();
+            assert_eq!(ready_b.len(), 1);
+            assert_eq!(ready_b[0].context.source_request_id, "b");
+            let b_uuid = ready_b[0].request.metadata().uuid.unwrap();
+
+            // 8. Call drain_ready at exactly profile_cutoff (1002.0 ms)
+            // This triggers begin_drain(1002.0)
+            api_calls.push(serde_json::json!({
+                "call": "drain_ready",
+                "time_ms": profile_cutoff,
+                "notes": "Trigger begin_drain at profile cutoff"
+            }));
+            let drained = controller.drain_ready(profile_cutoff).unwrap();
+            assert!(drained.is_empty());
+            assert_eq!(controller.phase, AgentxPhase::Drain);
+            assert_eq!(controller.summary.phase, AgentxPhase::Drain);
+            assert_eq!(controller.summary.profile_end_ms, Some(profile_cutoff));
+            assert_eq!(controller.summary.drain_deadline_ms, Some(drain_deadline));
+            assert_eq!(controller.in_flight.len(), 1);
+            assert_eq!(controller.summary.in_flight_at_profile_cutoff, 1);
+
+            (
+                controller,
+                b_uuid,
+                p_start,
+                profile_cutoff,
+                drain_deadline,
+                api_calls,
+            )
+        };
+
+        // ==========================================
+        // Branch 1: Normal Completion (t = D + 500ms = 1502.0ms < G = 2002.0ms)
+        // Unified polling schedule: D (1002), D+500 (1502), G-1 (2001), G (2002), G+50 (2052), G+100 (2102)
+        // ==========================================
+        let (mut controller_norm, b_uuid_norm, p_start, cutoff, deadline, mut norm_calls) =
+            setup_to_drain();
+        let finish_time_norm = cutoff + 500.0; // 1502.0 ms
+        let pre_deadline = deadline - 1.0; // 2001.0 ms
+        let delayed_poll_t = deadline + 50.0; // 2052.0 ms
+        let late_finish = deadline + 100.0; // 2102.0 ms
+        assert!(finish_time_norm < deadline);
+
+        // Checkpoint 1: 1502.0ms - Terminal arrives and drain finishes
+        norm_calls.push(serde_json::json!({
+            "call": "on_terminal",
+            "uuid": b_uuid_norm.to_string(),
+            "time_ms": finish_time_norm,
+            "has_error": false
+        }));
+        controller_norm
+            .on_terminal(b_uuid_norm, finish_time_norm, false)
+            .unwrap();
+
+        norm_calls.push(serde_json::json!({
+            "call": "drain_ready",
+            "time_ms": finish_time_norm,
+            "notes": "Poll after terminal to complete drain"
+        }));
+        let ready_after = controller_norm.drain_ready(finish_time_norm).unwrap();
+        assert!(ready_after.is_empty());
+
+        // Checkpoint 2: 2001.0ms (G - 1ms)
+        norm_calls.push(serde_json::json!({
+            "call": "drain_ready",
+            "time_ms": pre_deadline,
+            "notes": "Unified poll check at G-1 (already complete)"
+        }));
+        let _ = controller_norm.drain_ready(pre_deadline).unwrap();
+
+        // Checkpoint 3: 2002.0ms (G)
+        norm_calls.push(serde_json::json!({
+            "call": "drain_ready",
+            "time_ms": deadline,
+            "notes": "Unified poll check at G (already complete)"
+        }));
+        let _ = controller_norm.drain_ready(deadline).unwrap();
+
+        // Checkpoint 4: 2052.0ms (G + 50ms)
+        norm_calls.push(serde_json::json!({
+            "call": "drain_ready",
+            "time_ms": delayed_poll_t,
+            "notes": "Unified poll check at G+50 (already complete)"
+        }));
+        let _ = controller_norm.drain_ready(delayed_poll_t).unwrap();
+
+        // Checkpoint 5: 2102.0ms (G + 100ms)
+        norm_calls.push(serde_json::json!({
+            "call": "drain_ready",
+            "time_ms": late_finish,
+            "notes": "Unified poll check at G+100 (already complete)"
+        }));
+        let _ = controller_norm.drain_ready(late_finish).unwrap();
+
+        // Assertions on normal branch
+        assert_eq!(controller_norm.phase, AgentxPhase::Complete);
+        assert_eq!(controller_norm.summary.phase, AgentxPhase::Complete);
+        assert_eq!(controller_norm.summary.protocol_valid, true);
+        assert_eq!(controller_norm.summary.drain_completed, true);
+        assert_eq!(controller_norm.summary.censored, false);
+        assert_eq!(controller_norm.summary.invalid_reason, None);
+
+        // Event stream checks for normal branch
+        let norm_events = controller_norm.summary.events.clone();
+        assert!(
+            norm_events
+                .iter()
+                .any(|e| e.kind == AgentxEventKind::ProfileEnded
+                    && (e.logical_time_ms - cutoff).abs() < 1e-6)
+        );
+        assert!(
+            norm_events
+                .iter()
+                .any(|e| e.kind == AgentxEventKind::DrainCompleted
+                    && (e.logical_time_ms - finish_time_norm).abs() < 1e-6)
+        );
+        assert!(
+            !norm_events
+                .iter()
+                .any(|e| e.kind == AgentxEventKind::ProtocolInvalid)
+        );
+
+        // Timestamp monotonicity check
+        for w in norm_events.windows(2) {
+            assert!(w[0].logical_time_ms <= w[1].logical_time_ms);
+        }
+
+        // ==========================================
+        // Branch 2: Timeout / Censored (poll at G = 2002.0ms before completing request b)
+        // Unified polling schedule: D (1002), D+500 (1502), G-1 (2001), G (2002), G+50 (2052), G+100 (2102)
+        // ==========================================
+        let (mut controller_to, b_uuid_to, _, _, _, mut to_calls) = setup_to_drain();
+
+        // Checkpoint 1: 1502.0ms - In-flight remains 1, phase remains Drain, valid remains true
+        to_calls.push(serde_json::json!({
+            "call": "drain_ready",
+            "time_ms": finish_time_norm,
+            "notes": "Poll at D+500ms with request b in-flight (drain ongoing)"
+        }));
+        let r1 = controller_to.drain_ready(finish_time_norm).unwrap();
+        assert!(r1.is_empty());
+        assert_eq!(controller_to.phase, AgentxPhase::Drain);
+        assert_eq!(controller_to.summary.protocol_valid, true);
+
+        // Checkpoint 2: 2001.0ms (G - 1ms) - In-flight remains 1, time < deadline G -> protocol_valid MUST be true!
+        to_calls.push(serde_json::json!({
+            "call": "drain_ready",
+            "time_ms": pre_deadline,
+            "notes": "Poll at G-1ms with request b in-flight -> verifies no premature invalidation"
+        }));
+        let r2 = controller_to.drain_ready(pre_deadline).unwrap();
+        assert!(r2.is_empty());
+        assert_eq!(controller_to.phase, AgentxPhase::Drain);
+        assert_eq!(controller_to.summary.protocol_valid, true);
+
+        // Checkpoint 3: 2002.0ms (G) - Time reaches G (2002.0 ms) while request b is still in-flight!
+        to_calls.push(serde_json::json!({
+            "call": "drain_ready",
+            "time_ms": deadline,
+            "notes": "Poll at deadline G with request b still in flight -> triggers invalidate"
+        }));
+        let to_ready = controller_to.drain_ready(deadline).unwrap();
+        assert!(to_ready.is_empty());
+
+        // Assertions at timeout point
+        assert_eq!(controller_to.summary.protocol_valid, false);
+        assert_eq!(controller_to.summary.censored, true);
+        assert_eq!(controller_to.summary.drain_completed, false);
+        assert_eq!(
+            controller_to.summary.invalid_reason.as_deref(),
+            Some("drain grace expired before emitted requests completed")
+        );
+
+        // Checkpoint 4: 2052.0ms (G + 50ms) - Post-invalidation poll check
+        to_calls.push(serde_json::json!({
+            "call": "drain_ready",
+            "time_ms": delayed_poll_t,
+            "notes": "Poll at G+50ms while already invalidated"
+        }));
+        let r4 = controller_to.drain_ready(delayed_poll_t).unwrap();
+        assert!(r4.is_empty());
+
+        // Checkpoint 5: 2102.0ms (G + 100ms) - Request b late terminal arrives
+        to_calls.push(serde_json::json!({
+            "call": "on_terminal",
+            "uuid": b_uuid_to.to_string(),
+            "time_ms": late_finish,
+            "has_error": false
+        }));
+        controller_to
+            .on_terminal(b_uuid_to, late_finish, false)
+            .unwrap();
+
+        to_calls.push(serde_json::json!({
+            "call": "drain_ready",
+            "time_ms": late_finish,
+            "notes": "Poll after late terminal"
+        }));
+        let to_ready_late = controller_to.drain_ready(late_finish).unwrap();
+        assert!(to_ready_late.is_empty());
+
+        // Assertions after late terminal: phase becomes Complete, but valid and drain_completed stay false!
+        assert_eq!(controller_to.phase, AgentxPhase::Complete);
+        assert_eq!(controller_to.summary.phase, AgentxPhase::Complete);
+        assert_eq!(controller_to.summary.protocol_valid, false);
+        assert_eq!(controller_to.summary.drain_completed, false);
+        assert_eq!(controller_to.summary.censored, true);
+        assert_eq!(
+            controller_to.summary.invalid_reason.as_deref(),
+            Some("drain grace expired before emitted requests completed")
+        );
+
+        // Event stream checks for timeout branch
+        let to_events = controller_to.summary.events.clone();
+        assert!(
+            to_events
+                .iter()
+                .any(|e| e.kind == AgentxEventKind::ProfileEnded)
+        );
+        assert!(
+            to_events
+                .iter()
+                .any(|e| e.kind == AgentxEventKind::ProtocolInvalid
+                    && (e.logical_time_ms - deadline).abs() < 1e-6)
+        );
+
+        // Timestamp monotonicity check
+        for w in to_events.windows(2) {
+            assert!(w[0].logical_time_ms <= w[1].logical_time_ms);
+        }
+
+        // ==========================================
+        // Branch 3: Delayed Poll Branch (First poll during drain after G occurs at t = G + 50ms = 2052.0ms)
+        // Verifies real clock semantics: protocol_invalid timestamp is actual poll moment 2052.0ms, NOT retro-filled 2002.0ms!
+        // ==========================================
+        let (mut controller_dp, b_uuid_dp, _, _, _, mut dp_calls) = setup_to_drain();
+
+        // Intermediate poll before G
+        dp_calls.push(serde_json::json!({
+            "call": "drain_ready",
+            "time_ms": finish_time_norm,
+            "notes": "Poll at D+500ms"
+        }));
+        let _ = controller_dp.drain_ready(finish_time_norm).unwrap();
+
+        dp_calls.push(serde_json::json!({
+            "call": "drain_ready",
+            "time_ms": pre_deadline,
+            "notes": "Poll at G-1ms (protocol_valid is still true)"
+        }));
+        let _ = controller_dp.drain_ready(pre_deadline).unwrap();
+        assert_eq!(controller_dp.summary.protocol_valid, true);
+
+        // Skip poll at G (2002.0ms). Driver delayed until 2052.0ms!
+        dp_calls.push(serde_json::json!({
+            "call": "drain_ready",
+            "time_ms": delayed_poll_t,
+            "notes": "Delayed poll at G+50ms (2052.0ms) with request b in-flight -> triggers invalidate at 2052.0ms"
+        }));
+        let dp_ready = controller_dp.drain_ready(delayed_poll_t).unwrap();
+        assert!(dp_ready.is_empty());
+        assert_eq!(controller_dp.summary.protocol_valid, false);
+        assert_eq!(controller_dp.summary.censored, true);
+        assert_eq!(controller_dp.summary.drain_completed, false);
+        assert_eq!(
+            controller_dp.summary.invalid_reason.as_deref(),
+            Some("drain grace expired before emitted requests completed")
+        );
+
+        // Crucial: protocol_invalid event timestamp MUST be actual call time 2052.0ms!
+        assert!(controller_dp.summary.events.iter().any(|e| {
+            e.kind == AgentxEventKind::ProtocolInvalid
+                && (e.logical_time_ms - delayed_poll_t).abs() < 1e-6
+        }));
+
+        // Terminal arrives late at 2102.0ms
+        dp_calls.push(serde_json::json!({
+            "call": "on_terminal",
+            "uuid": b_uuid_dp.to_string(),
+            "time_ms": late_finish,
+            "has_error": false
+        }));
+        controller_dp
+            .on_terminal(b_uuid_dp, late_finish, false)
+            .unwrap();
+
+        dp_calls.push(serde_json::json!({
+            "call": "drain_ready",
+            "time_ms": late_finish,
+            "notes": "Poll after late terminal at 2102.0ms"
+        }));
+        let _ = controller_dp.drain_ready(late_finish).unwrap();
+        assert_eq!(controller_dp.phase, AgentxPhase::Complete);
+        assert_eq!(controller_dp.summary.protocol_valid, false);
+        assert_eq!(controller_dp.summary.drain_completed, false);
+        let dp_events = controller_dp.summary.events.clone();
+
+        // ==========================================
+        // Concurrent Deadline/Terminal Order Probe at exact t = G (2002.0ms)
+        // With full API calls, event trajectories, and assertions for both orders!
+        // ==========================================
+        // Order 1: on_terminal at G, THEN drain_ready at G
+        let (mut c_ord1, b_ord1, _, _, _, mut ord1_calls) = setup_to_drain();
+        ord1_calls.push(serde_json::json!({
+            "call": "on_terminal",
+            "uuid": b_ord1.to_string(),
+            "time_ms": deadline,
+            "has_error": false,
+            "notes": "Terminal processed at exact deadline G before drain check"
+        }));
+        c_ord1.on_terminal(b_ord1, deadline, false).unwrap();
+
+        ord1_calls.push(serde_json::json!({
+            "call": "drain_ready",
+            "time_ms": deadline,
+            "notes": "Poll at exact deadline G after terminal processed"
+        }));
+        let ord1_ready = c_ord1.drain_ready(deadline).unwrap();
+        assert!(ord1_ready.is_empty());
+        assert_eq!(c_ord1.phase, AgentxPhase::Complete);
+        assert_eq!(c_ord1.summary.phase, AgentxPhase::Complete);
+        assert_eq!(c_ord1.summary.protocol_valid, true);
+        assert_eq!(c_ord1.summary.drain_completed, true);
+        assert_eq!(c_ord1.summary.censored, false);
+        assert_eq!(c_ord1.summary.invalid_reason, None);
+        let ord1_events = c_ord1.summary.events.clone();
+
+        // Order 2: drain_ready at G, THEN on_terminal at G
+        let (mut c_ord2, b_ord2, _, _, _, mut ord2_calls) = setup_to_drain();
+        ord2_calls.push(serde_json::json!({
+            "call": "drain_ready",
+            "time_ms": deadline,
+            "notes": "Poll at exact deadline G while request b is in-flight -> triggers timeout invalidate"
+        }));
+        let ord2_ready = c_ord2.drain_ready(deadline).unwrap();
+        assert!(ord2_ready.is_empty());
+        assert_eq!(c_ord2.summary.protocol_valid, false);
+        assert_eq!(c_ord2.summary.drain_completed, false);
+        assert_eq!(c_ord2.summary.censored, true);
+        assert_eq!(
+            c_ord2.summary.invalid_reason.as_deref(),
+            Some("drain grace expired before emitted requests completed")
+        );
+
+        ord2_calls.push(serde_json::json!({
+            "call": "on_terminal",
+            "uuid": b_ord2.to_string(),
+            "time_ms": deadline,
+            "has_error": false,
+            "notes": "Terminal arriving at exact deadline G after drain check already invalidated"
+        }));
+        c_ord2.on_terminal(b_ord2, deadline, false).unwrap();
+
+        ord2_calls.push(serde_json::json!({
+            "call": "drain_ready",
+            "time_ms": deadline,
+            "notes": "Poll after terminal to clear in-flight"
+        }));
+        let _ = c_ord2.drain_ready(deadline).unwrap();
+        assert_eq!(c_ord2.phase, AgentxPhase::Complete);
+        assert_eq!(c_ord2.summary.phase, AgentxPhase::Complete);
+        assert_eq!(c_ord2.summary.protocol_valid, false);
+        assert_eq!(c_ord2.summary.drain_completed, false);
+        assert_eq!(c_ord2.summary.censored, true);
+        let ord2_events = c_ord2.summary.events.clone();
+
+        // ==========================================
+        // Evidence Serialization if requested via AGENTX_FIXTURE_EVIDENCE_DIR
+        // ==========================================
+        if let Some(evidence_dir) = std::env::var_os("AGENTX_FIXTURE_EVIDENCE_DIR") {
+            let out_dir = PathBuf::from(evidence_dir);
+            std::fs::create_dir(&out_dir).expect("Evidence directory must not already exist");
+            let evidence_file = out_dir.join("native_drain_grace_dual_branch_evidence.json");
+
+            let evidence_doc = serde_json::json!({
+                "schema_version": "native_drain_grace_evidence_v1.0",
+                "benchmark_id": "test",
+                "timing": {
+                    "profile_start_ms": p_start,
+                    "profile_cutoff_ms": cutoff,
+                    "drain_deadline_ms": deadline,
+                    "normal_terminal_ms": finish_time_norm,
+                    "timeout_terminal_ms": late_finish,
+                    "delayed_poll_ms": delayed_poll_t
+                },
+                "call_chain": "AgentxReplayController::new -> drain_ready(primer) -> on_terminal -> drain_ready(warmup) -> on_terminal -> drain_ready(profile) -> on_terminal -> drain_ready(b) -> drain_ready(cutoff) -> [branch]",
+                "controller_source_file": "dynamo/lib/mocker/src/loadgen/agentx.rs",
+                "features": ["default"],
+                "normal_branch": {
+                    "status": "PASSED",
+                    "protocol_valid": controller_norm.summary.protocol_valid,
+                    "drain_completed": controller_norm.summary.drain_completed,
+                    "censored": controller_norm.summary.censored,
+                    "invalid_reason": controller_norm.summary.invalid_reason,
+                    "api_calls": norm_calls,
+                    "summary": controller_norm.summary,
+                    "actual_events": norm_events
+                },
+                "timeout_branch": {
+                    "status": "PASSED_TIMEOUT_VALIDATED",
+                    "protocol_valid": controller_to.summary.protocol_valid,
+                    "drain_completed": controller_to.summary.drain_completed,
+                    "censored": controller_to.summary.censored,
+                    "invalid_reason": controller_to.summary.invalid_reason,
+                    "api_calls": to_calls,
+                    "summary": controller_to.summary,
+                    "actual_events": to_events
+                },
+                "delayed_poll_branch": {
+                    "status": "PASSED_DELAYED_POLL_VALIDATED",
+                    "protocol_valid": controller_dp.summary.protocol_valid,
+                    "drain_completed": controller_dp.summary.drain_completed,
+                    "censored": controller_dp.summary.censored,
+                    "invalid_reason": controller_dp.summary.invalid_reason,
+                    "api_calls": dp_calls,
+                    "summary": controller_dp.summary,
+                    "actual_events": dp_events
+                },
+                "concurrent_deadline_terminal_order_probe": {
+                    "description": "Probe examining evaluation difference when terminal and drain_ready occur at exact G",
+                    "driver_sequence_notes": "Driver must prioritize on_terminal before drain_ready when events coincide at exact deadline G to avoid premature protocol invalidation.",
+                    "order_terminal_then_drain": {
+                        "protocol_valid": c_ord1.summary.protocol_valid,
+                        "drain_completed": c_ord1.summary.drain_completed,
+                        "censored": c_ord1.summary.censored,
+                        "invalid_reason": c_ord1.summary.invalid_reason,
+                        "notes": "terminal processed first clears in-flight, so drain_ready sees 0 in-flight and completes successfully",
+                        "api_calls": ord1_calls,
+                        "summary": c_ord1.summary,
+                        "actual_events": ord1_events
+                    },
+                    "order_drain_then_terminal": {
+                        "protocol_valid": c_ord2.summary.protocol_valid,
+                        "drain_completed": c_ord2.summary.drain_completed,
+                        "censored": c_ord2.summary.censored,
+                        "invalid_reason": c_ord2.summary.invalid_reason,
+                        "notes": "drain_ready processed first sees request still in-flight at deadline G, so timeout triggers and protocol is invalidated",
+                        "api_calls": ord2_calls,
+                        "summary": c_ord2.summary,
+                        "actual_events": ord2_events
+                    }
+                }
+            });
+
+            let output = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&evidence_file)
+                .expect("Evidence file must not already exist");
+            serde_json::to_writer_pretty(&output, &evidence_doc)
+                .expect("Failed to write evidence file");
+            output.sync_all().expect("Failed to sync evidence file");
+        }
     }
 }

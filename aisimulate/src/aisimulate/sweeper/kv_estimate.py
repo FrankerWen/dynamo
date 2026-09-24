@@ -116,7 +116,11 @@ def estimate_kv_tokens(
         #    shard the model's (FP8 block-)quantized MoE dims (e.g. MiniMax-M2.5 moe_tp=8:
         #    moe_intermediate_size 1536 / 8 not divisible by weight_block_size 128). This is a
         #    property of *this shape*, not the model, so the enumerator should just drop it.
-        if "no KV budget" in msg or "Invalid quantized MoE configuration" in msg:
+        if (
+            "no KV budget" in msg
+            or "Invalid quantized MoE configuration" in msg
+            or "should be divisible by" in msg
+        ):
             return None
         raise
     return int(est["total_kv_size_tokens"])

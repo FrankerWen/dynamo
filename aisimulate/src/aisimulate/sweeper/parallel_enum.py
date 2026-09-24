@@ -120,6 +120,7 @@ def enumerate_worker_shapes(
     enable_wideep: bool = False,
     moe_backend: str | None = None,
     allow_moe_pure_tp: bool = True,
+    allow_mixed_shapes: bool = False,
 ) -> list[ParallelShape]:
     """Legal per-worker shapes at exactly ``gpus_per_worker`` GPUs (``pp`` = 1).
 
@@ -129,6 +130,12 @@ def enumerate_worker_shapes(
     ``allow_moe_pure_tp`` — now enabled for every MoE model, MLA included, since
     real deployments run it (InferenceX GLM-5 reports EP=1). Dense models scan
     plain TP and are unaffected. Backend EP-only filters (sglang wideep) still apply.
+
+    ``allow_mixed_shapes`` (default off, preserving the historical search space)
+    additionally keeps every width-legal shape that survives the backend
+    filters, i.e. it drops the real-silicon pure-pattern (TEP/DEP/MoE-TP)
+    restriction. Used by the heterogeneous P/D adaptation plan
+    ("开启混合组合枚举，解除目前仅保留纯并行模式的过滤").
     """
     g = gpus_per_worker
     if not is_moe:
@@ -174,7 +181,7 @@ def enumerate_worker_shapes(
                         and moe_ep == 1
                         and ((tp > 1 and dp == 1) or (tp == 1 and dp > 1))
                     )
-                    if not (is_tep or is_dep or is_moe_tp):
+                    if not allow_mixed_shapes and not (is_tep or is_dep or is_moe_tp):
                         continue
                     shapes.append(
                         ParallelShape(tp=tp, dp=dp, moe_tp=moe_tp, moe_ep=moe_ep)
@@ -193,6 +200,7 @@ def enumerate_parallel_configs(
     enable_wideep: bool = False,
     moe_backend: str | None = None,
     allow_moe_pure_tp: bool = True,
+    allow_mixed_shapes: bool = False,
 ) -> list[ReplicaParallelConfig]:
     """Enumerate ``(worker shape, replica count)`` configs that fit ``gpu_budget``.
 
@@ -220,6 +228,7 @@ def enumerate_parallel_configs(
             enable_wideep=enable_wideep,
             moe_backend=moe_backend,
             allow_moe_pure_tp=allow_moe_pure_tp,
+            allow_mixed_shapes=allow_mixed_shapes,
         )
         if not shapes:
             continue
@@ -244,6 +253,7 @@ def enumerate_disagg_configs(
     enable_wideep: bool = False,
     moe_backend: str | None = None,
     allow_moe_pure_tp: bool = True,
+    allow_mixed_shapes: bool = False,
 ) -> list[DisaggParallelConfig]:
     """Enumerate disagg ``(prefill, decode)`` configs that share the GPU budget.
 
@@ -267,6 +277,7 @@ def enumerate_disagg_configs(
         enable_wideep=enable_wideep,
         moe_backend=moe_backend,
         allow_moe_pure_tp=allow_moe_pure_tp,
+        allow_mixed_shapes=allow_mixed_shapes,
     )
     if not per_role:
         return []
